@@ -92,6 +92,12 @@ func (c *Client) Rename(path, newName string) error {
 // Put 上传本地文件：master 建元数据 → 直连主副本节点写数据 → commit 大小。
 // replicas 为期望副本数（含主副本）；从副本由主副本后台异步同步。
 func (c *Client) Put(localPath, remotePath string, replicas int) error {
+	return c.PutOverwrite(localPath, remotePath, replicas, false)
+}
+
+// PutOverwrite 上传本地文件，支持 overwrite 参数。
+// overwrite 为 true 时允许覆盖同名文件。
+func (c *Client) PutOverwrite(localPath, remotePath string, replicas int, overwrite bool) error {
 	f, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("open local: %w", err)
@@ -102,18 +108,24 @@ func (c *Client) Put(localPath, remotePath string, replicas int) error {
 	if err != nil {
 		return fmt.Errorf("stat local: %w", err)
 	}
-	return c.PutReader(remotePath, st.Size(), f, replicas)
+	return c.PutReaderOverwrite(remotePath, st.Size(), f, replicas, overwrite)
 }
 
 // PutReader 从 io.Reader 上传：创建元数据 → 直连主副本写 → commit。
 // 供 FUSE 挂载层在 flush 时把本地缓冲文件整体上传。
 func (c *Client) PutReader(remotePath string, size int64, r io.Reader, replicas int) error {
+	return c.PutReaderOverwrite(remotePath, size, r, replicas, false)
+}
+
+// PutReaderOverwrite 从 io.Reader 上传，支持 overwrite 参数。
+// overwrite 为 true 时允许覆盖同名文件。
+func (c *Client) PutReaderOverwrite(remotePath string, size int64, r io.Reader, replicas int, overwrite bool) error {
 	// 1. 在 master 创建文件记录并获取副本节点（第一个为主副本）。
 	var created struct {
 		Inode types.Inode      `json:"inode"`
 		Nodes []types.NodeInfo `json:"nodes"`
 	}
-	if err := c.postJSON("/files", map[string]any{"path": remotePath, "replicas": replicas}, &created); err != nil {
+	if err := c.postJSON("/files", map[string]any{"path": remotePath, "replicas": replicas, "overwrite": overwrite}, &created); err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
 	if len(created.Nodes) == 0 {

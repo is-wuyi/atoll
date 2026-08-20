@@ -340,6 +340,122 @@ func TestReplicaTargetsAndReplicated(t *testing.T) {
 	}
 }
 
+func TestCreateFileOverwrite(t *testing.T) {
+	// 场景 1：覆盖成功 — 创建 /a.txt → 覆写 → 验证 /meta 返回新 inode / 新 size。
+	t.Run("OverwriteSuccess", func(t *testing.T) {
+		ts := newTestServer(t)
+		registerNode(t, ts.URL, 1)
+
+		// 首次创建。
+		var first struct {
+			Inode struct {
+				ID uint64 `json:"id"`
+			} `json:"inode"`
+		}
+		resp := postJSON(t, ts.URL+"/files", map[string]any{
+			"path": "/a.txt", "replicas": 1,
+		}, &first)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("首次创建状态码 = %d", resp.StatusCode)
+		}
+		oldID := first.Inode.ID
+
+		// commit 写入一些数据。
+		postJSON(t, ts.URL+"/files/commit", map[string]any{
+			"inode_id": oldID, "size": 100,
+		}, nil)
+
+		// 覆写。
+		var overwritten struct {
+			Inode struct {
+				ID   uint64 `json:"id"`
+				Size int64  `json:"size"`
+			} `json:"inode"`
+		}
+		resp = postJSON(t, ts.URL+"/files", map[string]any{
+			"path": "/a.txt", "overwrite": true, "replicas": 1,
+		}, &overwritten)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("覆写状态码 = %d", resp.StatusCode)
+		}
+		if overwritten.Inode.ID == oldID {
+			t.Fatalf("覆写后 inode ID 应变化: 旧 %d == 新 %d", oldID, overwritten.Inode.ID)
+		}
+
+		// 验证 /meta 返回的是新 inode，且 size 重置为 0。
+		var out struct {
+			Inode struct {
+				ID   uint64 `json:"id"`
+				Size int64  `json:"size"`
+			} `json:"inode"`
+		}
+		resp = getJSON(t, ts.URL+"/meta?path=/a.txt", &out)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("lookup 状态码 = %d", resp.StatusCode)
+		}
+		if out.Inode.ID != overwritten.Inode.ID {
+			t.Fatalf("meta 返回旧 inode: got %d, want %d", out.Inode.ID, overwritten.Inode.ID)
+		}
+		if out.Inode.Size != 0 {
+			t.Fatalf("覆写后 size 应为 0, got %d", out.Inode.Size)
+		}
+	})
+
+	// 场景 2：不带 overwrite 仍返回 409。
+	t.Run("ConflictWithoutOverwrite", func(t *testing.T) {
+		ts := newTestServer(t)
+		registerNode(t, ts.URL, 1)
+
+		postJSON(t, ts.URL+"/files", map[string]any{
+			"path": "/b.txt", "replicas": 1,
+		}, nil)
+
+		// 不带 overwrite 再次创建同一路径。
+		resp := postJSON(t, ts.URL+"/files", map[string]any{
+			"path": "/b.txt", "replicas": 1,
+		}, nil)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("重复创建应 409, got %d", resp.StatusCode)
+		}
+	})
+
+	// 场景 3：覆写后旧 inode 在元数据中不存在。
+	t.Run("OldInodeGone", func(t *testing.T) {
+		store, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
+		if err != nil {
+			t.Fatalf("meta.Open: %v", err)
+		}
+		t.Cleanup(func() { store.Close() })
+		srv := NewServer(store, time.Hour)
+		ts := httptest.NewServer(srv.Handler())
+		t.Cleanup(func() { ts.Close() })
+
+		registerNode(t, ts.URL, 1)
+
+		// 首次创建。
+		var first struct {
+			Inode struct {
+				ID uint64 `json:"id"`
+			} `json:"inode"`
+		}
+		postJSON(t, ts.URL+"/files", map[string]any{
+			"path": "/a.txt", "replicas": 1,
+		}, &first)
+		oldID := first.Inode.ID
+
+		// 覆写。
+		postJSON(t, ts.URL+"/files", map[string]any{
+			"path": "/a.txt", "overwrite": true, "replicas": 1,
+		}, nil)
+
+		// 直接查询旧 inode，应不存在。
+		_, err = store.GetInode(oldID)
+		if err == nil {
+			t.Fatalf("旧 inode %d 应已被删除", oldID)
+		}
+	})
+}
+
 func TestSplitPath(t *testing.T) {
 	cases := []struct{ in, parent, name string }{
 		{"/a/b/c.txt", "/a/b", "c.txt"},

@@ -291,6 +291,51 @@ func TestDeleteReclaimsObjects(t *testing.T) {
 	t.Fatal("删除后对象未被回收（超时）")
 }
 
+// 覆写场景：overwrite=true 成功覆盖；不带 overwrite 重复创建返回 409。
+func TestPutOverwrite(t *testing.T) {
+	c, _ := newClusterV2(t, 1)
+	dir := t.TempDir()
+
+	// — 场景 1：覆写成功 —
+	// 首次创建 /a.txt
+	localA := filepath.Join(dir, "a.txt")
+	os.WriteFile(localA, []byte("version-1"), 0o644)
+	if err := c.Put(localA, "/a.txt", 1); err != nil {
+		t.Fatalf("首次 Put /a.txt: %v", err)
+	}
+
+	// 带 overwrite=true 覆写为新内容
+	os.WriteFile(localA, []byte("version-2"), 0o644)
+	if err := c.PutOverwrite(localA, "/a.txt", 1, true); err != nil {
+		t.Fatalf("覆写 /a.txt: %v", err)
+	}
+
+	// 验证 Get 得到新版本
+	outA := filepath.Join(dir, "a_out.txt")
+	if err := c.Get("/a.txt", outA); err != nil {
+		t.Fatalf("Get /a.txt: %v", err)
+	}
+	gotA, _ := os.ReadFile(outA)
+	if string(gotA) != "version-2" {
+		t.Fatalf("覆写后内容不符: got %q, want %q", gotA, "version-2")
+	}
+
+	// — 场景 2：不带 overwrite 仍 409 —
+	localB := filepath.Join(dir, "b.txt")
+	os.WriteFile(localB, []byte("first"), 0o644)
+	if err := c.Put(localB, "/b.txt", 1); err != nil {
+		t.Fatalf("首次 Put /b.txt: %v", err)
+	}
+
+	err := c.Put(localB, "/b.txt", 1)
+	if err == nil {
+		t.Fatal("重复 Put /b.txt 不带 overwrite 应返回错误")
+	}
+	if !strings.Contains(err.Error(), "409") {
+		t.Fatalf("期望 409 冲突错误, got: %v", err)
+	}
+}
+
 func decodeBody(r io.Reader, v any) error {
 	return json.NewDecoder(r).Decode(v)
 }

@@ -187,8 +187,9 @@ func (s *Server) handleReplicated(w http.ResponseWriter, r *http.Request) {
 // handleCreateFile 创建文件记录并分配副本节点（阶段1：从活跃节点随机挑 N 个）。
 func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Path     string `json:"path"`
-		Replicas int    `json:"replicas"` // 期望副本数，<=0 时取 1
+		Path      string `json:"path"`
+		Replicas  int    `json:"replicas"`  // 期望副本数，<=0 时取 1
+		Overwrite bool   `json:"overwrite"` // 覆盖已有文件
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
@@ -206,6 +207,19 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpError(w, http.StatusNotFound, "parent not found")
 		return
+	}
+	// 如果路径已存在，根据 overwrite 标记决定行为。
+	if old, err := s.store.ResolvePath(req.Path); err == nil {
+		if !req.Overwrite {
+			httpError(w, http.StatusConflict, meta.ErrExist.Error())
+			return
+		}
+		// overwrite=true：删除旧文件元数据并异步通知副本节点回收旧对象。
+		if err := s.store.DeleteFile(old.ID); err != nil {
+			httpErrorFromMeta(w, err)
+			return
+		}
+		go s.notifyObjectDelete(old.ID, old.Replicas)
 	}
 	alive, err := s.store.ListAliveNodes(s.nodeMaxAge)
 	if err != nil {

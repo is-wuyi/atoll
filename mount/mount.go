@@ -472,7 +472,7 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
 		return syscall.EIO
 	}
-	if err := w.m.client.PutReader(w.remote, st.Size(), w.f, w.m.replicas); err != nil {
+	if err := w.m.client.PutReaderOverwrite(w.remote, st.Size(), w.f, w.m.replicas, true); err != nil {
 		return syscall.EIO
 	}
 	w.dirty = false

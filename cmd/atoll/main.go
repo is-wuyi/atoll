@@ -33,7 +33,7 @@ const usageText = `usage: atoll <command> [args]
   atoll node     启动存储节点（对象存储 + 心跳）
 
 客户端命令 (可用 -master 或环境变量 ATOLL_MASTER 指定 master 地址):
-  atoll put <本地文件> <远程路径>    上传文件 [-replicas N]
+  atoll put <本地文件> <远程路径>    上传文件 [-replicas N] [-f]
   atoll get <远程路径> <本地文件>    下载文件
   atoll ls  <远程路径>              列目录
   atoll mkdir <远程路径>            建目录
@@ -191,6 +191,7 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
 	replicas := fs.Int("replicas", 2, "副本数（仅 put 使用，含主副本）")
+	force := fs.Bool("f", false, "强制覆盖远程已存在的同名文件（仅 put 使用）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -199,14 +200,22 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	switch cmd {
 	case "put":
 		if fs.NArg() != 2 {
-			fmt.Fprintln(stderr, "用法: atoll put [-replicas N] <本地文件> <远程路径>")
+			fmt.Fprintln(stderr, "用法: atoll put [-replicas N] [-f] <本地文件> <远程路径>")
 			return 2
 		}
-		if err := c.Put(fs.Arg(0), fs.Arg(1), *replicas); err != nil {
-			fmt.Fprintf(stderr, "put 失败: %v\n", err)
-			return 1
+		if *force {
+			if err := c.PutOverwrite(fs.Arg(0), fs.Arg(1), *replicas, true); err != nil {
+				fmt.Fprintf(stderr, "put 失败: %v\n", err)
+				return 1
+			}
+			fmt.Fprintf(stdout, "已覆盖 %s → %s（%d 副本）\n", fs.Arg(0), fs.Arg(1), *replicas)
+		} else {
+			if err := c.Put(fs.Arg(0), fs.Arg(1), *replicas); err != nil {
+				fmt.Fprintf(stderr, "put 失败: %v\n", err)
+				return 1
+			}
+			fmt.Fprintf(stdout, "已上传 %s → %s（%d 副本）\n", fs.Arg(0), fs.Arg(1), *replicas)
 		}
-		fmt.Fprintf(stdout, "已上传 %s → %s（%d 副本）\n", fs.Arg(0), fs.Arg(1), *replicas)
 	case "get":
 		if fs.NArg() != 2 {
 			fmt.Fprintln(stderr, "用法: atoll get <远程路径> <本地文件>")
