@@ -58,11 +58,17 @@ func (c *Client) Rm(path string) error {
 	return statusError(resp)
 }
 
+// replicaNode 是 lookup 返回的节点条目：地址 + 副本同步状态。
+type replicaNode struct {
+	Addr string `json:"addr"`
+	Done bool   `json:"done"`
+}
+
 // lookup 查询路径的 inode 与副本节点详情。
-func (c *Client) lookup(path string) (types.Inode, []types.NodeInfo, error) {
+func (c *Client) lookup(path string) (types.Inode, []replicaNode, error) {
 	var out struct {
-		Inode types.Inode     `json:"inode"`
-		Nodes []types.NodeInfo `json:"nodes"`
+		Inode types.Inode   `json:"inode"`
+		Nodes []replicaNode `json:"nodes"`
 	}
 	if err := c.getJSON("/meta?"+queryPath(path), &out); err != nil {
 		return types.Inode{}, nil, err
@@ -72,8 +78,9 @@ func (c *Client) lookup(path string) (types.Inode, []types.NodeInfo, error) {
 
 // ---- 数据操作 ----
 
-// Put 上传本地文件：master 建元数据 → 直连节点写数据 → commit 大小。
-func (c *Client) Put(localPath, remotePath string) error {
+// Put 上传本地文件：master 建元数据 → 直连主副本节点写数据 → commit 大小。
+// replicas 为期望副本数（含主副本）；从副本由主副本后台异步同步。
+func (c *Client) Put(localPath, remotePath string, replicas int) error {
 	f, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("open local: %w", err)
@@ -85,28 +92,29 @@ func (c *Client) Put(localPath, remotePath string) error {
 		return fmt.Errorf("stat local: %w", err)
 	}
 
-	// 1. 在 master 创建文件记录并获取副本节点（阶段1副本数 1）。
+	// 1. 在 master 创建文件记录并获取副本节点（第一个为主副本）。
 	var created struct {
 		Inode types.Inode     `json:"inode"`
 		Nodes []types.NodeInfo `json:"nodes"`
 	}
-	if err := c.postJSON("/files", map[string]any{"path": remotePath, "replicas": 1}, &created); err != nil {
+	if err := c.postJSON("/files", map[string]any{"path": remotePath, "replicas": replicas}, &created); err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
 	if len(created.Nodes) == 0 {
 		return fmt.Errorf("master 未分配任何存储节点")
 	}
 
-	// 2. 直连第一个节点写入数据。
+	// 2. 直连主副本写入数据。
 	if err := c.putObject(created.Nodes[0].Addr, created.Inode.ID, f); err != nil {
 		return fmt.Errorf("write object: %w", err)
 	}
 
-	// 3. commit 实际大小。
+	// 3. commit 实际大小（主副本会随后异步推送到其余节点）。
 	return c.postJSON("/files/commit", map[string]any{"inode_id": created.Inode.ID, "size": st.Size()}, nil)
 }
 
-// Get 下载远程文件：查元数据 → 随机挑一个副本节点直连读。
+// Get 下载远程文件：查元数据 → 优先从已同步完成的副本随机挑一个直连读。
+// 若暂无已完成副本（异步复制还在进行），退化为从任意副本尝试。
 func (c *Client) Get(remotePath, localPath string) error {
 	in, nodes, err := c.lookup(remotePath)
 	if err != nil {
@@ -115,7 +123,16 @@ func (c *Client) Get(remotePath, localPath string) error {
 	if len(nodes) == 0 {
 		return fmt.Errorf("无可用副本节点")
 	}
-	n := nodes[rand.Intn(len(nodes))]
+	var candidates []replicaNode
+	for _, nd := range nodes {
+		if nd.Done {
+			candidates = append(candidates, nd)
+		}
+	}
+	if len(candidates) == 0 {
+		candidates = nodes // 复制尚未完成，退而求其次
+	}
+	n := candidates[rand.Intn(len(candidates))]
 
 	resp, err := c.HTTP.Get(fmt.Sprintf("http://%s/objects/%d", n.Addr, in.ID))
 	if err != nil {

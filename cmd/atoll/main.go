@@ -132,6 +132,7 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
+	replicas := fs.Int("replicas", 2, "副本数（仅 put 使用，含主副本）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -140,14 +141,14 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	switch cmd {
 	case "put":
 		if fs.NArg() != 2 {
-			fmt.Fprintln(stderr, "用法: atoll put <本地文件> <远程路径>")
+			fmt.Fprintln(stderr, "用法: atoll put [-replicas N] <本地文件> <远程路径>")
 			return 2
 		}
-		if err := c.Put(fs.Arg(0), fs.Arg(1)); err != nil {
+		if err := c.Put(fs.Arg(0), fs.Arg(1), *replicas); err != nil {
 			fmt.Fprintf(stderr, "put 失败: %v\n", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "已上传 %s → %s\n", fs.Arg(0), fs.Arg(1))
+		fmt.Fprintf(stdout, "已上传 %s → %s（%d 副本）\n", fs.Arg(0), fs.Arg(1), *replicas)
 	case "get":
 		if fs.NArg() != 2 {
 			fmt.Fprintln(stderr, "用法: atoll get <远程路径> <本地文件>")

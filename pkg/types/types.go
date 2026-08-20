@@ -20,8 +20,11 @@ type Inode struct {
 	Type     EntryType `json:"type"`
 	Size     int64     `json:"size"`
 	Mtime    time.Time `json:"mtime"`
-	// Replicas 存放持有该文件副本的节点 ID；目录恒为空。
+	// Replicas 存放该文件的目标副本节点 ID（第一个为主副本）；目录恒为空。
 	Replicas []uint64 `json:"replicas,omitempty"`
+	// DoneReplicas 已确认落盘完成的副本节点 ID（含主副本）。
+	// 异步复制期间 DoneReplicas 是 Replicas 的子集；读操作优先从中挑选。
+	DoneReplicas []uint64 `json:"done_replicas,omitempty"`
 }
 
 // NodeInfo 是一个存储节点的注册信息与运行状态。

@@ -26,6 +26,7 @@ type Node struct {
 	nodeID            atomic.Int64
 	totalBytes        int64
 	heartbeatInterval time.Duration
+	httpClient        *http.Client // 与 master/peer 通信复用
 }
 
 func New(dataDir, masterURL, advertise string, totalBytes int64) *Node {
@@ -35,6 +36,7 @@ func New(dataDir, masterURL, advertise string, totalBytes int64) *Node {
 		advertise:         advertise,
 		totalBytes:        totalBytes,
 		heartbeatInterval: 5 * time.Second,
+		httpClient:        &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
@@ -49,6 +51,7 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("PUT /objects/{id}", n.handlePut)
 	mux.HandleFunc("GET /objects/{id}", n.handleGet)
 	mux.HandleFunc("DELETE /objects/{id}", n.handleDelete)
+	mux.HandleFunc("PUT /replicate/{id}", n.handleReplicate)
 	return mux
 }
 
@@ -87,6 +90,145 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n.used.Add(size - oldSize)
+	writeJSON(w, http.StatusCreated, map[string]int64{"size": size})
+	// 客户端直写视为"我是主副本"：成功后异步推送到其余副本节点。
+	if n.nodeID.Load() != 0 {
+		go n.replicateToPeers(id)
+	}
+}
+
+// replicateToPeers 把指定对象推送到 master 分配的其余副本节点（带重试）。
+// 目标列表实时从 master 获取，已完成的节点会被 master 过滤掉，因此重试天然幂等。
+func (n *Node) replicateToPeers(inodeID uint64) {
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		targets, err := n.fetchReplicaTargets(inodeID)
+		if err != nil {
+			log.Printf("replicate %d: 获取目标失败(尝试 %d/%d): %v", inodeID, attempt, maxAttempts, err)
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+		if len(targets) == 0 {
+			return // 全部同步完成
+		}
+		allOK := true
+		for _, addr := range targets {
+			if err := n.pushObject(addr, inodeID); err != nil {
+				log.Printf("replicate %d → %s 失败(尝试 %d/%d): %v", inodeID, addr, attempt, maxAttempts, err)
+				allOK = false
+			}
+		}
+		if allOK {
+			return
+		}
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	log.Printf("replicate %d: 达到最大重试次数，放弃（等待对账任务兜底）", inodeID)
+}
+
+// fetchReplicaTargets 向 master 查询除自己外待同步的副本节点地址。
+func (n *Node) fetchReplicaTargets(inodeID uint64) ([]string, error) {
+	url := fmt.Sprintf("%s/files/replica-targets?inode_id=%d&node_id=%d", n.masterURL, inodeID, n.nodeID.Load())
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var nodes []struct {
+		Addr string `json:"addr"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		return nil, err
+	}
+	var addrs []string
+	for _, nd := range nodes {
+		addrs = append(addrs, nd.Addr)
+	}
+	return addrs, nil
+}
+
+// pushObject 把本地对象推送到目标节点（目标节点会落盘并上报 master）。
+func (n *Node) pushObject(peerAddr string, inodeID uint64) error {
+	f, err := os.Open(n.objectPath(inodeID))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://%s/replicate/%d", peerAddr, inodeID), f)
+	if err != nil {
+		return err
+	}
+	resp, err := n.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// reportReplicated 向 master 上报"我已完成该对象的同步"。
+func (n *Node) reportReplicated(inodeID uint64) error {
+	body, _ := json.Marshal(map[string]any{
+		"inode_id": inodeID,
+		"node_id":  n.nodeID.Load(),
+	})
+	resp, err := http.Post(n.masterURL+"/files/replicated", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// handleReplicate 接收主副本推送的对象数据：落盘后向 master 上报同步完成。
+// 与 handlePut 的区别：来源是主副本节点而非客户端，成功后需要上报。
+func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseObjectID(w, r)
+	if !ok {
+		return
+	}
+	objPath := n.objectPath(id)
+	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var oldSize int64
+	if st, err := os.Stat(objPath); err == nil {
+		oldSize = st.Size()
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(objPath), ".tmp-*")
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	tmpName := tmp.Name()
+	size, err := io.Copy(tmp, r.Body)
+	closeErr := tmp.Close()
+	if err != nil || closeErr != nil {
+		os.Remove(tmpName)
+		httpError(w, http.StatusInternalServerError, "write object failed")
+		return
+	}
+	if err := os.Rename(tmpName, objPath); err != nil {
+		os.Remove(tmpName)
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	n.used.Add(size - oldSize)
+	// 落盘成功后向 master 上报，把自己加入 DoneReplicas。上报失败仅记日志：
+	// 主副本的重试机制会再次推送，重复落盘是幂等的。
+	if err := n.reportReplicated(id); err != nil {
+		log.Printf("report replicated %d: %v", id, err)
+	}
 	writeJSON(w, http.StatusCreated, map[string]int64{"size": size})
 }
 
@@ -249,6 +391,14 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
+
+// ---- 测试辅助（导出仅供集成测试使用） ----
+
+// SetNodeIDForTest 直接设置节点 ID（绕过注册流程，用于测试）。
+func (n *Node) SetNodeIDForTest(id uint64) { n.nodeID.Store(int64(id)) }
+
+// DataDirForTest 返回数据目录路径。
+func (n *Node) DataDirForTest() string { return n.dataDir }
 
 func httpError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})

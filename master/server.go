@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"time"
 
 	"atoll/master/meta"
@@ -35,6 +36,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /meta", s.handleLookup) // ?path=/a/b
 	mux.HandleFunc("POST /files", s.handleCreateFile)
 	mux.HandleFunc("POST /files/commit", s.handleCommitFile)
+	mux.HandleFunc("GET /files/replica-targets", s.handleReplicaTargets) // node 查询推送目标
+	mux.HandleFunc("POST /files/replicated", s.handleReplicated)         // 从副本上报同步完成
 	mux.HandleFunc("DELETE /entry", s.handleDelete) // ?path=/a/b
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("POST /nodes/heartbeat", s.handleNodeHeartbeat)
@@ -85,6 +88,7 @@ func (s *Server) handleListChildren(w http.ResponseWriter, r *http.Request) {
 
 // handleLookup 返回路径的 inode 及（对文件而言）副本所在的节点地址列表。
 // 客户端拿到节点地址后直连读写，不经过 master 中转。
+// 每个节点带 done 标记：true = 已确认同步完成，读优先挑这些节点。
 func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 	in, err := s.store.ResolvePath(r.URL.Query().Get("path"))
 	if err != nil {
@@ -92,17 +96,79 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := struct {
-		Inode types.Inode   `json:"inode"`
-		Nodes []types.NodeInfo `json:"nodes"` // 按 inode.Replicas 顺序给出节点详情
+		Inode types.Inode `json:"inode"`
+		Nodes []nodeEntry `json:"nodes"` // 按 inode.Replicas 顺序给出节点详情
 	}{Inode: in}
 	for _, id := range in.Replicas {
 		n, err := s.store.GetNode(id)
 		if err != nil {
 			continue // 节点可能已注销，跳过
 		}
-		resp.Nodes = append(resp.Nodes, n)
+		resp.Nodes = append(resp.Nodes, nodeEntry{NodeInfo: n, Done: contains(in.DoneReplicas, id)})
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// nodeEntry 是 lookup 响应中的节点条目：节点详情 + 副本同步状态。
+type nodeEntry struct {
+	types.NodeInfo
+	Done bool `json:"done"`
+}
+
+func contains(list []uint64, v uint64) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// handleReplicaTargets 主副本节点查询：除自己外还需要推送到哪些节点。
+// ?inode_id=N&node_id=self
+func (s *Server) handleReplicaTargets(w http.ResponseWriter, r *http.Request) {
+	inodeID, _ := strconv.ParseUint(r.URL.Query().Get("inode_id"), 10, 64)
+	nodeID, _ := strconv.ParseUint(r.URL.Query().Get("node_id"), 10, 64)
+	if inodeID == 0 || nodeID == 0 {
+		httpError(w, http.StatusBadRequest, "inode_id and node_id required")
+		return
+	}
+	in, err := s.store.GetInode(inodeID)
+	if err != nil {
+		httpErrorFromMeta(w, err)
+		return
+	}
+	var targets []types.NodeInfo
+	for _, id := range in.Replicas {
+		if id == nodeID || contains(in.DoneReplicas, id) {
+			continue // 跳过自己和已完成的
+		}
+		if n, err := s.store.GetNode(id); err == nil {
+			targets = append(targets, n)
+		}
+	}
+	writeJSON(w, http.StatusOK, targets)
+}
+
+// handleReplicated 从副本同步完成后上报，把自己加入 DoneReplicas。
+func (s *Server) handleReplicated(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InodeID uint64 `json:"inode_id"`
+		NodeID  uint64 `json:"node_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	if req.InodeID == 0 || req.NodeID == 0 {
+		httpError(w, http.StatusBadRequest, "inode_id and node_id required")
+		return
+	}
+	if err := s.store.AddReplicaDone(req.InodeID, req.NodeID); err != nil {
+		httpErrorFromMeta(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // ---- 文件 ----
@@ -184,16 +250,41 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.Type == types.TypeFile {
-		// TODO(阶段4): 通知各副本节点回收对象。当前先只删元数据。
-		err = s.store.DeleteFile(in.ID)
+		// 先删元数据（客户端立刻看不到该文件），再异步通知各副本节点回收对象。
+		// 回收失败不阻塞删除请求；残留对象由阶段 4 的对账任务兜底清理。
+		if err := s.store.DeleteFile(in.ID); err != nil {
+			httpErrorFromMeta(w, err)
+			return
+		}
+		go s.notifyObjectDelete(in.ID, in.Replicas)
 	} else {
-		err = s.store.DeleteDir(in.ID)
-	}
-	if err != nil {
-		httpErrorFromMeta(w, err)
-		return
+		if err := s.store.DeleteDir(in.ID); err != nil {
+			httpErrorFromMeta(w, err)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// notifyObjectDelete 通知持有该对象的所有节点删除本地文件。
+func (s *Server) notifyObjectDelete(inodeID uint64, replicaNodeIDs []uint64) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, id := range replicaNodeIDs {
+		n, err := s.store.GetNode(id)
+		if err != nil {
+			continue
+		}
+		req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("http://%s/objects/%d", n.Addr, inodeID), nil)
+		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("通知节点 %d 删除对象 %d 失败: %v", id, inodeID, err)
+			continue
+		}
+		resp.Body.Close()
+	}
 }
 
 // ---- 节点 ----

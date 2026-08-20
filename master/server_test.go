@@ -251,6 +251,67 @@ func TestInvalidPathRejected(t *testing.T) {
 	}
 }
 
+// 阶段2：replica-targets 查询（跳过自己与已完成节点）+ replicated 上报。
+func TestReplicaTargetsAndReplicated(t *testing.T) {
+	ts := newTestServer(t)
+	n1 := registerNode(t, ts.URL, 1)
+	n2 := registerNode(t, ts.URL, 2)
+	n3 := registerNode(t, ts.URL, 3)
+
+	// 3 副本文件。
+	var created struct {
+		Inode struct {
+			ID uint64 `json:"id"`
+		} `json:"inode"`
+	}
+	postJSON(t, ts.URL+"/files", map[string]any{"path": "/r.bin", "replicas": 3}, &created)
+	id := created.Inode.ID
+
+	// n1 视角：目标应是 n2、n3（不含自己）。
+	var targets []struct {
+		ID   uint64 `json:"id"`
+		Addr string `json:"addr"`
+	}
+	resp := getJSON(t, ts.URL+fmt.Sprintf("/files/replica-targets?inode_id=%d&node_id=%d", id, n1), &targets)
+	if resp.StatusCode != http.StatusOK || len(targets) != 2 {
+		t.Fatalf("replica-targets = %d 个目标 (status %d), want 2", len(targets), resp.StatusCode)
+	}
+	for _, tg := range targets {
+		if tg.ID == n1 || tg.Addr == "" {
+			t.Fatalf("目标不应包含自己或空地址: %+v", tg)
+		}
+	}
+
+	// commit（主副本完成）后，n1 上报 n2 同步完成。
+	postJSON(t, ts.URL+"/files/commit", map[string]any{"inode_id": id, "size": 10}, nil)
+	postJSON(t, ts.URL+"/files/replicated", map[string]any{"inode_id": id, "node_id": n2}, nil)
+
+	// 再查 n1 的目标：只剩 n3。
+	resp = getJSON(t, ts.URL+fmt.Sprintf("/files/replica-targets?inode_id=%d&node_id=%d", id, n1), &targets)
+	if resp.StatusCode != http.StatusOK || len(targets) != 1 || targets[0].ID != n3 {
+		t.Fatalf("上报后目标应只剩 n3: %+v", targets)
+	}
+
+	// lookup 应标注 done：主副本(n1) 与 n2 done，n3 未 done。
+	var out struct {
+		Inode struct {
+			DoneReplicas []uint64 `json:"done_replicas"`
+		} `json:"inode"`
+		Nodes []struct {
+			ID   uint64 `json:"id"`
+			Done bool   `json:"done"`
+		} `json:"nodes"`
+	}
+	getJSON(t, ts.URL+"/meta?path=/r.bin", &out)
+	doneMap := map[uint64]bool{}
+	for _, nd := range out.Nodes {
+		doneMap[nd.ID] = nd.Done
+	}
+	if !doneMap[n1] || !doneMap[n2] || doneMap[n3] {
+		t.Fatalf("done 标注不符: %+v", out.Nodes)
+	}
+}
+
 func TestSplitPath(t *testing.T) {
 	cases := []struct{ in, parent, name string }{
 		{"/a/b/c.txt", "/a/b", "c.txt"},

@@ -304,7 +304,8 @@ func (s *Store) Rename(id uint64, newName string) error {
 	})
 }
 
-// UpdateFileSize 只更新文件大小与修改时间（客户端写完成回报用），副本位置不变。
+// UpdateFileSize 更新文件大小，并把主副本（Replicas[0]）标记为已同步。
+// 客户端直连主副本写完数据后 commit 时调用。
 func (s *Store) UpdateFileSize(id uint64, size int64) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		in, err := getInodeTx(tx, id)
@@ -316,8 +317,36 @@ func (s *Store) UpdateFileSize(id uint64, size int64) error {
 		}
 		in.Size = size
 		in.Mtime = time.Now()
+		if len(in.Replicas) > 0 {
+			in.DoneReplicas = appendUnique(in.DoneReplicas, in.Replicas[0])
+		}
 		return putInode(tx, &in)
 	})
+}
+
+// AddReplicaDone 把某节点加入文件的已完成副本列表（从副本同步完成后上报）。
+func (s *Store) AddReplicaDone(id, nodeID uint64) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		in, err := getInodeTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if in.Type != types.TypeFile {
+			return ErrNotFile
+		}
+		in.DoneReplicas = appendUnique(in.DoneReplicas, nodeID)
+		return putInode(tx, &in)
+	})
+}
+
+// appendUnique 追加不重复的元素。
+func appendUnique(list []uint64, v uint64) []uint64 {
+	for _, x := range list {
+		if x == v {
+			return list
+		}
+	}
+	return append(list, v)
 }
 
 // UpdateFile 更新文件大小与副本位置（写完成后调用）。
