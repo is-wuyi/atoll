@@ -282,19 +282,47 @@ func TestReplicaTargetsAndReplicated(t *testing.T) {
 		}
 	}
 
-	// commit（主副本完成）后，n1 上报 n2 同步完成。
+	// commit（主副本完成）后，n2 上报同步完成。
 	postJSON(t, ts.URL+"/files/commit", map[string]any{"inode_id": id, "size": 10}, nil)
 	postJSON(t, ts.URL+"/files/replicated", map[string]any{"inode_id": id, "node_id": n2}, nil)
 
-	// 再查 n1 的目标：只剩 n3。
+	// 重新查询元数据，动态计算 n1 视角的期望目标：
+	// 全部副本 - 自己(n1) - 已完成(DoneReplicas)。分配是随机 shuffle 的，不能硬编码。
+	var meta2 struct {
+		Inode struct {
+			Replicas     []uint64 `json:"replicas"`
+			DoneReplicas []uint64 `json:"done_replicas"`
+		} `json:"inode"`
+	}
+	getJSON(t, ts.URL+"/meta?path=/r.bin", &meta2)
+	doneSet := map[uint64]bool{}
+	for _, d := range meta2.Inode.DoneReplicas {
+		doneSet[d] = true
+	}
+	var want []uint64
+	for _, r := range meta2.Inode.Replicas {
+		if r != n1 && !doneSet[r] {
+			want = append(want, r)
+		}
+	}
 	resp = getJSON(t, ts.URL+fmt.Sprintf("/files/replica-targets?inode_id=%d&node_id=%d", id, n1), &targets)
-	if resp.StatusCode != http.StatusOK || len(targets) != 1 || targets[0].ID != n3 {
-		t.Fatalf("上报后目标应只剩 n3: %+v", targets)
+	if resp.StatusCode != http.StatusOK || len(targets) != len(want) {
+		t.Fatalf("目标数 = %d (status %d), 期望 %d 个: %+v", len(targets), resp.StatusCode, len(want), targets)
+	}
+	gotSet := map[uint64]bool{}
+	for _, tg := range targets {
+		gotSet[tg.ID] = true
+	}
+	for _, w := range want {
+		if !gotSet[w] {
+			t.Fatalf("期望目标 %d 不在结果中: %+v", w, targets)
+		}
 	}
 
-	// lookup 应标注 done：主副本(n1) 与 n2 done，n3 未 done。
+	// lookup 应正确标注 done：完成集合 = {主副本, n2}。
 	var out struct {
 		Inode struct {
+			Replicas     []uint64 `json:"replicas"`
 			DoneReplicas []uint64 `json:"done_replicas"`
 		} `json:"inode"`
 		Nodes []struct {
@@ -303,12 +331,12 @@ func TestReplicaTargetsAndReplicated(t *testing.T) {
 		} `json:"nodes"`
 	}
 	getJSON(t, ts.URL+"/meta?path=/r.bin", &out)
-	doneMap := map[uint64]bool{}
+	primary := out.Inode.Replicas[0] // commit 标记的是主副本
+	wantDone := map[uint64]bool{primary: true, n2: true}
 	for _, nd := range out.Nodes {
-		doneMap[nd.ID] = nd.Done
-	}
-	if !doneMap[n1] || !doneMap[n2] || doneMap[n3] {
-		t.Fatalf("done 标注不符: %+v", out.Nodes)
+		if nd.Done != wantDone[nd.ID] {
+			t.Fatalf("节点 %d done=%v, 期望 %v", nd.ID, nd.Done, wantDone[nd.ID])
+		}
 	}
 }
 
