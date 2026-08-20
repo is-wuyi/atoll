@@ -277,16 +277,24 @@ func (n *node) Create(ctx context.Context, name string, _ uint32, _ uint32, out 
 }
 
 // Setattr 处理 truncate（打开的写句柄）；其余属性修改忽略。
+// 内核对 O_TRUNC 的实现：OPEN(WRONLY) 后发不带句柄的 SETATTR(size=0)
+// （未协商 ATOMIC_O_TRUNC 时），此时 f 为 nil——按路径查活跃写缓冲。
 func (n *node) Setattr(_ context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	if sz, ok := in.GetSize(); ok {
-		if w, ok := f.(*writeHandle); ok {
-			if errno := w.truncate(sz); errno != 0 {
-				return errno
-			}
-			w.attr(&out.Attr)
-			return 0
+		w, _ := f.(*writeHandle)
+		if w == nil {
+			n.m.mu.Lock()
+			w = n.m.writes[n.path()]
+			n.m.mu.Unlock()
 		}
-		return syscall.ENOTSUP
+		if w == nil {
+			return syscall.ENOTSUP
+		}
+		if errno := w.truncate(sz); errno != 0 {
+			return errno
+		}
+		w.attr(&out.Attr)
+		return 0
 	}
 	// 其余（mtime/chmod）接受但不动集群元数据。
 	in2, _, err := n.m.client.Lookup(n.path())
