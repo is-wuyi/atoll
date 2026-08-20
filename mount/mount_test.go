@@ -13,9 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hanwen/go-fuse/v2/fs"
-	"github.com/hanwen/go-fuse/v2/fuse"
-
 	"atoll/client"
 	"atoll/master"
 	"atoll/master/meta"
@@ -63,129 +60,6 @@ func newTestCluster(t *testing.T, numNodes int) (*client.Client, *Mount) {
 	return c, m
 }
 
-// 内核挂载 e2e：需要 /dev/fuse；不可用（如无权限环境）则跳过。
-// 覆盖：mkdir/写文件/读回/分段读/ls/rename/跨目录拒绝/rm/stat。
-func TestKernelMount(t *testing.T) {
-	// 必须在挂载前检查：fs.Mount 会阻塞等待内核响应，
-	// 如果 /dev/fuse 不可用或 FUSE 模块没加载，进程会永久挂起。
-	if _, err := os.Stat("/dev/fuse"); err != nil {
-		t.Skip("/dev/fuse 不可用，跳过内核挂载测试")
-	}
-	if isFUSEBlocked() {
-		t.Skip("FUSE 模块不可用或被阻止，跳过内核挂载测试")
-	}
-	c, m := newTestCluster(t, 2)
-
-	mnt := t.TempDir()
-	server, err := fs.Mount(mnt, m.Root(), &fs.Options{
-		MountOptions: fuse.MountOptions{Name: "atoll-test"},
-	})
-	if err != nil {
-		t.Skipf("挂载失败（环境不支持）: %v", err)
-	}
-	t.Cleanup(func() { server.Unmount() })
-
-	// ---- 目录 ----
-	if err := os.Mkdir(filepath.Join(mnt, "dir"), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-
-	// ---- 写文件（Create→Write→Flush 整传）----
-	content := []byte("kernel mounted atoll! 0123456789")
-	if err := os.WriteFile(filepath.Join(mnt, "dir", "k.txt"), content, 0o644); err != nil {
-		t.Fatalf("写文件: %v", err)
-	}
-
-	// ---- 读回（Range 读）----
-	got, err := os.ReadFile(filepath.Join(mnt, "dir", "k.txt"))
-	if err != nil || !bytes.Equal(got, content) {
-		t.Fatalf("读回: %v %q", err, got)
-	}
-
-	// ---- 分段读（dd 式 offset 读取，验证 Range 逻辑）----
-	f, err := os.Open(filepath.Join(mnt, "dir", "k.txt"))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	buf := make([]byte, 6)
-	if _, err := f.ReadAt(buf, 7); err != nil {
-		t.Fatalf("ReadAt: %v", err)
-	}
-	if string(buf) != "mounted" {
-		t.Fatalf("分段读: %q", buf)
-	}
-	f.Close()
-
-	// ---- 覆盖写（Open O_TRUNC）----
-	if err := os.WriteFile(filepath.Join(mnt, "dir", "k.txt"), []byte("short"), 0o644); err != nil {
-		t.Fatalf("覆盖写: %v", err)
-	}
-	got2, _ := os.ReadFile(filepath.Join(mnt, "dir", "k.txt"))
-	if string(got2) != "short" {
-		t.Fatalf("覆盖后内容: %q", got2)
-	}
-
-	// ---- ls ----
-	ents, err := os.ReadDir(filepath.Join(mnt, "dir"))
-	if err != nil || len(ents) != 1 || ents[0].Name() != "k.txt" {
-		t.Fatalf("ls: %v %+v", err, ents)
-	}
-
-	// ---- stat ----
-	st, err := os.Stat(filepath.Join(mnt, "dir", "k.txt"))
-	if err != nil || st.Size() != 5 || st.Mode().IsRegular() == false {
-		t.Fatalf("stat: %v %+v", err, st)
-	}
-
-	// ---- rename 同目录 ----
-	if err := os.Rename(filepath.Join(mnt, "dir", "k.txt"), filepath.Join(mnt, "dir", "k2.txt")); err != nil {
-		t.Fatalf("rename: %v", err)
-	}
-
-	// ---- 跨目录 rename → EXDEV ----
-	if err := os.Rename(filepath.Join(mnt, "dir", "k2.txt"), filepath.Join(mnt, "top.txt")); err == nil {
-		t.Fatal("跨目录 rename 应失败（EXDEV）")
-	}
-
-	// ---- rm ----
-	if err := os.Remove(filepath.Join(mnt, "dir", "k2.txt")); err != nil {
-		t.Fatalf("remove: %v", err)
-	}
-	// ---- rmdir（空目录）----
-	if err := os.Remove(filepath.Join(mnt, "dir")); err != nil {
-		t.Fatalf("rmdir: %v", err)
-	}
-
-	// ---- 集群侧独立验证 ----
-	if _, _, err := c.Lookup("/dir"); err == nil {
-		t.Fatal("集群侧 /dir 应已删除")
-	}
-
-	// ---- 大文件 Range 读验证（512KB，跨多个读块）----
-	big := bytes.Repeat([]byte("A"), 512*1024)
-	if err := os.WriteFile(filepath.Join(mnt, "big.bin"), big, 0o644); err != nil {
-		t.Fatalf("写大文件: %v", err)
-	}
-	bf, _ := os.Open(filepath.Join(mnt, "big.bin"))
-	tail := make([]byte, 4096)
-	if _, err := bf.ReadAt(tail, 500*1024); err != nil {
-		t.Fatalf("大文件尾部分段读: %v", err)
-	}
-	if !bytes.Equal(tail, bytes.Repeat([]byte("A"), 4096)) {
-		t.Fatal("大文件分段读内容不符")
-	}
-	bf.Close()
-}
-
-// isFUSEBlocked 检查 FUSE 内核模块是否真正可用。
-// 容器环境可能有 /dev/fuse 字符设备但模块未加载，
-// 此时任何 open 操作都会永久阻塞。
-// 通过检查 /sys/module/fuse 是否存在来判断。
-func isFUSEBlocked() bool {
-	_, err := os.Stat("/sys/module/fuse")
-	return err != nil
-}
-
 // 纯函数：candidateAddrs 的 done 优先语义。
 func TestCandidateAddrs(t *testing.T) {
 	reps := []client.Replica{
@@ -223,3 +97,6 @@ func TestMapErrno(t *testing.T) {
 		}
 	}
 }
+
+// 内核挂载 e2e 测试在 mount_fuse_test.go 中（需要 //go:build fuse）。
+// 运行方式: go test -tags fuse -run TestKernelMount ./mount/
