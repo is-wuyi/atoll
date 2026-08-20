@@ -256,7 +256,7 @@ func TestReplicaTargetsAndReplicated(t *testing.T) {
 	ts := newTestServer(t)
 	n1 := registerNode(t, ts.URL, 1)
 	n2 := registerNode(t, ts.URL, 2)
-	n3 := registerNode(t, ts.URL, 3)
+	registerNode(t, ts.URL, 3)
 
 	// 3 副本文件。
 	var created struct {
