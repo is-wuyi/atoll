@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"atoll/master/meta"
@@ -38,6 +39,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /files/commit", s.handleCommitFile)
 	mux.HandleFunc("GET /files/replica-targets", s.handleReplicaTargets) // node 查询推送目标
 	mux.HandleFunc("POST /files/replicated", s.handleReplicated)         // 从副本上报同步完成
+	mux.HandleFunc("POST /entry/rename", s.handleRename)                 // 同目录改名
 	mux.HandleFunc("DELETE /entry", s.handleDelete) // ?path=/a/b
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("POST /nodes/heartbeat", s.handleNodeHeartbeat)
@@ -271,6 +273,33 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 			httpErrorFromMeta(w, err)
 			return
 		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleRename 同目录内改名：POST /entry/rename {"path":..., "new_name":...}
+func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path    string `json:"path"`
+		NewName string `json:"new_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	if req.NewName == "" || req.NewName == "." || req.NewName == ".." ||
+		strings.Contains(req.NewName, "/") {
+		httpError(w, http.StatusBadRequest, "invalid new_name")
+		return
+	}
+	in, err := s.store.ResolvePath(req.Path)
+	if err != nil {
+		httpError(w, http.StatusNotFound, "path not found")
+		return
+	}
+	if err := s.store.Rename(in.ID, req.NewName); err != nil {
+		httpErrorFromMeta(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

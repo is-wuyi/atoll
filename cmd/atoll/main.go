@@ -1,6 +1,6 @@
 // atoll 是一个分布式文件存储系统（项目名：环礁）。
-// 单一二进制包含三种角色：master（中心服务器）、node（存储节点）、
-// 以及 CLI 客户端命令 put/get/ls/mkdir/rm；mount 子命令在阶段 3 实现。
+// 单一二进制包含三种角色：master（中心服务器）、node（存储节点），
+// CLI 客户端命令 put/get/ls/mkdir/rm，以及 FUSE 挂载命令 mount。
 package main
 
 import (
@@ -10,12 +10,19 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/hanwen/go-fuse/v2/fs/pathfs"
 
 	"atoll/client"
 	"atoll/master"
 	"atoll/master/meta"
+	"atoll/mount"
 	"atoll/node"
 )
 
@@ -26,11 +33,12 @@ const usageText = `usage: atoll <command> [args]
   atoll node     启动存储节点（对象存储 + 心跳）
 
 客户端命令 (可用 -master 或环境变量 ATOLL_MASTER 指定 master 地址):
-  atoll put <本地文件> <远程路径>    上传文件
+  atoll put <本地文件> <远程路径>    上传文件 [-replicas N]
   atoll get <远程路径> <本地文件>    下载文件
   atoll ls  <远程路径>              列目录
   atoll mkdir <远程路径>            建目录
-  atoll rm  <远程路径>              删除文件/空目录`
+  atoll rm  <远程路径>              删除文件/空目录
+  atoll mount <挂载点>              FUSE 挂载为本地目录 [-cache 缓冲目录 -replicas N]`
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -47,6 +55,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runMaster(rest, stderr)
 	case "node":
 		return runNode(rest, stderr)
+	case "mount":
+		return runMount(rest, stderr)
 	case "put", "get", "ls", "mkdir", "rm":
 		return runClientCmd(cmd, rest, stdout, stderr)
 	case "help", "-h", "--help":
@@ -123,6 +133,54 @@ func runNode(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "atoll node: %v\n", err)
 		return 1
 	}
+	return 0
+}
+
+// ---- FUSE 挂载 ----
+
+func runMount(args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
+	replicas := fs.Int("replicas", 2, "新写入文件的副本数")
+	cacheDir := fs.String("cache", filepath.Join(os.TempDir(), "atoll-cache"), "写缓冲临时目录")
+	debug := fs.Bool("debug", false, "输出 FUSE 调试日志")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "用法: atoll mount [-cache 目录] <挂载点>")
+		return 2
+	}
+	mountPoint := fs.Arg(0)
+	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
+		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
+		return 1
+	}
+
+	c := client.New(*masterURL)
+	m, err := mount.New(c, *cacheDir, *replicas)
+	if err != nil {
+		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
+		return 1
+	}
+	server, err := fs.Mount(mountPoint, m.Root(), &fs.Options{
+		MountOptions: fuse.MountOptions{Name: "atoll", Debug: *debug},
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
+		return 1
+	}
+
+	// Ctrl-C / SIGTERM 时卸载退出。
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	fmt.Fprintf(stderr, "atoll 已挂载到 %s（Ctrl-C 卸载）\n", mountPoint)
+	go func() {
+		<-sig
+		server.Unmount()
+	}()
+	server.Wait()
 	return 0
 }
 

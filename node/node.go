@@ -232,7 +232,8 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]int64{"size": size})
 }
 
-// handleGet 读出对象内容。
+// handleGet 读出对象内容。支持单区间 Range 请求（206 部分内容），
+// 供 FUSE 客户端按偏移读取，避免拉取整个对象。
 func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseObjectID(w, r)
 	if !ok {
@@ -248,10 +249,78 @@ func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	if rng := r.Header.Get("Range"); rng != "" {
+		start, end, ok := parseRange(rng, st.Size())
+		if !ok {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", st.Size()))
+			httpError(w, http.StatusRequestedRangeNotSatisfiable, "invalid range")
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, st.Size()))
+		w.WriteHeader(http.StatusPartialContent)
+		if _, err := f.Seek(start, io.SeekStart); err == nil {
+			if _, err := io.CopyN(w, f, end-start+1); err != nil {
+				log.Printf("serve object %d range: %v", id, err)
+			}
+		}
+		return
+	}
 	if _, err := io.Copy(w, f); err != nil {
 		log.Printf("serve object %d: %v", id, err)
 	}
+}
+
+// parseRange 解析 "bytes=start-end"（end 可省略；后缀式 bytes=-N 也支持）。
+// 返回闭区间 [start, end]；非法、多区间或越界返回 ok=false。
+func parseRange(h string, size int64) (start, end int64, ok bool) {
+	const prefix = "bytes="
+	if !strings.HasPrefix(h, prefix) {
+		return 0, 0, false
+	}
+	spec := h[len(prefix):]
+	if strings.Contains(spec, ",") {
+		return 0, 0, false // 多区间不支持
+	}
+	dash := strings.Index(spec, "-")
+	if dash < 0 {
+		return 0, 0, false
+	}
+	left, right := spec[:dash], spec[dash+1:]
+	if left == "" {
+		// 后缀长度：bytes=-N，取最后 N 字节（N 超过文件大小则整个文件）。
+		var n int64
+		if _, err := fmt.Sscanf(right, "%d", &n); err != nil || n <= 0 {
+			return 0, 0, false
+		}
+		start = size - n
+		if start < 0 {
+			start = 0
+		}
+		return start, size - 1, true
+	}
+	if _, err := fmt.Sscanf(left, "%d", &start); err != nil {
+		return 0, 0, false
+	}
+	if right == "" {
+		end = size - 1
+	} else if _, err := fmt.Sscanf(right, "%d", &end); err != nil {
+		return 0, 0, false
+	}
+	if start < 0 || end < start || start >= size {
+		return 0, 0, false
+	}
+	if end >= size {
+		end = size - 1
+	}
+	return start, end, true
 }
 
 // handleDelete 删除对象。

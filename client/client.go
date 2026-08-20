@@ -59,22 +59,32 @@ func (c *Client) Rm(path string) error {
 	return statusError(resp)
 }
 
-// replicaNode 是 lookup 返回的节点条目：地址 + 副本同步状态。
-type replicaNode struct {
+// Replica 是 Lookup 返回的节点条目：地址 + 副本同步状态。
+type Replica struct {
 	Addr string `json:"addr"`
 	Done bool   `json:"done"`
 }
 
-// lookup 查询路径的 inode 与副本节点详情。
-func (c *Client) lookup(path string) (types.Inode, []replicaNode, error) {
+// Lookup 查询路径的 inode 与副本节点详情（导出供挂载层使用）。
+func (c *Client) Lookup(path string) (types.Inode, []Replica, error) {
 	var out struct {
-		Inode types.Inode   `json:"inode"`
-		Nodes []replicaNode `json:"nodes"`
+		Inode types.Inode `json:"inode"`
+		Nodes []Replica   `json:"nodes"`
 	}
 	if err := c.getJSON("/meta?"+queryPath(path), &out); err != nil {
 		return types.Inode{}, nil, err
 	}
 	return out.Inode, out.Nodes, nil
+}
+
+// lookup 内部使用（保持旧名）。
+func (c *Client) lookup(path string) (types.Inode, []Replica, error) {
+	return c.Lookup(path)
+}
+
+// Rename 同目录内改名。
+func (c *Client) Rename(path, newName string) error {
+	return c.postJSON("/entry/rename", map[string]string{"path": path, "new_name": newName}, nil)
 }
 
 // ---- 数据操作 ----
@@ -92,10 +102,15 @@ func (c *Client) Put(localPath, remotePath string, replicas int) error {
 	if err != nil {
 		return fmt.Errorf("stat local: %w", err)
 	}
+	return c.PutReader(remotePath, st.Size(), f, replicas)
+}
 
+// PutReader 从 io.Reader 上传：创建元数据 → 直连主副本写 → commit。
+// 供 FUSE 挂载层在 flush 时把本地缓冲文件整体上传。
+func (c *Client) PutReader(remotePath string, size int64, r io.Reader, replicas int) error {
 	// 1. 在 master 创建文件记录并获取副本节点（第一个为主副本）。
 	var created struct {
-		Inode types.Inode     `json:"inode"`
+		Inode types.Inode      `json:"inode"`
 		Nodes []types.NodeInfo `json:"nodes"`
 	}
 	if err := c.postJSON("/files", map[string]any{"path": remotePath, "replicas": replicas}, &created); err != nil {
@@ -106,12 +121,12 @@ func (c *Client) Put(localPath, remotePath string, replicas int) error {
 	}
 
 	// 2. 直连主副本写入数据。
-	if err := c.putObject(created.Nodes[0].Addr, created.Inode.ID, f); err != nil {
+	if err := c.putObject(created.Nodes[0].Addr, created.Inode.ID, r); err != nil {
 		return fmt.Errorf("write object: %w", err)
 	}
 
 	// 3. commit 实际大小（主副本会随后异步推送到其余节点）。
-	return c.postJSON("/files/commit", map[string]any{"inode_id": created.Inode.ID, "size": st.Size()}, nil)
+	return c.postJSON("/files/commit", map[string]any{"inode_id": created.Inode.ID, "size": size}, nil)
 }
 
 // Get 下载远程文件：查元数据 → 优先从已同步完成的副本随机挑一个直连读。
