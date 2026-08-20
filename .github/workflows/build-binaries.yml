@@ -1,0 +1,36 @@
+name: Build Binaries
+
+on:
+  workflow_dispatch: # 手动触发：gh workflow run build-binaries.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build -trimpath -ldflags "-s -w" -o dist/atoll-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/atoll
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atoll-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/

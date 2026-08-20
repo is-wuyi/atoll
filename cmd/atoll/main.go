@@ -91,7 +91,7 @@ func runNode(args []string, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
 	listen := fs.String("listen", ":9421", "监听地址")
-	advertise := fs.String("advertise", "", "注册到 master 的直连地址（默认取 listen 去掉前导冒号）")
+	advertise := fs.String("advertise", "", "注册到 master 供客户端直连的地址；跨机部署必须显式指定（如 203.0.113.5:9421）")
 	dataDir := fs.String("data-dir", "./node-data", "对象存储目录")
 	totalBytes := fs.Int64("total-bytes", 100<<30, "声明容量（字节）")
 	if err := fs.Parse(args); err != nil {
@@ -99,7 +99,11 @@ func runNode(args []string, stderr io.Writer) int {
 	}
 	adv := *advertise
 	if adv == "" {
-		adv = strings.TrimPrefix(*listen, ":") // ":9421" → "9421"，本机测试场景够用
+		if strings.HasPrefix(*listen, ":") {
+			adv = "127.0.0.1" + *listen // ":9421" → "127.0.0.1:9421"，仅本机测试场景够用
+		} else {
+			adv = *listen
+		}
 	}
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
 		fmt.Fprintf(stderr, "atoll node: %v\n", err)
