@@ -140,7 +140,7 @@ func (c *Client) Get(remotePath, localPath string) error {
 	if len(nodes) == 0 {
 		return fmt.Errorf("无可用副本节点")
 	}
-	var candidates []replicaNode
+	var candidates []Replica
 	for _, nd := range nodes {
 		if nd.Done {
 			candidates = append(candidates, nd)
