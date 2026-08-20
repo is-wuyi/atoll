@@ -79,6 +79,11 @@ func (c *Client) Put(localPath, remotePath string) error {
 		return fmt.Errorf("open local: %w", err)
 	}
 	defer f.Close()
+	// 先取大小：http 客户端发送请求体后会关闭 body，之后不能再 Stat。
+	st, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat local: %w", err)
+	}
 
 	// 1. 在 master 创建文件记录并获取副本节点（阶段1副本数 1）。
 	var created struct {
@@ -98,10 +103,6 @@ func (c *Client) Put(localPath, remotePath string) error {
 	}
 
 	// 3. commit 实际大小。
-	st, err := f.Stat()
-	if err != nil {
-		return err
-	}
 	return c.postJSON("/files/commit", map[string]any{"inode_id": created.Inode.ID, "size": st.Size()}, nil)
 }
 
