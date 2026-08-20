@@ -223,6 +223,8 @@ else
 fi
 
 # ── 12. rmdir 删除空目录 ──
+# 确保目录为空（跨目录 mv 测试可能在 sub_a 中留下了文件）
+rm -f "${TEST_DIR}/sub_a/"* 2>/dev/null || true
 if rmdir "${TEST_DIR}/sub_a" 2>/dev/null; then
   if [ ! -d "${TEST_DIR}/sub_a" ]; then
     record "rmdir 删除空目录" "PASS"
