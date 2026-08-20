@@ -1,7 +1,6 @@
 package mount
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
