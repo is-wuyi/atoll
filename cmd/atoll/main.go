@@ -139,20 +139,20 @@ func runNode(args []string, stderr io.Writer) int {
 // ---- FUSE 挂载 ----
 
 func runMount(args []string, stderr io.Writer) int {
-	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
-	replicas := fs.Int("replicas", 2, "新写入文件的副本数")
-	cacheDir := fs.String("cache", filepath.Join(os.TempDir(), "atoll-cache"), "写缓冲临时目录")
-	debug := fs.Bool("debug", false, "输出 FUSE 调试日志")
-	if err := fs.Parse(args); err != nil {
+	fset := flag.NewFlagSet("mount", flag.ContinueOnError)
+	fset.SetOutput(stderr)
+	masterURL := fset.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
+	replicas := fset.Int("replicas", 2, "新写入文件的副本数")
+	cacheDir := fset.String("cache", filepath.Join(os.TempDir(), "atoll-cache"), "写缓冲临时目录")
+	debug := fset.Bool("debug", false, "输出 FUSE 调试日志")
+	if err := fset.Parse(args); err != nil {
 		return 2
 	}
-	if fs.NArg() != 1 {
+	if fset.NArg() != 1 {
 		fmt.Fprintln(stderr, "用法: atoll mount [-cache 目录] <挂载点>")
 		return 2
 	}
-	mountPoint := fs.Arg(0)
+	mountPoint := fset.Arg(0)
 	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
 		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
 		return 1
