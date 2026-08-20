@@ -35,7 +35,7 @@ func newTestCluster(t *testing.T, numNodes int) (*client.Client, *Mount) {
 	t.Cleanup(func() { masterSrv.Close() })
 
 	for i := 0; i < numNodes; i++ {
-		n := node.New(filepath.Join(t.TempDir(), "data"), masterSrv.URL, "", 1<<30)
+		n := atollnode.New(filepath.Join(t.TempDir(), "data"), masterSrv.URL, "", 1<<30)
 		nodeSrv := httptest.NewServer(n.Handler())
 		t.Cleanup(func() { nodeSrv.Close() })
 
