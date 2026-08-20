@@ -115,6 +115,7 @@ func (c *Client) Put(localPath, remotePath string, replicas int) error {
 
 // Get 下载远程文件：查元数据 → 优先从已同步完成的副本随机挑一个直连读。
 // 若暂无已完成副本（异步复制还在进行），退化为从任意副本尝试。
+// 单个节点不可达/404 时自动转移到下一个副本（故障转移），全部失败才报错。
 func (c *Client) Get(remotePath, localPath string) error {
 	in, nodes, err := c.lookup(remotePath)
 	if err != nil {
@@ -132,24 +133,35 @@ func (c *Client) Get(remotePath, localPath string) error {
 	if len(candidates) == 0 {
 		candidates = nodes // 复制尚未完成，退而求其次
 	}
-	n := candidates[rand.Intn(len(candidates))]
+	// 打乱顺序实现随机负载均衡，然后依次尝试：宕机节点自动跳过。
+	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
 
-	resp, err := c.HTTP.Get(fmt.Sprintf("http://%s/objects/%d", n.Addr, in.ID))
-	if err != nil {
-		return err
+	var lastErr error
+	for _, n := range candidates {
+		resp, err := c.HTTP.Get(fmt.Sprintf("http://%s/objects/%d", n.Addr, in.ID))
+		if err != nil {
+			lastErr = fmt.Errorf("节点 %s: %w", n.Addr, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("节点 %s 返回 %d", n.Addr, resp.StatusCode)
+			continue
+		}
+		out, err := os.Create(localPath)
+		if err != nil {
+			resp.Body.Close()
+			return err
+		}
+		_, copyErr := io.Copy(out, resp.Body)
+		closeErr := out.Close()
+		resp.Body.Close()
+		if copyErr != nil || closeErr != nil {
+			return fmt.Errorf("写本地文件: %v / %v", copyErr, closeErr)
+		}
+		return nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("节点返回 %d", resp.StatusCode)
-	}
-
-	out, err := os.Create(localPath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, resp.Body)
-	return err
+	return fmt.Errorf("所有副本读取失败，最后错误: %w", lastErr)
 }
 
 // putObject 向节点写入对象数据。

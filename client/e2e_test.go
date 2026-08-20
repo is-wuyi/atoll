@@ -244,19 +244,14 @@ func TestFailoverRead(t *testing.T) {
 	}
 	victim.server.Close()
 
-	// 从剩下的副本读——Get 会在 done 节点里随机挑，victim 已关，
-	// 若挑到它会连接失败；随机可能踩坑，重试几次保证不是运气问题。
-	var lastErr error
-	ok := false
-	for i := 0; i < 10 && !ok; i++ {
-		out := filepath.Join(dir, "out.txt")
-		if lastErr = c.Get("/failover.txt", out); lastErr == nil {
-			got, _ := os.ReadFile(out)
-			ok = bytes.Equal(got, content)
-		}
+	// 单次 Get 就应成功：客户端故障转移会跳过宕机节点从其他副本读。
+	out := filepath.Join(dir, "out.txt")
+	if err := c.Get("/failover.txt", out); err != nil {
+		t.Fatalf("主副本宕机后单次读取应故障转移: %v", err)
 	}
-	if !ok {
-		t.Fatalf("主副本宕机后读取失败: %v", lastErr)
+	got, _ := os.ReadFile(out)
+	if !bytes.Equal(got, content) {
+		t.Fatalf("故障转移读回内容不符")
 	}
 }
 
