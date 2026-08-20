@@ -1,5 +1,6 @@
 # 编译产物（只匹配仓库根目录的二进制，避免误伤 cmd/atoll 源码目录）
 /atoll
 dist/
+dist-new/
 *.test
 coverage.out
