@@ -19,7 +19,7 @@ import (
 	"atoll/client"
 	"atoll/master"
 	"atoll/master/meta"
-	"atoll/node"
+	atollnode "atoll/node"
 )
 
 // newTestCluster 拉起 httptest 集群（1 master + N node，真实注册）。
