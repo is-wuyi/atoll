@@ -199,7 +199,10 @@ func (c *Client) Get(remotePath, localPath string) error {
 
 // putObject 向节点写入对象数据。
 func (c *Client) putObject(nodeAddr string, inodeID uint64, r io.Reader) error {
-	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://%s/objects/%d", nodeAddr, inodeID), r)
+	// io.NopCloser 包裹：http transport 上传完成后会关闭 req.Body，
+	// 若直接传 *os.File 会被关掉句柄，导致同一写句柄后续 Write 报 EIO
+	// （实机覆盖写 bug 根因：FLUSH 上传后 transport 关文件 → 再 WRITE 失败）。
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://%s/objects/%d", nodeAddr, inodeID), io.NopCloser(r))
 	if err != nil {
 		return err
 	}

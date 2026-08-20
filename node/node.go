@@ -157,7 +157,8 @@ func (n *Node) pushObject(peerAddr string, inodeID uint64) error {
 		return err
 	}
 	defer f.Close()
-	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://%s/replicate/%d", peerAddr, inodeID), f)
+	// io.NopCloser 包裹：防止 http transport 上传后关闭 *os.File（同 client.putObject）。
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://%s/replicate/%d", peerAddr, inodeID), io.NopCloser(f))
 	if err != nil {
 		return err
 	}

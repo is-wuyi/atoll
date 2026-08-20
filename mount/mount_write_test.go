@@ -250,3 +250,49 @@ func TestWriteHandleTruncate(t *testing.T) {
 
 	w.Release(context.Background())
 }
+
+// TestWriteHandleFlushThenWriteAgain 回归测试：同一句柄 Flush 上传后必须还能继续 Write。
+// 根因：http transport 上传完会关闭 req.Body，直接传 *os.File 会把句柄关掉，
+// 实机表现为 O_TRUNC 覆盖写路径（SETATTR→FLUSH→WRITE）第二次写报 EIO。
+func TestWriteHandleFlushThenWriteAgain(t *testing.T) {
+	c, m := newTestCluster(t, 1)
+
+	ctx := context.Background()
+	w, err := m.newWriteHandle("/reuse.txt", true)
+	if err != nil {
+		t.Fatalf("newWriteHandle: %v", err)
+	}
+
+	// 第一轮：写入 v1 并 Flush（触发上传）。
+	if _, errno := w.Write(ctx, []byte("v1-data"), 0); errno != 0 {
+		t.Fatalf("第一次 Write: %v", errno)
+	}
+	if errno := w.Flush(ctx); errno != 0 {
+		t.Fatalf("第一次 Flush: %v", errno)
+	}
+
+	// 第二轮：同一句柄继续写（旧 bug 在此 EIO：句柄已被 transport 关闭）。
+	if _, errno := w.Write(ctx, []byte("v2-data"), 0); errno != 0 {
+		t.Fatalf("Flush 后再次 Write 失败（句柄被 http transport 关闭的回归 bug）: %v", errno)
+	}
+	if errno := w.truncate(0); errno != 0 {
+		t.Fatalf("truncate: %v", errno)
+	}
+	if _, errno := w.Write(ctx, []byte("v2-data"), 0); errno != 0 {
+		t.Fatalf("truncate 后 Write: %v", errno)
+	}
+	if errno := w.Flush(ctx); errno != 0 {
+		t.Fatalf("第二次 Flush: %v", errno)
+	}
+	w.Release(ctx)
+
+	// 集群侧最终内容必须是第二轮版本。
+	down := filepath.Join(t.TempDir(), "down.txt")
+	if err := c.Get("/reuse.txt", down); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, _ := os.ReadFile(down)
+	if !bytes.Equal(got, []byte("v2-data")) {
+		t.Fatalf("最终内容: %q, want %q", got, "v2-data")
+	}
+}
