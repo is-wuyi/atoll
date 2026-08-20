@@ -16,7 +16,7 @@
 #  11. rm     删除文件
 #  12. rmdir  删除空目录
 
-set -euo pipefail
+set -uo pipefail
 
 # ── 环境变量 ──
 export NO_PROXY="et.net,.et.net,10.126.0.0/16"
@@ -139,14 +139,27 @@ fi
 
 # ── 6. 覆盖写（重点回归项） ──
 OVERWRITE_FILE="${TEST_DIR}/overwrite.txt"
-echo "first write" > "$OVERWRITE_FILE" 2>/dev/null
-echo "second write" > "$OVERWRITE_FILE" 2>/dev/null
-OVERWRITE_ACTUAL=$(cat "$OVERWRITE_FILE" 2>/dev/null)
-OVERWRITE_MD5=$(md5sum "$OVERWRITE_FILE" 2>/dev/null | awk '{print $1}' || md5 -q "$OVERWRITE_FILE" 2>/dev/null || echo "N/A")
-if [ "$OVERWRITE_ACTUAL" = "second write" ] && [ -n "$OVERWRITE_MD5" ]; then
+# 先删除可能残留的旧文件
+rm -f "$OVERWRITE_FILE" 2>/dev/null || true
+FIRST_OK=false
+SECOND_OK=false
+if echo "first write" > "$OVERWRITE_FILE" 2>/dev/null; then
+  FIRST_OK=true
+fi
+if echo "second write" > "$OVERWRITE_FILE" 2>/dev/null; then
+  SECOND_OK=true
+fi
+OVERWRITE_ACTUAL=""
+OVERWRITE_MD5=""
+if [ -f "$OVERWRITE_FILE" ]; then
+  OVERWRITE_ACTUAL=$(cat "$OVERWRITE_FILE" 2>/dev/null || echo "")
+  OVERWRITE_MD5=$(md5sum "$OVERWRITE_FILE" 2>/dev/null | awk '{print $1}' || md5 -q "$OVERWRITE_FILE" 2>/dev/null || echo "N/A")
+fi
+if $FIRST_OK && $SECOND_OK && [ "$OVERWRITE_ACTUAL" = "second write" ] && [ -n "$OVERWRITE_MD5" ]; then
   record "覆盖写 (echo两次+md5)" "PASS"
 else
-  echo "  期望 'second write'，实际 '${OVERWRITE_ACTUAL}'"
+  echo "  首次写入: $FIRST_OK, 二次写入: $SECOND_OK"
+  echo "  读回内容: '${OVERWRITE_ACTUAL}'"
   echo "  md5: ${OVERWRITE_MD5}"
   record "覆盖写 (echo两次+md5)" "FAIL"
 fi
