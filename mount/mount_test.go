@@ -177,15 +177,13 @@ func TestKernelMount(t *testing.T) {
 	bf.Close()
 }
 
-// isFUSEBlocked 检查 FUSE 模块是否真正可用。
-// 通过尝试打开 /dev/fuse 并立即关闭来验证。
+// isFUSEBlocked 检查 FUSE 内核模块是否真正可用。
+// 容器环境可能有 /dev/fuse 字符设备但模块未加载，
+// 此时任何 open 操作都会永久阻塞。
+// 通过检查 /sys/module/fuse 是否存在来判断。
 func isFUSEBlocked() bool {
-	f, err := os.Open("/dev/fuse")
-	if err != nil {
-		return true
-	}
-	f.Close()
-	return false
+	_, err := os.Stat("/sys/module/fuse")
+	return err != nil
 }
 
 // 纯函数：candidateAddrs 的 done 优先语义。
