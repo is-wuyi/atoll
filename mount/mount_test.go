@@ -152,7 +152,7 @@ func TestKernelMount(t *testing.T) {
 	}
 
 	// ---- 集群侧独立验证 ----
-	if _, err := c.Lookup("/dir"); err == nil {
+	if _, _, err := c.Lookup("/dir"); err == nil {
 		t.Fatal("集群侧 /dir 应已删除")
 	}
 
