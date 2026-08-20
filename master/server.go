@@ -139,7 +139,7 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusServiceUnavailable, fmt.Sprintf("alive nodes %d < replicas %d", len(alive), req.Replicas))
 		return
 	}
-	rand.Shuffle(len(alive), func(i, j int) bool { alive[i], alive[j] = alive[j], alive[i] })
+	rand.Shuffle(len(alive), func(i, j int) { alive[i], alive[j] = alive[j], alive[i] })
 	chosen := alive[:req.Replicas]
 	nodeIDs := make([]uint64, len(chosen))
 	for i, n := range chosen {
