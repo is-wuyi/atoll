@@ -304,6 +304,22 @@ func (s *Store) Rename(id uint64, newName string) error {
 	})
 }
 
+// UpdateFileSize 只更新文件大小与修改时间（客户端写完成回报用），副本位置不变。
+func (s *Store) UpdateFileSize(id uint64, size int64) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		in, err := getInodeTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if in.Type != types.TypeFile {
+			return ErrNotFile
+		}
+		in.Size = size
+		in.Mtime = time.Now()
+		return putInode(tx, &in)
+	})
+}
+
 // UpdateFile 更新文件大小与副本位置（写完成后调用）。
 func (s *Store) UpdateFile(id uint64, size int64, replicas []uint64) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
