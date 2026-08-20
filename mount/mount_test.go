@@ -66,8 +66,13 @@ func newTestCluster(t *testing.T, numNodes int) (*client.Client, *Mount) {
 // 内核挂载 e2e：需要 /dev/fuse；不可用（如无权限环境）则跳过。
 // 覆盖：mkdir/写文件/读回/分段读/ls/rename/跨目录拒绝/rm/stat。
 func TestKernelMount(t *testing.T) {
+	// 必须在挂载前检查：fs.Mount 会阻塞等待内核响应，
+	// 如果 /dev/fuse 不可用或 FUSE 模块没加载，进程会永久挂起。
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		t.Skip("/dev/fuse 不可用，跳过内核挂载测试")
+	}
+	if isFUSEBlocked() {
+		t.Skip("FUSE 模块不可用或被阻止，跳过内核挂载测试")
 	}
 	c, m := newTestCluster(t, 2)
 
@@ -170,6 +175,17 @@ func TestKernelMount(t *testing.T) {
 		t.Fatal("大文件分段读内容不符")
 	}
 	bf.Close()
+}
+
+// isFUSEBlocked 检查 FUSE 模块是否真正可用。
+// 通过尝试打开 /dev/fuse 并立即关闭来验证。
+func isFUSEBlocked() bool {
+	f, err := os.Open("/dev/fuse")
+	if err != nil {
+		return true
+	}
+	f.Close()
+	return false
 }
 
 // 纯函数：candidateAddrs 的 done 优先语义。
