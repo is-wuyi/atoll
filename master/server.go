@@ -89,6 +89,7 @@ func (s *Server) handleListChildren(w http.ResponseWriter, r *http.Request) {
 // handleLookup 返回路径的 inode 及（对文件而言）副本所在的节点地址列表。
 // 客户端拿到节点地址后直连读写，不经过 master 中转。
 // 每个节点带 done 标记：true = 已确认同步完成，读优先挑这些节点。
+// 心跳过期（判定宕机）的节点不返回，避免客户端连不可达地址。
 func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 	in, err := s.store.ResolvePath(r.URL.Query().Get("path"))
 	if err != nil {
@@ -103,6 +104,9 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 		n, err := s.store.GetNode(id)
 		if err != nil {
 			continue // 节点可能已注销，跳过
+		}
+		if time.Since(n.LastHeartbeat) > s.nodeMaxAge {
+			continue // 已判定宕机，不提供给客户端
 		}
 		resp.Nodes = append(resp.Nodes, nodeEntry{NodeInfo: n, Done: contains(in.DoneReplicas, id)})
 	}
@@ -143,9 +147,14 @@ func (s *Server) handleReplicaTargets(w http.ResponseWriter, r *http.Request) {
 		if id == nodeID || contains(in.DoneReplicas, id) {
 			continue // 跳过自己和已完成的
 		}
-		if n, err := s.store.GetNode(id); err == nil {
-			targets = append(targets, n)
+		n, err := s.store.GetNode(id)
+		if err != nil {
+			continue
 		}
+		if time.Since(n.LastHeartbeat) > s.nodeMaxAge {
+			continue // 已判定宕机的节点不作为推送目标
+		}
+		targets = append(targets, n)
 	}
 	writeJSON(w, http.StatusOK, targets)
 }

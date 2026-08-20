@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 
 	"atoll/pkg/types"
@@ -130,11 +131,16 @@ func (c *Client) Get(remotePath, localPath string) error {
 			candidates = append(candidates, nd)
 		}
 	}
-	if len(candidates) == 0 {
-		candidates = nodes // 复制尚未完成，退而求其次
+	// 非完成副本追加在后面作为兜底：异步复制中它们可能已落盘只是上报延迟，
+	// 或完成副本全部宕机时从它们抢救数据。
+	for _, nd := range nodes {
+		if !nd.Done {
+			candidates = append(candidates, nd)
+		}
 	}
-	// 打乱顺序实现随机负载均衡，然后依次尝试：宕机节点自动跳过。
+	// done 节点内部打乱实现随机负载均衡（保持 done 整体在前），依次尝试：宕机节点自动跳过。
 	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Done && !candidates[j].Done })
 
 	var lastErr error
 	for _, n := range candidates {

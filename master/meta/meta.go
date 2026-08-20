@@ -368,20 +368,45 @@ func (s *Store) UpdateFile(id uint64, size int64, replicas []uint64) error {
 
 // ---- 存储节点操作 ----
 
-// RegisterNode 注册一个存储节点，返回分配的节点信息。
+// RegisterNode 注册一个存储节点，返回节点信息。
+// 幂等：同一 addr 重复注册（如节点重启）复用原 ID，避免同一物理节点多 ID 并存。
 func (s *Store) RegisterNode(addr string, totalBytes int64) (types.NodeInfo, error) {
 	var n types.NodeInfo
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		id, err := nextID(tx, keyNextNode)
+		b := tx.Bucket(bucketNodes)
+		// 按 addr 找已有记录。
+		var existing *types.NodeInfo
+		err := b.ForEach(func(k, v []byte) error {
+			var cand types.NodeInfo
+			if err := json.Unmarshal(v, &cand); err != nil {
+				return err
+			}
+			if cand.Addr == addr {
+				c := cand
+				existing = &c
+			}
+			return nil
+		})
 		if err != nil {
 			return err
 		}
-		n = types.NodeInfo{ID: id, Addr: addr, TotalBytes: totalBytes, LastHeartbeat: time.Now()}
+		if existing != nil {
+			// 复用 ID，刷新容量与心跳。
+			existing.TotalBytes = totalBytes
+			existing.LastHeartbeat = time.Now()
+			n = *existing
+		} else {
+			id, err := nextID(tx, keyNextNode)
+			if err != nil {
+				return err
+			}
+			n = types.NodeInfo{ID: id, Addr: addr, TotalBytes: totalBytes, LastHeartbeat: time.Now()}
+		}
 		raw, err := json.Marshal(n)
 		if err != nil {
 			return err
 		}
-		return tx.Bucket(bucketNodes).Put(u64be(id), raw)
+		return b.Put(u64be(n.ID), raw)
 	})
 	if err != nil {
 		return types.NodeInfo{}, err

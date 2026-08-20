@@ -179,6 +179,31 @@ func TestNodeRegisterAndHeartbeat(t *testing.T) {
 	}
 }
 
+// 节点重启后重复注册：同一地址应复用原 ID（幂等），而不是产生新记录。
+func TestRegisterNodeIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	n1, _ := s.RegisterNode("27119.et.net:9421", 100)
+	n2, _ := s.RegisterNode("27119.et.net:9421", 200) // 重启后容量变化
+	if n1.ID != n2.ID {
+		t.Fatalf("同一地址重复注册应复用 ID: %d vs %d", n1.ID, n2.ID)
+	}
+	// 只应有一条节点记录。
+	alive, _ := s.ListAliveNodes(time.Hour)
+	if len(alive) != 1 {
+		t.Fatalf("应只有 1 个节点记录, got %d", len(alive))
+	}
+	// 容量被刷新。
+	got, _ := s.GetNode(n1.ID)
+	if got.TotalBytes != 200 {
+		t.Fatalf("TotalBytes = %d, want 200（重启后新容量）", got.TotalBytes)
+	}
+	// 不同地址注册新 ID。
+	n3, _ := s.RegisterNode("27472.et.net:9421", 100)
+	if n3.ID == n1.ID {
+		t.Fatal("不同地址应是新节点")
+	}
+}
+
 // 重新打开数据库应保留全部数据（持久化验证）。
 func TestPersistence(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "meta.db")
