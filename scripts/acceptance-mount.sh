@@ -48,14 +48,18 @@ ensure_mounted() {
   fi
   echo "挂载点 ${MOUNT_POINT} 未挂载，尝试挂载..."
   mkdir -p "$MOUNT_POINT"
-  if "$ATOLL_BIN" mount "$MOUNT_POINT" 2>&1; then
-    sleep 2
+  nohup "$ATOLL_BIN" mount "$MOUNT_POINT" > /tmp/atoll_mount.log 2>&1 &
+  # 等待挂载完成（最多 30 秒）
+  for i in $(seq 1 30); do
+    sleep 1
     if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-      echo "挂载成功"
+      echo "挂载成功（等待 ${i}s）"
       return 0
     fi
-  fi
-  echo "ERROR: 挂载失败，无法继续验收"
+  done
+  echo "ERROR: 挂载失败（等待 30s 超时），无法继续验收"
+  echo "日志:"
+  cat /tmp/atoll_mount.log
   exit 1
 }
 
