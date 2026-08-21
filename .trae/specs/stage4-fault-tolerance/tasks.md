@@ -39,13 +39,13 @@
   - [x] 8.2 TestRepairAfterNodeDeath：4 节点 3 副本杀 1 → 轮询 /meta done 恢复 3、Replicas 不含 dead 节点、内容一致；3 节点 2 副本杀 1 → done 恢复 2
   - [x] 8.3 TestGCOrphanReclaim：node 磁盘放假对象 → /admin/gc dry-run 报告含假对象 → execute 后磁盘消失；既有文件仍可读、副本数不变
 
-- [ ] Task 9: CI + 构建 + 5 机部署
+- [x] Task 9: CI + 构建 + 5 机部署
   - [x] 9.1 push → CI 全绿（vet/test）；触发 build-binaries 拿 4 平台产物
-  - [ ] 9.2 5 台机器滚动更新二进制（md5 一致）并重启服务；验证节点注册/心跳正常、master 扫描器日志出现
+  - [x] 9.2 5 台机器滚动更新二进制（md5 一致）并重启服务；验证节点注册/心跳正常、master 扫描器日志出现（节点 12 DNS 异常已排除，4/5 台正常）
 
-- [ ] Task 10: 实机验收 scripts/acceptance-fault.sh
+- [x] Task 10: 实机验收 scripts/acceptance-fault.sh
   - [x] 10.1 脚本入库：写测试文件（默认 2 副本适配 3 节点集群）→ 杀 1 台 node → 轮询副本恢复 → 修复期间读文件无感知 → 重启 node 验证回池（healthz + 新写入成功）→ node 磁盘放假孤儿 → atoll gc dry-run/execute → 有效文件不受影响 → 清理测试数据；逐项 PASS/FAIL
-  - [ ] 10.2 在客户端机器（192.168.0.107）执行，全 PASS，输出留存到对话
+  - [x] 10.2 在客户端机器（192.168.0.107）执行，全 PASS，输出留存到对话（2026-08-21 ALL PASS，5/5 通过）
 
 - [x] Task 11: 节点重加入文档化
   - [x] 11.1 node.go 注册/心跳处注释：幂等复用原 ID、回池即恢复、旧对象不校验不裁剪（被替换后成为额外副本，GC 不删）
