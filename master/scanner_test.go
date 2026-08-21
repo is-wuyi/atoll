@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,7 +52,7 @@ func TestDeathMonitorNewDeath(t *testing.T) {
 	// 第二次扫描：节点变 dead，应记日志。
 	s.deathMonitorOnce()
 	logs := buf.String()
-	if !bytes.Contains(logs, []byte("判定死亡")) {
+	if !strings.Contains(logs, "判定死亡") {
 		t.Fatalf("应输出 '判定死亡' 日志, got: %s", logs)
 	}
 }
@@ -69,7 +70,7 @@ func TestDeathMonitorRejoin(t *testing.T) {
 	store.Heartbeat(n.ID, 0)
 	s.deathMonitorOnce()
 	logs := buf.String()
-	if !bytes.Contains(logs, []byte("心跳恢复")) {
+	if !strings.Contains(logs, "心跳恢复") {
 		t.Fatalf("应输出 '心跳恢复' 日志, got: %s", logs)
 	}
 }
