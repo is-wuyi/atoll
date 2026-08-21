@@ -264,15 +264,23 @@ func (s *Scanner) repairScanOnce() {
 		return
 	}
 
-	err = s.store.ForEachFile(func(in types.Inode) error {
+	// 先在 View 事务内收集文件快照，事务退出后再执行修复。
+	// 不能在 ForEachFile 回调里直接 ReplaceReplica（Update）：
+	// bbolt 同库读写事务嵌套会自死锁。
+	var inodes []types.Inode
+	if err := s.store.ForEachFile(func(in types.Inode) error {
+		inodes = append(inodes, in)
+		return nil
+	}); err != nil {
+		log.Printf("修复扫描: ForEachFile 失败: %v", err)
+		return
+	}
+
+	for _, in := range inodes {
 		tasks := planRepairs(in, nodes, s.nodeMaxAge)
 		for _, t := range tasks {
 			s.executeRepair(in.ID, t)
 		}
-		return nil
-	})
-	if err != nil {
-		log.Printf("修复扫描: ForEachFile 失败: %v", err)
 	}
 }
 
