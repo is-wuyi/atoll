@@ -12,7 +12,7 @@
 | 27119.et.net | node id=2 | SSH 22，用户 jimo（sudo） | 数据 /volume2/@atoll | 群晖 DSM，systemd 服务 atoll-node (:9421) |
 | 27348.et.net | node id=3 | SSH 22，用户 jimo（sudo） | 数据 /volume1/@atoll | 同上 |
 | 27472.et.net | node id=4 | SSH 22，用户 jimo（sudo） | 数据 /volume3/@atoll | 同上 |
-| 192.168.0.110 | 挂载客户端 | SSH 22，用户 root | /opt/atoll/atoll，挂载点 /mnt/atoll | Ubuntu 26.04 x86_64，/dev/fuse 可用，EasyTier 10.126.126.15 |
+| 192.168.0.107（原 .110，DHCP 会变） | 挂载客户端 | SSH 22，用户 root | /opt/atoll/atoll，挂载点 /mnt/atoll | Ubuntu 26.04 x86_64，/dev/fuse 可用，EasyTier tun0（IP 会变），systemd 服务 easytier |
 | 开发 Mac | 开发机 | 本地 | dist*/ 下二进制 | Intel x86_64；必须 `export NO_PROXY="et.net,.et.net,10.126.0.0/16"` 绕过 Clash |
 
 凭据由用户提供，**严禁写入仓库任何文件**。

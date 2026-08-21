@@ -2,10 +2,12 @@ package node
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -261,5 +263,115 @@ func TestRegisterAndHeartbeat(t *testing.T) {
 	}
 	if heartbeats < 2 {
 		t.Fatalf("心跳次数 = %d, want >= 2", heartbeats)
+	}
+}
+
+// TestPullObject 验证 POST /pull：从源节点拉取对象并落盘，内容一致。
+func TestPullObject(t *testing.T) {
+	// 源节点：持有对象 100。
+	_, sourceTS := newTestNode(t)
+	data := []byte("pull me from source")
+	req, _ := http.NewRequest(http.MethodPut, sourceTS.URL+"/objects/100", bytes.NewReader(data))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("源节点 PUT 状态码 = %d", resp.StatusCode)
+	}
+
+	// 目标节点：收到 pull 请求后应异步拉取。
+	_, targetTS := newTestNode(t)
+	// sourceTS.URL 形如 "http://127.0.0.1:PORT"，需要去掉 "http://" 前缀。
+	sourceAddr := sourceTS.URL[len("http://"):]
+	pullBody, _ := json.Marshal(map[string]any{
+		"inode_id":    100,
+		"source_addr": sourceAddr,
+	})
+	pullResp, err := http.Post(targetTS.URL+"/pull", "application/json", bytes.NewReader(pullBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pullResp.Body.Close()
+	if pullResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /pull 状态码 = %d, want 202", pullResp.StatusCode)
+	}
+
+	// 轮询等待对象落盘。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		getResp, err := http.Get(targetTS.URL + "/objects/100")
+		if err == nil {
+			body, _ := io.ReadAll(getResp.Body)
+			getResp.Body.Close()
+			if getResp.StatusCode == http.StatusOK && bytes.Equal(body, data) {
+				return // 成功
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("pull 后对象未在目标节点落盘或内容不一致")
+}
+
+// TestAdminObjects 验证 GET /admin/objects 返回全部对象，跳过 .tmp-* 临时文件。
+func TestAdminObjects(t *testing.T) {
+	n, ts := newTestNode(t)
+
+	// 写入 3 个对象。
+	put := func(id string, data []byte) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPut, ts.URL+"/objects/"+id, bytes.NewReader(data))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT /objects/%s 状态码 = %d", id, resp.StatusCode)
+		}
+	}
+	put("1", []byte("aaa"))  // 3 bytes
+	put("10", []byte("bb"))  // 2 bytes
+	put("256", []byte("c"))  // 1 byte
+
+	// 手动创建一个 .tmp-* 文件，应被跳过。
+	tmpPath := filepath.Join(n.DataDirForTest(), "objects", "01", ".tmp-fake")
+	if err := os.MkdirAll(filepath.Dir(tmpPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmpPath, []byte("temp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Get(ts.URL + "/admin/objects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /admin/objects 状态码 = %d", resp.StatusCode)
+	}
+
+	var objects []struct {
+		ID   uint64 `json:"id"`
+		Size int64  `json:"size"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&objects); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(objects) != 3 {
+		t.Fatalf("对象数量 = %d, want 3 (应跳过 .tmp-*)", len(objects))
+	}
+
+	// 验证按 ID 排序。
+	if objects[0].ID != 1 || objects[0].Size != 3 {
+		t.Fatalf("objects[0] = {ID:%d, Size:%d}, want {1, 3}", objects[0].ID, objects[0].Size)
+	}
+	if objects[1].ID != 10 || objects[1].Size != 2 {
+		t.Fatalf("objects[1] = {ID:%d, Size:%d}, want {10, 2}", objects[1].ID, objects[1].Size)
+	}
+	if objects[2].ID != 256 || objects[2].Size != 1 {
+		t.Fatalf("objects[2] = {ID:%d, Size:%d}, want {256, 1}", objects[2].ID, objects[2].Size)
 	}
 }

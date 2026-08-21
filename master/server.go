@@ -20,10 +20,16 @@ import (
 type Server struct {
 	store      *meta.Store
 	nodeMaxAge time.Duration // 节点心跳超时阈值
+	scanner    *Scanner      // GC 需要调用
 }
 
 func NewServer(store *meta.Store, nodeMaxAge time.Duration) *Server {
 	return &Server{store: store, nodeMaxAge: nodeMaxAge}
+}
+
+// SetScanner 绑定扫描器，供 /admin/gc 等接口使用。
+func (s *Server) SetScanner(scanner *Scanner) {
+	s.scanner = scanner
 }
 
 // Handler 返回全部路由。
@@ -43,6 +49,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /entry", s.handleDelete) // ?path=/a/b
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("POST /nodes/heartbeat", s.handleNodeHeartbeat)
+	mux.HandleFunc("POST /admin/gc", s.handleGC)
 	return mux
 }
 
@@ -376,6 +383,27 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ---- GC ----
+
+func (s *Server) handleGC(w http.ResponseWriter, r *http.Request) {
+	if s.scanner == nil {
+		httpError(w, http.StatusInternalServerError, "scanner not initialized")
+		return
+	}
+	var req struct {
+		Execute bool `json:"execute"`
+	}
+	if r.Body != nil {
+		json.NewDecoder(r.Body).Decode(&req)
+	}
+	reports, err := s.scanner.RunGC(req.Execute)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, reports)
 }
 
 // ---- 工具 ----

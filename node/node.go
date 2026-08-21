@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -27,6 +29,7 @@ type Node struct {
 	totalBytes        int64
 	heartbeatInterval time.Duration
 	httpClient        *http.Client // 与 master/peer 通信复用
+	pulling           sync.Map     // map[uint64]struct{}: 正在拉取的 inode，去重用
 }
 
 func New(dataDir, masterURL, advertise string, totalBytes int64) *Node {
@@ -52,6 +55,8 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("GET /objects/{id}", n.handleGet)
 	mux.HandleFunc("DELETE /objects/{id}", n.handleDelete)
 	mux.HandleFunc("PUT /replicate/{id}", n.handleReplicate)
+	mux.HandleFunc("POST /pull", n.handlePull)
+	mux.HandleFunc("GET /admin/objects", n.handleAdminObjects)
 	return mux
 }
 
@@ -233,6 +238,121 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]int64{"size": size})
 }
 
+// handlePull 接收拉取请求，立即返回 202，后台异步从源节点拉取对象并落盘。
+// 同一 inode 的并发 pull 会去重：若已在拉取则直接返回 202。
+func (n *Node) handlePull(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InodeID    uint64 `json:"inode_id"`
+		SourceAddr string `json:"source_addr"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.InodeID == 0 || req.SourceAddr == "" {
+		httpError(w, http.StatusBadRequest, "inode_id and source_addr are required")
+		return
+	}
+	// 去重：已有人在拉同一 inode，直接返回 202。
+	if _, loaded := n.pulling.LoadOrStore(req.InodeID, struct{}{}); loaded {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+	go n.pullObject(req.InodeID, req.SourceAddr)
+}
+
+// pullObject 后台从源节点拉取对象并落盘，完成后上报 master。
+func (n *Node) pullObject(inodeID uint64, sourceAddr string) {
+	defer n.pulling.Delete(inodeID)
+	url := fmt.Sprintf("http://%s/objects/%d", sourceAddr, inodeID)
+	resp, err := n.httpClient.Get(url)
+	if err != nil {
+		log.Printf("pull %d from %s: %v", inodeID, sourceAddr, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("pull %d from %s: status %d", inodeID, sourceAddr, resp.StatusCode)
+		return
+	}
+	objPath := n.objectPath(inodeID)
+	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
+		log.Printf("pull %d: mkdir: %v", inodeID, err)
+		return
+	}
+	var oldSize int64
+	if st, err := os.Stat(objPath); err == nil {
+		oldSize = st.Size()
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(objPath), ".tmp-*")
+	if err != nil {
+		log.Printf("pull %d: create temp: %v", inodeID, err)
+		return
+	}
+	tmpName := tmp.Name()
+	size, err := io.Copy(tmp, resp.Body)
+	closeErr := tmp.Close()
+	if err != nil || closeErr != nil {
+		os.Remove(tmpName)
+		log.Printf("pull %d: write: %v", inodeID, err)
+		return
+	}
+	if err := os.Rename(tmpName, objPath); err != nil {
+		os.Remove(tmpName)
+		log.Printf("pull %d: rename: %v", inodeID, err)
+		return
+	}
+	n.used.Add(size - oldSize)
+	if err := n.reportReplicated(inodeID); err != nil {
+		log.Printf("pull %d: report replicated: %v", inodeID, err)
+	}
+}
+
+// handleAdminObjects 返回本机全部对象的 ID 和大小，跳过 .tmp-* 临时文件。
+func (n *Node) handleAdminObjects(w http.ResponseWriter, _ *http.Request) {
+	type objInfo struct {
+		ID   uint64 `json:"id"`
+		Size int64  `json:"size"`
+	}
+	var objects []objInfo
+	objectsDir := filepath.Join(n.dataDir, "objects")
+	entries, err := os.ReadDir(objectsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSON(w, http.StatusOK, []objInfo{})
+			return
+		}
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	for _, bucket := range entries {
+		if !bucket.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(objectsDir, bucket.Name()))
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() || strings.HasPrefix(f.Name(), ".tmp-") {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			id, err := strconv.ParseUint(f.Name(), 10, 64)
+			if err != nil {
+				continue
+			}
+			objects = append(objects, objInfo{ID: id, Size: info.Size()})
+		}
+	}
+	sort.Slice(objects, func(i, j int) bool { return objects[i].ID < objects[j].ID })
+	writeJSON(w, http.StatusOK, objects)
+}
+
 // handleGet 读出对象内容。支持单区间 Range 请求（206 部分内容），
 // 供 FUSE 客户端按偏移读取，避免拉取整个对象。
 func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -359,6 +479,12 @@ func parseObjectID(w http.ResponseWriter, r *http.Request) (uint64, bool) {
 
 // ---- 与 master 交互 ----
 
+// 节点重加入行为说明：
+// 节点重启后幂等注册复用原 ID（同一地址重复注册时 master 返回原 ID），
+// 心跳恢复即回池；其上旧对象不校验、不裁剪。
+// 若该节点曾被修复扫描替换（Replicas 中被新节点替代），其旧副本成为额外副本，
+// GC 不删除仍在元数据 inode 集合中的对象（即文件仍存活则不删）。
+
 // Register 向 master 注册并启动心跳循环（阻塞直到首次注册成功）。
 func (n *Node) Register() error {
 	if err := n.registerOnce(); err != nil {
@@ -466,6 +592,9 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 // SetNodeIDForTest 直接设置节点 ID（绕过注册流程，用于测试）。
 func (n *Node) SetNodeIDForTest(id uint64) { n.nodeID.Store(int64(id)) }
+
+// NodeIDForTest 返回节点 ID（供测试发送心跳用）。
+func (n *Node) NodeIDForTest() uint64 { return uint64(n.nodeID.Load()) }
 
 // DataDirForTest 返回数据目录路径。
 func (n *Node) DataDirForTest() string { return n.dataDir }

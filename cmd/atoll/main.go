@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -38,7 +39,8 @@ const usageText = `usage: atoll <command> [args]
   atoll ls  <远程路径>              列目录
   atoll mkdir <远程路径>            建目录
   atoll rm  <远程路径>              删除文件/空目录
-  atoll mount <挂载点>              FUSE 挂载为本地目录 [-cache 缓冲目录 -replicas N]`
+  atoll mount <挂载点>              FUSE 挂载为本地目录 [-cache 缓冲目录 -replicas N]
+  atoll gc [--execute]              垃圾回收（dry-run 默认；--execute 执行删除）`
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -59,6 +61,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runMount(rest, stderr)
 	case "put", "get", "ls", "mkdir", "rm":
 		return runClientCmd(cmd, rest, stdout, stderr)
+	case "gc":
+		return runGC(rest, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprintln(stdout, usageText)
 		return 0
@@ -76,6 +80,8 @@ func runMaster(args []string, stderr io.Writer) int {
 	listen := fs.String("listen", ":9420", "监听地址")
 	dbPath := fs.String("db", "atoll.db", "元数据 bbolt 文件路径")
 	nodeMaxAge := fs.Duration("node-max-age", 30*time.Second, "节点心跳超时阈值")
+	repairIntv := fs.Duration("repair-interval", 15*time.Second, "副本修复扫描周期")
+	gcIntv := fs.Duration("gc-interval", 10*time.Minute, "GC 对账扫描周期")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -85,7 +91,15 @@ func runMaster(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer store.Close()
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	scanner := master.NewScanner(store, *nodeMaxAge, *repairIntv, *gcIntv)
+	go scanner.Start(ctx)
+
 	srv := master.NewServer(store, *nodeMaxAge)
+	srv.SetScanner(scanner)
 	log.Printf("atoll master listening on %s (db=%s)", *listen, *dbPath)
 	if err := http.ListenAndServe(*listen, srv.Handler()); err != nil {
 		fmt.Fprintf(stderr, "atoll master: %v\n", err)
@@ -263,6 +277,43 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		fmt.Fprintf(stdout, "已删除 %s\n", fs.Arg(0))
+	}
+	return 0
+}
+
+// ---- GC ----
+
+func runGC(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
+	execute := fs.Bool("execute", false, "执行删除（默认仅 dry-run）")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	c := client.New(*masterURL)
+	reports, err := c.GC(*execute)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc 失败: %v\n", err)
+		return 1
+	}
+	totalOrphans := 0
+	totalBytes := int64(0)
+	for _, r := range reports {
+		totalOrphans += r.OrphanCount
+		totalBytes += r.OrphanBytes
+		if r.OrphanCount > 0 {
+			fmt.Fprintf(stdout, "节点 %d (%s): %d 个孤儿, %d 字节\n", r.NodeID, r.NodeAddr, r.OrphanCount, r.OrphanBytes)
+		}
+	}
+	if totalOrphans == 0 {
+		fmt.Fprintln(stdout, "无孤儿对象")
+	} else {
+		action := "发现"
+		if *execute {
+			action = "已删除"
+		}
+		fmt.Fprintf(stdout, "%s %d 个孤儿, 共 %d 字节\n", action, totalOrphans, totalBytes)
 	}
 	return 0
 }

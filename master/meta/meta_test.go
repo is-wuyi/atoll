@@ -2,7 +2,9 @@ package meta
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -201,6 +203,126 @@ func TestRegisterNodeIdempotent(t *testing.T) {
 	n3, _ := s.RegisterNode("27472.et.net:9421", 100)
 	if n3.ID == n1.ID {
 		t.Fatal("不同地址应是新节点")
+	}
+}
+
+func TestListNodes(t *testing.T) {
+	s := newTestStore(t)
+	// 注册 3 个节点。
+	s.RegisterNode("n1:9421", 100)
+	s.RegisterNode("n2:9421", 200)
+	s.RegisterNode("n3:9421", 300)
+	nodes, err := s.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	if len(nodes) != 3 {
+		t.Fatalf("ListNodes = %d 个, want 3", len(nodes))
+	}
+	ids := make(map[uint64]bool)
+	for _, n := range nodes {
+		ids[n.ID] = true
+	}
+	if len(ids) != 3 {
+		t.Fatalf("节点 ID 应唯一, got %v", ids)
+	}
+}
+
+func TestForEachFile(t *testing.T) {
+	s := newTestStore(t)
+	s.CreateFile(RootID, "a.txt", nil)
+	s.CreateFile(RootID, "b.txt", nil)
+	dir, _ := s.CreateDir(RootID, "sub")
+	s.CreateFile(dir.ID, "c.txt", nil) // 目录下的文件也应遍历到
+
+	var collected []uint64
+	err := s.ForEachFile(func(in types.Inode) error {
+		collected = append(collected, in.ID)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ForEachFile: %v", err)
+	}
+	if len(collected) != 3 {
+		t.Fatalf("ForEachFile 收集 %d 个文件, want 3", len(collected))
+	}
+	// 目录不应出现。
+	for _, id := range collected {
+		in, _ := s.GetInode(id)
+		if in.Type != types.TypeFile {
+			t.Fatalf("ForEachFile 返回了非文件 inode: %+v", in)
+		}
+	}
+}
+
+func TestForEachFileAbort(t *testing.T) {
+	s := newTestStore(t)
+	s.CreateFile(RootID, "a.txt", nil)
+	s.CreateFile(RootID, "b.txt", nil)
+	sentinel := fmt.Errorf("stop")
+	count := 0
+	err := s.ForEachFile(func(in types.Inode) error {
+		count++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("应返回 sentinel, got %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("fn 应只调用 1 次, got %d", count)
+	}
+}
+
+func TestReplaceReplica(t *testing.T) {
+	s := newTestStore(t)
+	f, _ := s.CreateFile(RootID, "data.bin", []uint64{10, 20, 30})
+	// 手动标记 10、20 为 Done。
+	s.AddReplicaDone(f.ID, 10)
+	s.AddReplicaDone(f.ID, 20)
+
+	// 把节点 10 替换为 99。
+	if err := s.ReplaceReplica(f.ID, 10, 99); err != nil {
+		t.Fatalf("ReplaceReplica: %v", err)
+	}
+	got, _ := s.GetInode(f.ID)
+	// Replicas 中 10 应变为 99。
+	found99 := false
+	for _, r := range got.Replicas {
+		if r == 10 {
+			t.Fatal("Replicas 中不应再有 10")
+		}
+		if r == 99 {
+			found99 = true
+		}
+	}
+	if !found99 {
+		t.Fatalf("Replicas 中应有 99, got %v", got.Replicas)
+	}
+	// DoneReplicas 中 10 应被移除，20 仍存在。
+	for _, r := range got.DoneReplicas {
+		if r == 10 {
+			t.Fatal("DoneReplicas 中不应再有 10")
+		}
+	}
+	if len(got.DoneReplicas) != 1 || got.DoneReplicas[0] != 20 {
+		t.Fatalf("DoneReplicas = %v, want [20]", got.DoneReplicas)
+	}
+}
+
+func TestReplaceReplicaInodeNotExist(t *testing.T) {
+	s := newTestStore(t)
+	err := s.ReplaceReplica(99999, 1, 2)
+	if !errors.Is(err, ErrNotExist) {
+		t.Fatalf("不存在 inode 应返回 ErrNotExist, got %v", err)
+	}
+}
+
+func TestReplaceReplicaOldNotInReplicas(t *testing.T) {
+	s := newTestStore(t)
+	f, _ := s.CreateFile(RootID, "x.txt", []uint64{1, 2})
+	err := s.ReplaceReplica(f.ID, 99, 3)
+	if err == nil {
+		t.Fatal("oldNodeID 不在 Replicas 中应返回错误")
 	}
 }
 

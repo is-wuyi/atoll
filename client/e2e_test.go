@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,15 @@ import (
 	"atoll/master/meta"
 	"atoll/node"
 )
+
+// clusterV3 支持可配 nodeMaxAge + Scanner 的测试集群。
+type clusterV3 struct {
+	client  *Client
+	store   *meta.Store
+	server  *httptest.Server
+	scanner *master.Scanner
+	nodes   []*clusterNode
+}
 
 // postRaw 发送原始 JSON POST（测试辅助）。
 func postRaw(url, body string) (*http.Response, error) {
@@ -71,6 +81,62 @@ func newClusterV2(t *testing.T, numNodes int) (*Client, []*clusterNode) {
 		nodes = append(nodes, cn)
 	}
 	return New(masterSrv.URL), nodes
+}
+
+// newClusterV3 创建带 Scanner 的测试集群（nodeMaxAge 可配）。
+func newClusterV3(t *testing.T, numNodes int, nodeMaxAge time.Duration) *clusterV3 {
+	t.Helper()
+
+	store, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatalf("meta.Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	srv := master.NewServer(store, nodeMaxAge)
+	scanner := master.NewScanner(store, nodeMaxAge, time.Hour, time.Hour)
+	srv.SetScanner(scanner)
+	masterSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { masterSrv.Close() })
+
+	var nodes []*clusterNode
+	for i := 0; i < numNodes; i++ {
+		n := node.New(filepath.Join(t.TempDir(), "data"), masterSrv.URL, "", 1<<30)
+		nodeSrv := httptest.NewServer(n.Handler())
+		t.Cleanup(func() { nodeSrv.Close() })
+		cn := &clusterNode{node: n, server: nodeSrv}
+
+		resp, err := postRaw(masterSrv.URL+"/nodes/register",
+			fmt.Sprintf(`{"addr": %q, "total_bytes": 1073741824}`, cn.addr()))
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("node %d 注册失败: %v status=%d", i, err, resp.StatusCode)
+		}
+		var reg struct {
+			ID uint64 `json:"id"`
+		}
+		if err := decodeBody(resp.Body, &reg); err != nil {
+			t.Fatalf("解码注册响应: %v", err)
+		}
+		resp.Body.Close()
+		n.SetNodeIDForTest(reg.ID)
+		nodes = append(nodes, cn)
+	}
+	return &clusterV3{
+		client:  New(masterSrv.URL),
+		store:   store,
+		server:  masterSrv,
+		scanner: scanner,
+		nodes:   nodes,
+	}
+}
+
+// heartbeatNode 手动发送心跳维持节点 alive。
+func (cv *clusterV3) heartbeatNode(cn *clusterNode) {
+	body, _ := json.Marshal(map[string]any{
+		"node_id":    cn.node.NodeIDForTest(),
+		"used_bytes": int64(0),
+	})
+	http.Post(cv.server.URL+"/nodes/heartbeat", "application/json", bytes.NewReader(body))
 }
 
 // waitDone 轮询 master 直到该文件有 >= n 个已完成副本，超时失败。
@@ -333,6 +399,218 @@ func TestPutOverwrite(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "409") {
 		t.Fatalf("期望 409 冲突错误, got: %v", err)
+	}
+}
+
+// ---- 阶段4 e2e 测试 ----
+
+// repairOnceAndWait 杀掉 victim 后：等待心跳过期 → 给幸存节点重新心跳 →
+// 触发一次修复扫描 → 轮询直到文件 done 副本恢复至 want 个。
+// 返回恢复后的副本列表。前置：集群 nodeMaxAge=1s。
+func repairOnceAndWait(t *testing.T, cv *clusterV3, c *Client, path string, victim *clusterNode, want int) []Replica {
+	t.Helper()
+	victim.server.Close()
+
+	// 等待 victim 心跳过期（nodeMaxAge=1s）。
+	time.Sleep(1200 * time.Millisecond)
+
+	// 关键：给幸存节点重新发心跳，否则全部节点心跳过期会被判 dead，无源可修。
+	for _, n := range cv.nodes {
+		if n != victim {
+			cv.heartbeatNode(n)
+		}
+	}
+
+	cv.scanner.RepairScanOnce()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		_, reps, err := c.Lookup(path)
+		if err == nil {
+			done := 0
+			for _, r := range reps {
+				if r.Done {
+					done++
+				}
+			}
+			if done >= want {
+				return reps
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("副本修复超时: 等待 %d 个 done 副本: %s", want, path)
+	return nil
+}
+
+// TestRepairAfterNodeDeath 4 节点 3 副本杀 1 → 修复后 done 恢复 3、Replicas 不含 dead 节点、内容一致。
+func TestRepairAfterNodeDeath(t *testing.T) {
+	cv := newClusterV3(t, 4, time.Second)
+	c := cv.client
+
+	// 初始心跳全部 alive。
+	for _, n := range cv.nodes {
+		cv.heartbeatNode(n)
+	}
+
+	// 创建 3 副本文件。
+	dir := t.TempDir()
+	local := filepath.Join(dir, "data.bin")
+	content := bytes.Repeat([]byte("repair-test-"), 1000)
+	os.WriteFile(local, content, 0o644)
+	if err := c.Put(local, "/data.bin", 3); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	waitDone(t, c, "/data.bin", 3)
+
+	// 找到持有 Done 副本的一个节点作为 victim。
+	_, reps, _ := c.Lookup("/data.bin")
+	var victim *clusterNode
+	for _, r := range reps {
+		if r.Done {
+			for _, cn := range cv.nodes {
+				if cn.addr() == r.Addr {
+					victim = cn
+					break
+				}
+			}
+			if victim != nil {
+				break
+			}
+		}
+	}
+	if victim == nil {
+		t.Fatal("未找到持有 Done 副本的节点")
+	}
+	victimAddr := victim.addr()
+
+	reps = repairOnceAndWait(t, cv, c, "/data.bin", victim, 3)
+
+	// Replicas 不应再包含 dead 节点地址。
+	for _, r := range reps {
+		if r.Addr == victimAddr {
+			t.Fatalf("修复后 Replicas 仍含 dead 节点 %s", victimAddr)
+		}
+	}
+
+	// 验证内容不变。
+	out := filepath.Join(dir, "out.bin")
+	if err := c.Get("/data.bin", out); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if !bytes.Equal(got, content) {
+		t.Fatal("修复后内容不符")
+	}
+}
+
+// TestRepairAfterNodeDeath3Nodes 3 节点 2 副本杀 1 → 修复后 done 恢复 2（换到第 3 台）。
+func TestRepairAfterNodeDeath3Nodes(t *testing.T) {
+	cv := newClusterV3(t, 3, time.Second)
+	c := cv.client
+
+	for _, n := range cv.nodes {
+		cv.heartbeatNode(n)
+	}
+
+	dir := t.TempDir()
+	local := filepath.Join(dir, "data.bin")
+	content := []byte("three-node-repair-test")
+	os.WriteFile(local, content, 0o644)
+	if err := c.Put(local, "/data.bin", 2); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	waitDone(t, c, "/data.bin", 2)
+
+	_, reps, _ := c.Lookup("/data.bin")
+	var victim *clusterNode
+	for _, r := range reps {
+		if r.Done {
+			for _, cn := range cv.nodes {
+				if cn.addr() == r.Addr {
+					victim = cn
+					break
+				}
+			}
+			if victim != nil {
+				break
+			}
+		}
+	}
+	if victim == nil {
+		t.Fatal("未找到持有 Done 副本的节点")
+	}
+
+	reps = repairOnceAndWait(t, cv, c, "/data.bin", victim, 2)
+	if len(reps) < 2 {
+		t.Fatalf("修复后副本数 %d < 2", len(reps))
+	}
+
+	out := filepath.Join(dir, "out.bin")
+	if err := c.Get("/data.bin", out); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if !bytes.Equal(got, content) {
+		t.Fatal("修复后内容不符")
+	}
+}
+
+// TestGCOrphanReclaim 验证孤儿对象回收。
+func TestGCOrphanReclaim(t *testing.T) {
+	cv := newClusterV3(t, 2, time.Hour)
+	c := cv.client
+
+	// 写入文件并等待副本。
+	dir := t.TempDir()
+	local := filepath.Join(dir, "keep.txt")
+	os.WriteFile(local, []byte("keep-me"), 0o644)
+	if err := c.Put(local, "/keep.txt", 2); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	waitDone(t, c, "/keep.txt", 2)
+
+	// 在节点磁盘放假孤儿对象（必须放在正确分桶 id%256 下，DELETE 才能命中）。
+	const orphanID = 99999 // 99999%256=159=0x9f
+	orphanPath := filepath.Join(cv.nodes[0].node.DataDirForTest(), "objects",
+		fmt.Sprintf("%02x", orphanID%256), strconv.FormatUint(orphanID, 10))
+	os.MkdirAll(filepath.Dir(orphanPath), 0o755)
+	os.WriteFile(orphanPath, []byte("orphan"), 0o644)
+
+	// dry-run 应报告孤儿。
+	reports, err := cv.scanner.RunGC(false)
+	if err != nil {
+		t.Fatalf("GC dry-run: %v", err)
+	}
+	foundOrphan := false
+	for _, r := range reports {
+		for _, o := range r.Orphans {
+			if o.ID == orphanID {
+				foundOrphan = true
+			}
+		}
+	}
+	if !foundOrphan {
+		t.Fatal("dry-run 应报告孤儿对象 99999")
+	}
+
+	// execute 应删除孤儿。
+	_, err = cv.scanner.RunGC(true)
+	if err != nil {
+		t.Fatalf("GC execute: %v", err)
+	}
+	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
+		t.Fatal("孤儿对象应已删除")
+	}
+
+	// 正常文件不受影响。
+	out := filepath.Join(dir, "out.txt")
+	if err := c.Get("/keep.txt", out); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if string(got) != "keep-me" {
+		t.Fatalf("正常文件内容不符: %q", got)
 	}
 }
 

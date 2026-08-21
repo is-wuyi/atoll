@@ -265,3 +265,38 @@ func statusError(resp *http.Response) error {
 func queryPath(p string) string {
 	return url.Values{"path": {p}}.Encode()
 }
+
+// ---- GC ----
+
+// GCNodeReport 是 GC 返回的单节点孤儿报告。
+type GCNodeReport struct {
+	NodeID      uint64 `json:"node_id"`
+	NodeAddr    string `json:"node_addr"`
+	OrphanCount int    `json:"-"` // 从 Orphans 长度计算
+	OrphanBytes int64  `json:"orphan_bytes"`
+	Orphans     []struct {
+		ID   uint64 `json:"id"`
+		Size int64  `json:"size"`
+	} `json:"orphans"`
+}
+
+// GC 调用 master /admin/gc，execute=true 时执行删除。
+func (c *Client) GC(execute bool) ([]GCNodeReport, error) {
+	body, _ := json.Marshal(map[string]bool{"execute": execute})
+	resp, err := c.HTTP.Post(c.MasterURL+"/admin/gc", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := statusError(resp); err != nil {
+		return nil, err
+	}
+	var reports []GCNodeReport
+	if err := json.NewDecoder(resp.Body).Decode(&reports); err != nil {
+		return nil, err
+	}
+	for i := range reports {
+		reports[i].OrphanCount = len(reports[i].Orphans)
+	}
+	return reports, nil
+}

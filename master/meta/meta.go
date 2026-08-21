@@ -471,6 +471,74 @@ func (s *Store) GetNode(nodeID uint64) (types.NodeInfo, error) {
 	return n, err
 }
 
+// ListNodes 返回全部节点（含 dead），用于死亡判定与修复扫描。
+func (s *Store) ListNodes() ([]types.NodeInfo, error) {
+	var out []types.NodeInfo
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketNodes).ForEach(func(_, v []byte) error {
+			var n types.NodeInfo
+			if err := json.Unmarshal(v, &n); err != nil {
+				return err
+			}
+			out = append(out, n)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ForEachFile 遍历全部文件 inode，用于修复扫描与 GC 元数据集合。
+// 只处理 Type == types.TypeFile 的 inode；fn 返回 error 则停止遍历。
+func (s *Store) ForEachFile(fn func(types.Inode) error) error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketInodes).ForEach(func(_, v []byte) error {
+			var in types.Inode
+			if err := json.Unmarshal(v, &in); err != nil {
+				return err
+			}
+			if in.Type != types.TypeFile {
+				return nil
+			}
+			return fn(in)
+		})
+	})
+}
+
+// ReplaceReplica 副本槽位替换，用于修复扫描中替换 dead 节点。
+// 在 Replicas 中找到 oldNodeID 并替换为 newNodeID，同时从 DoneReplicas 中移除 oldNodeID。
+// inode 不存在返回 ErrNotExist，oldNodeID 不在 Replicas 中返回错误。
+func (s *Store) ReplaceReplica(inodeID, oldNodeID, newNodeID uint64) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		in, err := getInodeTx(tx, inodeID)
+		if err != nil {
+			return err
+		}
+		found := false
+		for i, rid := range in.Replicas {
+			if rid == oldNodeID {
+				in.Replicas[i] = newNodeID
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("node %d not in replicas of inode %d", oldNodeID, inodeID)
+		}
+		// 从 DoneReplicas 中移除 oldNodeID。
+		filtered := in.DoneReplicas[:0]
+		for _, rid := range in.DoneReplicas {
+			if rid != oldNodeID {
+				filtered = append(filtered, rid)
+			}
+		}
+		in.DoneReplicas = filtered
+		return putInode(tx, &in)
+	})
+}
+
 // ---- 内部工具 ----
 
 func putInode(tx *bolt.Tx, in *types.Inode) error {
