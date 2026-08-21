@@ -96,7 +96,7 @@ func runMaster(args []string, stderr io.Writer) int {
 	defer cancel()
 
 	scanner := master.NewScanner(store, *nodeMaxAge, *repairIntv, *gcIntv)
-	go scanner.Start(ctx)
+	scanner.Start(ctx) // 内部为三个循环各起 goroutine
 
 	srv := master.NewServer(store, *nodeMaxAge)
 	srv.SetScanner(scanner)

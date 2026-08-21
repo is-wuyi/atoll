@@ -35,8 +35,10 @@ func captureLogs(t *testing.T) *bytes.Buffer {
 }
 
 // TestDeathMonitorNewDeath 测试 alive→dead 转换记日志。
+// nodeMaxAge 取 500ms 而非更小值：并行测试高负载下 goroutine 调度延迟
+// 可能超过小阈值，导致心跳与扫描之间的间隔被误判过期（曾引发 flaky）。
 func TestDeathMonitorNewDeath(t *testing.T) {
-	s, store := newTestScanner(t, 100*time.Millisecond)
+	s, store := newTestScanner(t, 500*time.Millisecond)
 	buf := captureLogs(t)
 
 	// 注册节点，刷新心跳使其 alive。
@@ -47,7 +49,7 @@ func TestDeathMonitorNewDeath(t *testing.T) {
 	s.deathMonitorOnce()
 
 	// 等待心跳过期。
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(600 * time.Millisecond)
 
 	// 第二次扫描：节点变 dead，应记日志。
 	s.deathMonitorOnce()
@@ -59,11 +61,13 @@ func TestDeathMonitorNewDeath(t *testing.T) {
 
 // TestDeathMonitorRejoin 测试 dead→alive 转换记日志。
 func TestDeathMonitorRejoin(t *testing.T) {
-	s, store := newTestScanner(t, 50*time.Millisecond)
+	s, store := newTestScanner(t, 500*time.Millisecond)
 	buf := captureLogs(t)
 
-	// 注册节点但不刷新心跳，首次扫描即判定 dead。
+	// 注册节点但不刷新心跳。RegisterNode 会写入 LastHeartbeat=now，
+	// 必须等待超过 nodeMaxAge 后首扫才判 dead（否则 prevAlive 含该节点，无状态转换）。
 	n, _ := store.RegisterNode("n1:9421", 100)
+	time.Sleep(600 * time.Millisecond)
 	s.deathMonitorOnce() // prevAlive={}
 
 	// 刷新心跳，使其恢复 alive。
@@ -77,12 +81,12 @@ func TestDeathMonitorRejoin(t *testing.T) {
 
 // TestDeathMonitorNoRepeat 测试持续 dead 状态不重复记日志。
 func TestDeathMonitorNoRepeat(t *testing.T) {
-	s, store := newTestScanner(t, 50*time.Millisecond)
+	s, store := newTestScanner(t, 500*time.Millisecond)
 	buf := captureLogs(t)
 
 	store.RegisterNode("n1:9421", 100)
-	s.deathMonitorOnce() // 首次扫描记下（无节点在 prevAlive，不记日志）
-	time.Sleep(60 * time.Millisecond)
+	s.deathMonitorOnce() // 首扫记下 prevAlive
+	time.Sleep(600 * time.Millisecond)
 	s.deathMonitorOnce() // 第一次判定死亡
 	before := buf.Len()
 	s.deathMonitorOnce() // 持续 dead，不应再记日志
