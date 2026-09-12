@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"atoll/master/meta"
+	"atoll/node"
 	"atoll/pkg/types"
 )
 
@@ -258,7 +261,7 @@ func TestFindOrphansEmpty(t *testing.T) {
 	}
 }
 
-// TestFindOrphansNormalObjectsNotAffected 正常对象不被误判。
+// TestFindOrphansNormalObjectsNotAffected 正常对象不被误判（额外副本场景）。
 func TestFindOrphansNormalObjectsNotAffected(t *testing.T) {
 	// 额外副本（节点被替换后旧副本仍存在）不应被 GC。
 	objects := []ObjectEntry{
@@ -269,5 +272,105 @@ func TestFindOrphansNormalObjectsNotAffected(t *testing.T) {
 	orphans := findOrphans(objects, validIDs)
 	if len(orphans) != 0 {
 		t.Fatalf("额外副本不应被 GC, got %d 个孤儿", len(orphans))
+	}
+}
+
+// ---- 修复退避单测 ----
+
+// TestRepairBackoffRampsUp 修复连续未收敛时退避窗口倍增，收敛后清零。
+func TestRepairBackoffRampsUp(t *testing.T) {
+	s, _ := newTestScanner(t, time.Hour) // repairIntv = time.Hour
+	s.bumpRepairBackoff(42)
+	s.mu.Lock()
+	first := s.nextAttempt[42].Sub(time.Now())
+	s.mu.Unlock()
+	if first < 30*time.Minute || first > time.Hour {
+		t.Fatalf("第一次退避应 ≈ 1x repairIntv, got %v", first)
+	}
+	s.bumpRepairBackoff(42)
+	s.mu.Lock()
+	second := s.nextAttempt[42].Sub(time.Now())
+	streak := s.failStreak[42]
+	s.mu.Unlock()
+	if streak != 2 {
+		t.Fatalf("failStreak = %d, want 2", streak)
+	}
+	if second < time.Hour || second > 2*time.Hour+time.Minute {
+		t.Fatalf("第二次退避应 ≈ 2x repairIntv, got %v", second)
+	}
+	// 模拟收敛：扫描循环里 len(tasks)==0 时直接清零。
+	s.mu.Lock()
+	delete(s.failStreak, 42)
+	delete(s.nextAttempt, 42)
+	s.mu.Unlock()
+	s.bumpRepairBackoff(42)
+	s.mu.Lock()
+	afterReset := s.nextAttempt[42].Sub(time.Now())
+	streak = s.failStreak[42]
+	s.mu.Unlock()
+	if streak != 1 || afterReset > time.Hour {
+		t.Fatalf("收敛清零后应重新从 1x 开始, streak=%d next=%v", streak, afterReset)
+	}
+}
+
+// TestRepairBackoffCapsAt40x 退避倍数封顶 40x。
+func TestRepairBackoffCapsAt40x(t *testing.T) {
+	s, _ := newTestScanner(t, time.Hour)
+	s.mu.Lock()
+	s.failStreak[7] = 50 // 远超上限
+	s.mu.Unlock()
+	s.bumpRepairBackoff(7)
+	s.mu.Lock()
+	next := s.nextAttempt[7].Sub(time.Now())
+	s.mu.Unlock()
+	if next > 41*time.Hour {
+		t.Fatalf("退避应封顶 40x, got %v", next)
+	}
+}
+
+// TestProbeSource404 源对象 404 时 probeSource 返回 false；存在/网络错误返回 true。
+func TestProbeSource404(t *testing.T) {
+	// 源节点：写入对象 1，没有对象 2。
+	_, ts := newTestNodeForMaster(t)
+	putObjectForMaster(t, ts.URL, 1)
+
+	s, _ := newTestScanner(t, time.Hour)
+	if !s.probeSource(ts.Listener.Addr().String(), 1) {
+		t.Fatal("对象存在时应返回 true")
+	}
+	if s.probeSource(ts.Listener.Addr().String(), 2) {
+		t.Fatal("对象 404 时应返回 false")
+	}
+	// 不存在的地址（网络错误）应保持乐观返回 true。
+	if !s.probeSource("127.0.0.1:1", 1) {
+		t.Fatal("网络错误时应返回 true")
+	}
+}
+
+// ---- 测试辅助 ----
+
+// newTestNodeForMaster 在 master 包内启动一个最小存储节点 HTTP 服务。
+func newTestNodeForMaster(t *testing.T) (*node.Node, *httptest.Server) {
+	t.Helper()
+	n := node.New(t.TempDir(), "http://master.invalid", "127.0.0.1:19000", 1<<30)
+	ts := httptest.NewServer(n.Handler())
+	t.Cleanup(func() { ts.Close() })
+	return n, ts
+}
+
+// putObjectForMaster 向测试节点 PUT 一个对象。
+func putObjectForMaster(t *testing.T, baseURL string, id uint64) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/objects/%d", baseURL, id), strings.NewReader("data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT 状态码 = %d", resp.StatusCode)
 	}
 }

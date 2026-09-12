@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -28,7 +29,8 @@ type Node struct {
 	nodeID            atomic.Int64
 	totalBytes        int64
 	heartbeatInterval time.Duration
-	httpClient        *http.Client // 与 master/peer 通信复用
+	httpClient        *http.Client // 与 master 交互（小请求，60s 全程超时）
+	bulkClient        *http.Client // 对等节点大对象传输（push/pull，不设全程超时）
 	pulling           sync.Map     // map[uint64]struct{}: 正在拉取的 inode，去重用
 }
 
@@ -40,6 +42,16 @@ func New(dataDir, masterURL, advertise string, totalBytes int64) *Node {
 		totalBytes:        totalBytes,
 		heartbeatInterval: 5 * time.Second,
 		httpClient:        &http.Client{Timeout: 60 * time.Second},
+		// 大对象传输不能设全程超时：http.Client 的 Timeout 覆盖读 body，
+		// 3GB 文件按内网实际带宽可能要数分钟，60s 超时会让每次 pull/push
+		// 都在半途被掐死（曾导致 inode 114 副本自 8/21 起从未同步成功）。
+		// 改为只在连接/握手/响应头阶段限时，body 传输不限时。
+		bulkClient: &http.Client{Transport: &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+		}},
 	}
 }
 
@@ -66,35 +78,12 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	objPath := n.objectPath(id)
-	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	// 覆盖写场景：先记下旧对象大小，成功后按差值计费。
-	var oldSize int64
-	if st, err := os.Stat(objPath); err == nil {
-		oldSize = st.Size()
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(objPath), ".tmp-*")
+	size, err := n.storeObject(id, r.Body)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	tmpName := tmp.Name()
-	size, err := io.Copy(tmp, r.Body)
-	closeErr := tmp.Close()
-	if err != nil || closeErr != nil {
-		os.Remove(tmpName)
+		log.Printf("put object %d: %v", id, err)
 		httpError(w, http.StatusInternalServerError, "write object failed")
 		return
 	}
-	if err := os.Rename(tmpName, objPath); err != nil {
-		os.Remove(tmpName)
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	n.used.Add(size - oldSize)
 	writeJSON(w, http.StatusCreated, map[string]int64{"size": size})
 	// 客户端直写视为"我是主副本"：成功后异步推送到其余副本节点。
 	if n.nodeID.Load() != 0 {
@@ -167,7 +156,7 @@ func (n *Node) pushObject(peerAddr string, inodeID uint64) error {
 	if err != nil {
 		return err
 	}
-	resp, err := n.httpClient.Do(req)
+	resp, err := n.bulkClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -178,21 +167,29 @@ func (n *Node) pushObject(peerAddr string, inodeID uint64) error {
 	return nil
 }
 
-// reportReplicated 向 master 上报"我已完成该对象的同步"。
+// reportReplicated 向 master 上报"我已完成该对象的同步"，失败重试 3 次。
+// 上报失败会导致下轮修复扫描重复 pull 整个对象，重试可把这种放大压到最低。
 func (n *Node) reportReplicated(inodeID uint64) error {
 	body, _ := json.Marshal(map[string]any{
 		"inode_id": inodeID,
 		"node_id":  n.nodeID.Load(),
 	})
-	resp, err := http.Post(n.masterURL+"/files/replicated", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return err
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		resp, terr := http.Post(n.masterURL+"/files/replicated", "application/json", bytes.NewReader(body))
+		if terr == nil {
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+			err = fmt.Errorf("status %d", resp.StatusCode)
+		} else {
+			err = terr
+		}
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %d", resp.StatusCode)
-	}
-	return nil
+	return err
 }
 
 // handleReplicate 接收主副本推送的对象数据：落盘后向 master 上报同步完成。
@@ -202,34 +199,12 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	objPath := n.objectPath(id)
-	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	var oldSize int64
-	if st, err := os.Stat(objPath); err == nil {
-		oldSize = st.Size()
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(objPath), ".tmp-*")
+	size, err := n.storeObject(id, r.Body)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	tmpName := tmp.Name()
-	size, err := io.Copy(tmp, r.Body)
-	closeErr := tmp.Close()
-	if err != nil || closeErr != nil {
-		os.Remove(tmpName)
+		log.Printf("replicate object %d: %v", id, err)
 		httpError(w, http.StatusInternalServerError, "write object failed")
 		return
 	}
-	if err := os.Rename(tmpName, objPath); err != nil {
-		os.Remove(tmpName)
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	n.used.Add(size - oldSize)
 	// 落盘成功后向 master 上报，把自己加入 DoneReplicas。上报失败仅记日志：
 	// 主副本的重试机制会再次推送，重复落盘是幂等的。
 	if err := n.reportReplicated(id); err != nil {
@@ -266,7 +241,7 @@ func (n *Node) handlePull(w http.ResponseWriter, r *http.Request) {
 func (n *Node) pullObject(inodeID uint64, sourceAddr string) {
 	defer n.pulling.Delete(inodeID)
 	url := fmt.Sprintf("http://%s/objects/%d", sourceAddr, inodeID)
-	resp, err := n.httpClient.Get(url)
+	resp, err := n.bulkClient.Get(url)
 	if err != nil {
 		log.Printf("pull %d from %s: %v", inodeID, sourceAddr, err)
 		return
@@ -276,37 +251,57 @@ func (n *Node) pullObject(inodeID uint64, sourceAddr string) {
 		log.Printf("pull %d from %s: status %d", inodeID, sourceAddr, resp.StatusCode)
 		return
 	}
-	objPath := n.objectPath(inodeID)
-	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
-		log.Printf("pull %d: mkdir: %v", inodeID, err)
+	size, err := n.storeObject(inodeID, resp.Body)
+	if err != nil {
+		log.Printf("pull %d: %v", inodeID, err)
 		return
 	}
+	log.Printf("pull %d: 已落盘 %d 字节", inodeID, size)
+	if err := n.reportReplicated(inodeID); err != nil {
+		log.Printf("pull %d: report replicated: %v", inodeID, err)
+	}
+}
+
+// storeObject 把 r 的内容安全落盘为对象 id：临时文件 → fsync → 原子改名。
+// fsync 保证掉电后文件内容完整，rename 前的数据才计入用量。
+// 返回写入字节数；失败时清理临时文件、不影响已有对象。
+func (n *Node) storeObject(id uint64, r io.Reader) (int64, error) {
+	objPath := n.objectPath(id)
+	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
+		return 0, err
+	}
+	// 覆盖写场景：先记下旧对象大小，成功后按差值计费。
 	var oldSize int64
 	if st, err := os.Stat(objPath); err == nil {
 		oldSize = st.Size()
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(objPath), ".tmp-*")
 	if err != nil {
-		log.Printf("pull %d: create temp: %v", inodeID, err)
-		return
+		return 0, err
 	}
 	tmpName := tmp.Name()
-	size, err := io.Copy(tmp, resp.Body)
-	closeErr := tmp.Close()
-	if err != nil || closeErr != nil {
+	size, err := io.Copy(tmp, r)
+	if err != nil {
+		tmp.Close()
 		os.Remove(tmpName)
-		log.Printf("pull %d: write: %v", inodeID, err)
-		return
+		return 0, err
+	}
+	// 数据先落盘再改名：掉电后要么旧对象、要么新对象，绝不出现半份新对象。
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return 0, err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return 0, err
 	}
 	if err := os.Rename(tmpName, objPath); err != nil {
 		os.Remove(tmpName)
-		log.Printf("pull %d: rename: %v", inodeID, err)
-		return
+		return 0, err
 	}
 	n.used.Add(size - oldSize)
-	if err := n.reportReplicated(inodeID); err != nil {
-		log.Printf("pull %d: report replicated: %v", inodeID, err)
-	}
+	return size, nil
 }
 
 // handleAdminObjects 返回本机全部对象的 ID 和大小，跳过 .tmp-* 临时文件。
@@ -558,8 +553,11 @@ func (n *Node) heartbeatOnce() error {
 	return nil
 }
 
-// InitUsedBytes 启动时统计已有数据量（对象目录遍历一次）。
+// InitUsedBytes 启动时统计已有数据量（对象目录遍历一次），并清理上次崩溃残留的临时文件。
 func (n *Node) InitUsedBytes() error {
+	if err := n.cleanupTmpFiles(); err != nil {
+		return err
+	}
 	var total int64
 	err := filepath.WalkDir(filepath.Join(n.dataDir, "objects"), func(_ string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -568,7 +566,7 @@ func (n *Node) InitUsedBytes() error {
 			}
 			return err
 		}
-		if !d.IsDir() {
+		if !d.IsDir() && !strings.HasPrefix(d.Name(), ".tmp-") {
 			if info, err := d.Info(); err == nil {
 				total += info.Size()
 			}
@@ -579,6 +577,40 @@ func (n *Node) InitUsedBytes() error {
 		return err
 	}
 	n.used.Store(total)
+	return nil
+}
+
+// cleanupTmpFiles 删除对象目录下全部 .tmp-* 残留（写一半的半成品，重启后已无意义）。
+func (n *Node) cleanupTmpFiles() error {
+	objectsDir := filepath.Join(n.dataDir, "objects")
+	entries, err := os.ReadDir(objectsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // 尚无数据
+		}
+		return err
+	}
+	removed := 0
+	for _, bucket := range entries {
+		if !bucket.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(objectsDir, bucket.Name()))
+		if err != nil {
+			continue // 单桶失败不阻塞启动
+		}
+		for _, f := range files {
+			if f.IsDir() || !strings.HasPrefix(f.Name(), ".tmp-") {
+				continue
+			}
+			if err := os.Remove(filepath.Join(objectsDir, bucket.Name(), f.Name())); err == nil {
+				removed++
+			}
+		}
+	}
+	if removed > 0 {
+		log.Printf("启动清理：删除 %d 个残留临时文件", removed)
+	}
 	return nil
 }
 
@@ -598,6 +630,9 @@ func (n *Node) NodeIDForTest() uint64 { return uint64(n.nodeID.Load()) }
 
 // DataDirForTest 返回数据目录路径。
 func (n *Node) DataDirForTest() string { return n.dataDir }
+
+// objectPathForTest 返回对象的磁盘路径（供测试直接检查文件内容）。
+func (n *Node) objectPathForTest(id uint64) string { return n.objectPath(id) }
 
 func httpError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})

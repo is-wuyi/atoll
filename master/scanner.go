@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -25,19 +26,23 @@ type Scanner struct {
 	gcIntv     time.Duration
 	httpClient *http.Client
 
-	mu        sync.Mutex
-	prevAlive map[uint64]bool // 上轮 alive 集合
+	mu          sync.Mutex
+	prevAlive   map[uint64]bool      // 上轮 alive 集合
+	failStreak  map[uint64]int       // 修复连续未收敛轮数（按 inode）
+	nextAttempt map[uint64]time.Time // 修复退避：下次允许对该 inode 触发修复的时间
 }
 
 // NewScanner 创建一个新的 Scanner 实例。
 func NewScanner(store *meta.Store, nodeMaxAge, repairIntv, gcIntv time.Duration) *Scanner {
 	return &Scanner{
-		store:      store,
-		nodeMaxAge: nodeMaxAge,
-		repairIntv: repairIntv,
-		gcIntv:     gcIntv,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		prevAlive:  make(map[uint64]bool),
+		store:       store,
+		nodeMaxAge:  nodeMaxAge,
+		repairIntv:  repairIntv,
+		gcIntv:      gcIntv,
+		httpClient:  &http.Client{Timeout: 10 * time.Second},
+		prevAlive:   make(map[uint64]bool),
+		failStreak:  make(map[uint64]int),
+		nextAttempt: make(map[uint64]time.Time),
 	}
 }
 
@@ -257,6 +262,8 @@ func planRepairs(inode types.Inode, nodes []types.NodeInfo, maxAge time.Duration
 func (s *Scanner) RepairScanOnce() { s.repairScanOnce() }
 
 // repairScanOnce 执行一次副本修复扫描。
+// 带 per-inode 指数退避：连续未收敛的文件按 1x→2x→4x... 周期倍增间隔（封顶 40x），
+// 避免源节点长期故障时每轮都重拉大文件造成内网流量风暴。
 func (s *Scanner) repairScanOnce() {
 	nodes, err := s.store.ListNodes()
 	if err != nil {
@@ -276,12 +283,43 @@ func (s *Scanner) repairScanOnce() {
 		return
 	}
 
+	now := time.Now()
 	for _, in := range inodes {
 		tasks := planRepairs(in, nodes, s.nodeMaxAge)
+		if len(tasks) == 0 {
+			// 本轮全部健康：清零退避状态。
+			s.mu.Lock()
+			delete(s.failStreak, in.ID)
+			delete(s.nextAttempt, in.ID)
+			s.mu.Unlock()
+			continue
+		}
+		// 退避窗口内的文件本轮跳过（上一轮修复尚未收敛）。
+		s.mu.Lock()
+		next, backed := s.nextAttempt[in.ID]
+		s.mu.Unlock()
+		if backed && now.Before(next) {
+			continue
+		}
+		// 记录"未收敛 +1"并安排下次退避窗口，然后执行本轮任务。
+		s.bumpRepairBackoff(in.ID)
 		for _, t := range tasks {
 			s.executeRepair(in.ID, t)
 		}
 	}
+}
+
+// bumpRepairBackoff 修复连续未收敛时推迟下次触发：1x→2x→4x…封顶 40 个 repairIntv。
+// 收敛（len(tasks)==0）时由扫描循环直接清零 failStreak/nextAttempt。
+func (s *Scanner) bumpRepairBackoff(inodeID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failStreak[inodeID]++
+	mult := int64(1 << min(s.failStreak[inodeID]-1, 6)) // streak 1,2,3… → 1x,2x,4x…封顶 64x
+	if mult > 40 {
+		mult = 40
+	}
+	s.nextAttempt[inodeID] = time.Now().Add(time.Duration(mult) * s.repairIntv)
 }
 
 // executeRepair 执行单个修复任务。
@@ -293,6 +331,12 @@ func (s *Scanner) executeRepair(inodeID uint64, t repairTask) {
 	case repairSkipNoTarget:
 		log.Printf("inode %d slot %d: 无合格新目标（dead node %d），跳过", inodeID, t.SlotIdx, t.OldNodeID)
 	case repairReplaceDead:
+		// 先探源：源上对象已丢失（404）时，换目标 + 重拉只会永远失败，
+		// 白白 churn 元数据与流量——跳过并保持退避，等源恢复或人工介入。
+		if !s.probeSource(t.SourceAddr, inodeID) {
+			log.Printf("inode %d slot %d: 源 %s 上对象缺失（404），跳过修复", inodeID, t.SlotIdx, t.SourceAddr)
+			return
+		}
 		if err := s.store.ReplaceReplica(inodeID, t.OldNodeID, t.NewNodeID); err != nil {
 			if errors.Is(err, meta.ErrNotExist) {
 				return // 文件被并发删除，静默跳过
@@ -303,9 +347,31 @@ func (s *Scanner) executeRepair(inodeID uint64, t repairTask) {
 		log.Printf("inode %d slot %d: 替换 dead node %d → %d，触发 pull", inodeID, t.SlotIdx, t.OldNodeID, t.NewNodeID)
 		s.triggerPull(t.NewNodeAddr, inodeID, t.SourceAddr)
 	case repairTriggerPull:
+		if !s.probeSource(t.SourceAddr, inodeID) {
+			log.Printf("inode %d slot %d: 源 %s 上对象缺失（404），跳过 pull", inodeID, t.SlotIdx, t.SourceAddr)
+			return
+		}
 		log.Printf("inode %d slot %d: 触发 pull（alive 未 Done）", inodeID, t.SlotIdx)
 		s.triggerPull(t.TargetAddr, inodeID, t.SourceAddr)
 	}
+}
+
+// probeSource 探测源节点上对象是否存在（Range 请求 1 字节，开销极小）。
+// 仅当明确返回 404 才判"源数据丢失"；网络错误等其他失败保持乐观（仍触发 pull，由重试兜底）。
+func (s *Scanner) probeSource(sourceAddr string, inodeID uint64) bool {
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("http://%s/objects/%d", sourceAddr, inodeID), nil)
+	if err != nil {
+		return true
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return true // 网络暂不可达：不阻止修复（可能是瞬时抖动）
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) // 排空以便连接复用
+	return resp.StatusCode != http.StatusNotFound
 }
 
 // triggerPull 调用目标节点 POST /pull。

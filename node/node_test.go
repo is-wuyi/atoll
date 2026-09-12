@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -373,5 +374,76 @@ func TestAdminObjects(t *testing.T) {
 	}
 	if objects[2].ID != 256 || objects[2].Size != 1 {
 		t.Fatalf("objects[2] = {ID:%d, Size:%d}, want {256, 1}", objects[2].ID, objects[2].Size)
+	}
+}
+
+// errReader 读一次就报错，模拟写入中途断流。
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+// TestStoreObjectOverwriteKeepsOldOnFailure 验证写失败时旧对象不受影响、临时文件被清理。
+func TestStoreObjectOverwriteKeepsOldOnFailure(t *testing.T) {
+	n, _ := newTestNode(t)
+	// 先落一个正式对象。
+	if _, err := n.storeObject(7, bytes.NewReader([]byte("old"))); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟中途断流：Reader 第一次读就报错。
+	if _, err := n.storeObject(7, errReader{}); err == nil {
+		t.Fatal("写入应失败")
+	}
+	// 旧对象原样保留。
+	data, err := os.ReadFile(n.objectPathForTest(7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("旧对象内容 = %q, want %q", data, "old")
+	}
+	// 目录里不应残留 .tmp-*。
+	entries, err := os.ReadDir(filepath.Join(n.DataDirForTest(), "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bucket := range entries {
+		files, err := os.ReadDir(filepath.Join(n.DataDirForTest(), "objects", bucket.Name()))
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if strings.HasPrefix(f.Name(), ".tmp-") {
+				t.Fatalf("残留临时文件未清理: %s", f.Name())
+			}
+		}
+	}
+}
+
+// TestInitUsedBytesCleansTmp 验证重启时清理 .tmp-* 残留且不计入用量。
+func TestInitUsedBytesCleansTmp(t *testing.T) {
+	n, _ := newTestNode(t)
+	if _, err := n.storeObject(1, bytes.NewReader([]byte("hello"))); err != nil {
+		t.Fatal(err)
+	}
+	// 手动放置一个崩溃残留的临时文件。
+	tmpPath := filepath.Join(n.DataDirForTest(), "objects", "01", ".tmp-crash")
+	if err := os.MkdirAll(filepath.Dir(tmpPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmpPath, []byte("garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟重启：新实例初始化。
+	n2 := New(n.dataDir, "http://master.invalid", "127.0.0.1:9002", 1<<30)
+	if err := n2.InitUsedBytes(); err != nil {
+		t.Fatal(err)
+	}
+	// tmp 被清掉。
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Fatalf("临时文件应被清理: %v", err)
+	}
+	// 用量只算正式对象。
+	if u := n2.used.Load(); u != 5 {
+		t.Fatalf("重启后 used = %d, want 5（tmp 不应计入）", u)
 	}
 }

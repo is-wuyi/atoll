@@ -100,8 +100,15 @@ func runMaster(args []string, stderr io.Writer) int {
 
 	srv := master.NewServer(store, *nodeMaxAge)
 	srv.SetScanner(scanner)
+	httpSrv := &http.Server{Addr: *listen, Handler: srv.Handler()}
+	go func() {
+		<-ctx.Done() // SIGTERM/SIGINT：NotifyContext 拦截了默认终止行为，必须显式退出
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		httpSrv.Shutdown(shutdownCtx)
+	}()
 	log.Printf("atoll master listening on %s (db=%s)", *listen, *dbPath)
-	if err := http.ListenAndServe(*listen, srv.Handler()); err != nil {
+	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
 		fmt.Fprintf(stderr, "atoll master: %v\n", err)
 		return 1
 	}
@@ -142,8 +149,21 @@ func runNode(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "atoll node: 注册 master 失败: %v\n", err)
 		return 1
 	}
+	httpSrv := &http.Server{
+		Addr:              *listen,
+		Handler:           n.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		httpSrv.Shutdown(shutdownCtx)
+	}()
 	log.Printf("atoll node listening on %s (data=%s)", *listen, *dataDir)
-	if err := http.ListenAndServe(*listen, n.Handler()); err != nil {
+	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
 		fmt.Fprintf(stderr, "atoll node: %v\n", err)
 		return 1
 	}
