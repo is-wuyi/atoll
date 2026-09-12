@@ -113,6 +113,10 @@ func fillEntry(a *fuse.Attr, in *types.Inode) {
 	}
 	a.Ino = in.ID
 	a.Mtime = uint64(in.Mtime.Unix())
+	// 报告挂载进程的 uid/gid：否则内核视为 root 所有，
+	// 普通用户在挂载点上无写权限（曾导致 mac 上写入 permission denied）。
+	a.Uid = uint32(os.Getuid())
+	a.Gid = uint32(os.Getgid())
 }
 
 // ---- 属性 ----
@@ -536,6 +540,8 @@ func (w *writeHandle) truncate(size uint64) syscall.Errno {
 // attr 把本地缓冲文件的属性填入 fuse.Attr。
 func (w *writeHandle) attr(a *fuse.Attr) {
 	st, err := os.Stat(w.local)
+	a.Uid = uint32(os.Getuid())
+	a.Gid = uint32(os.Getgid())
 	if err != nil {
 		a.Mode = fuse.S_IFREG | 0o644
 		return
