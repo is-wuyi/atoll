@@ -25,6 +25,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"atoll/client"
+	"atoll/pkg/auth"
 	"atoll/pkg/types"
 )
 
@@ -33,12 +34,18 @@ type Mount struct {
 	client   *client.Client
 	replicas int    // 新写入文件的副本数
 	cacheDir string // 写缓冲临时文件目录
+	token    auth.Token
 
 	mu     sync.Mutex
 	writes map[string]*writeHandle // 远程路径 → 进行中的本地写入
 }
 
 func New(c *client.Client, cacheDir string, replicas int) (*Mount, error) {
+	return NewWithToken(c, cacheDir, replicas, "")
+}
+
+// NewWithToken 创建带认证的挂载会话：读句柄的节点直连请求也注入 token。
+func NewWithToken(c *client.Client, cacheDir string, replicas int, token auth.Token) (*Mount, error) {
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
@@ -46,6 +53,7 @@ func New(c *client.Client, cacheDir string, replicas int) (*Mount, error) {
 		client:   c,
 		replicas: replicas,
 		cacheDir: cacheDir,
+		token:    token,
 		writes:   make(map[string]*writeHandle),
 	}, nil
 }
@@ -262,7 +270,10 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 		ino:   in.ID,
 		size:  in.Size,
 		addrs: addrs,
-		http:  &http.Client{Timeout: 30 * time.Second},
+		http: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: &auth.Transport{Token: n.m.token},
+		},
 	}, 0, 0
 }
 

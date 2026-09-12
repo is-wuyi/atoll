@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"atoll/pkg/auth"
 	"atoll/pkg/types"
 )
 
@@ -22,10 +23,16 @@ type Client struct {
 	HTTP      *http.Client
 }
 
+// New 创建客户端。token 为空 = 兼容模式（不注入认证头，连未启认证的旧集群）。
 func New(masterURL string) *Client {
+	return NewWithToken(masterURL, "")
+}
+
+// NewWithToken 创建带认证 token 的客户端（自动注入 Bearer 头）。
+func NewWithToken(masterURL string, token auth.Token) *Client {
 	return &Client{
 		MasterURL: strings.TrimRight(masterURL, "/"),
-		HTTP:      http.DefaultClient,
+		HTTP:      &http.Client{Transport: &auth.Transport{Token: token}},
 	}
 }
 

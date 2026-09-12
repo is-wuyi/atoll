@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"atoll/master/meta"
+	"atoll/pkg/auth"
 	"atoll/pkg/types"
 )
 
@@ -32,18 +33,23 @@ type Scanner struct {
 	nextAttempt map[uint64]time.Time // 修复退避：下次允许对该 inode 触发修复的时间
 }
 
-// NewScanner 创建一个新的 Scanner 实例。
+// NewScanner 创建一个新的 Scanner 实例。token 由 SetToken 设置后对出站请求生效。
 func NewScanner(store *meta.Store, nodeMaxAge, repairIntv, gcIntv time.Duration) *Scanner {
 	return &Scanner{
 		store:       store,
 		nodeMaxAge:  nodeMaxAge,
 		repairIntv:  repairIntv,
 		gcIntv:      gcIntv,
-		httpClient:  &http.Client{Timeout: 10 * time.Second},
+		httpClient:  &http.Client{Timeout: 10 * time.Second, Transport: &auth.Transport{Token: ""}},
 		prevAlive:   make(map[uint64]bool),
 		failStreak:  make(map[uint64]int),
 		nextAttempt: make(map[uint64]time.Time),
 	}
+}
+
+// SetToken 设置出站请求的认证 token（触发 pull、GC、删除通知等）。
+func (s *Scanner) SetToken(t auth.Token) {
+	s.httpClient.Transport = &auth.Transport{Token: t}
 }
 
 // Start 启动三个后台扫描器，ctx 取消时退出。

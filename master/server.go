@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"atoll/master/meta"
+	"atoll/pkg/auth"
 	"atoll/pkg/types"
 )
 
@@ -21,18 +22,22 @@ type Server struct {
 	store      *meta.Store
 	nodeMaxAge time.Duration // 节点心跳超时阈值
 	scanner    *Scanner      // GC 需要调用
+	token      auth.Token    // 集群认证；空 = 兼容模式
 }
 
 func NewServer(store *meta.Store, nodeMaxAge time.Duration) *Server {
 	return &Server{store: store, nodeMaxAge: nodeMaxAge}
 }
 
+// SetToken 设置集群认证 token（包装 Handler 生效）。空 token = 兼容模式。
+func (s *Server) SetToken(token auth.Token) { s.token = token }
+
 // SetScanner 绑定扫描器，供 /admin/gc 等接口使用。
 func (s *Server) SetScanner(scanner *Scanner) {
 	s.scanner = scanner
 }
 
-// Handler 返回全部路由。
+// Handler 返回全部路由（整体经 auth 包装，healthz 豁免）。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -50,7 +55,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("POST /nodes/heartbeat", s.handleNodeHeartbeat)
 	mux.HandleFunc("POST /admin/gc", s.handleGC)
-	return mux
+	return auth.Wrap(mux, s.token)
 }
 
 // ---- 目录 ----
@@ -327,7 +332,10 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 
 // notifyObjectDelete 通知持有该对象的所有节点删除本地文件。
 func (s *Server) notifyObjectDelete(inodeID uint64, replicaNodeIDs []uint64) {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &auth.Transport{Token: s.token},
+	}
 	for _, id := range replicaNodeIDs {
 		n, err := s.store.GetNode(id)
 		if err != nil {

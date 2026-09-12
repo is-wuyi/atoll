@@ -18,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"atoll/pkg/auth"
 )
 
 // Node 是一个存储节点实例。
@@ -32,32 +34,52 @@ type Node struct {
 	httpClient        *http.Client // 与 master 交互（小请求，60s 全程超时）
 	bulkClient        *http.Client // 对等节点大对象传输（push/pull，不设全程超时）
 	pulling           sync.Map     // map[uint64]struct{}: 正在拉取的 inode，去重用
+	token             auth.Token   // 集群认证；空 = 兼容模式
 }
 
 func New(dataDir, masterURL, advertise string, totalBytes int64) *Node {
-	return &Node{
+	bulkTransport := &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+	}
+	n := &Node{
 		dataDir:           dataDir,
 		masterURL:         strings.TrimRight(masterURL, "/"),
 		advertise:         advertise,
 		totalBytes:        totalBytes,
 		heartbeatInterval: 5 * time.Second,
-		httpClient:        &http.Client{Timeout: 60 * time.Second},
 		// 大对象传输不能设全程超时：http.Client 的 Timeout 覆盖读 body，
 		// 3GB 文件按内网实际带宽可能要数分钟，60s 超时会让每次 pull/push
 		// 都在半途被掐死（曾导致 inode 114 副本自 8/21 起从未同步成功）。
 		// 改为只在连接/握手/响应头阶段限时，body 传输不限时。
-		bulkClient: &http.Client{Transport: &http.Transport{
-			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			IdleConnTimeout:       90 * time.Second,
-		}},
+		bulkClient: &http.Client{Transport: &auth.Transport{Fallback: bulkTransport}},
+	}
+	n.httpClient = &http.Client{
+		Timeout:   60 * time.Second,
+		Transport: &auth.Transport{Token: n.token},
+	}
+	n.bulkClient.Transport.(*auth.Transport).Token = n.token
+	return n
+}
+
+// SetToken 设置集群认证 token：出站请求注入。空 token = 兼容模式。
+// 必须在 Handler()/Register() 之前调用。
+func (n *Node) SetToken(t auth.Token) {
+	n.token = t
+	if tr, ok := n.httpClient.Transport.(*auth.Transport); ok {
+		tr.Token = t
+	}
+	if tr, ok := n.bulkClient.Transport.(*auth.Transport); ok {
+		tr.Token = t
 	}
 }
 
 // ---- 对象存储 HTTP API ----
 
-// Handler 返回对象存储路由。对象以 inode ID 命名，直接落盘。
+// Handler 返回对象存储路由（整体经 auth 包装，healthz 豁免）。
+// 对象以 inode ID 命名，直接落盘。
 func (n *Node) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -69,7 +91,7 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("PUT /replicate/{id}", n.handleReplicate)
 	mux.HandleFunc("POST /pull", n.handlePull)
 	mux.HandleFunc("GET /admin/objects", n.handleAdminObjects)
-	return mux
+	return auth.Wrap(mux, n.token)
 }
 
 // handlePut 写入对象：先写临时文件再原子改名，避免读到半份数据。
@@ -123,7 +145,7 @@ func (n *Node) replicateToPeers(inodeID uint64) {
 // fetchReplicaTargets 向 master 查询除自己外待同步的副本节点地址。
 func (n *Node) fetchReplicaTargets(inodeID uint64) ([]string, error) {
 	url := fmt.Sprintf("%s/files/replica-targets?inode_id=%d&node_id=%d", n.masterURL, inodeID, n.nodeID.Load())
-	resp, err := http.Get(url)
+	resp, err := n.httpClient.Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +198,7 @@ func (n *Node) reportReplicated(inodeID uint64) error {
 	})
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
-		resp, terr := http.Post(n.masterURL+"/files/replicated", "application/json", bytes.NewReader(body))
+		resp, terr := n.httpClient.Post(n.masterURL+"/files/replicated", "application/json", bytes.NewReader(body))
 		if terr == nil {
 			defer resp.Body.Close()
 			io.Copy(io.Discard, resp.Body)
@@ -494,7 +516,7 @@ func (n *Node) registerOnce() error {
 		"addr":        n.advertise,
 		"total_bytes": n.totalBytes,
 	})
-	resp, err := http.Post(n.masterURL+"/nodes/register", "application/json", bytes.NewReader(body))
+	resp, err := n.httpClient.Post(n.masterURL+"/nodes/register", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
@@ -539,7 +561,7 @@ func (n *Node) heartbeatOnce() error {
 		"node_id":    n.nodeID.Load(),
 		"used_bytes": n.used.Load(),
 	})
-	resp, err := http.Post(n.masterURL+"/nodes/heartbeat", "application/json", bytes.NewReader(body))
+	resp, err := n.httpClient.Post(n.masterURL+"/nodes/heartbeat", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("heartbeat: %w", err)
 	}

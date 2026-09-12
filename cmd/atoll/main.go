@@ -25,6 +25,7 @@ import (
 	"atoll/master/meta"
 	"atoll/mount"
 	"atoll/node"
+	"atoll/pkg/auth"
 )
 
 const usageText = `usage: atoll <command> [args]
@@ -40,7 +41,11 @@ const usageText = `usage: atoll <command> [args]
   atoll mkdir <远程路径>            建目录
   atoll rm  <远程路径>              删除文件/空目录
   atoll mount <挂载点>              FUSE 挂载为本地目录 [-cache 缓冲目录 -replicas N]
-  atoll gc [--execute]              垃圾回收（dry-run 默认；--execute 执行删除）`
+  atoll gc [--execute]              垃圾回收（dry-run 默认；--execute 执行删除）
+  atoll auth gen                    生成随机集群认证 token
+
+认证: 全部角色支持 -token 参数或 ATOLL_TOKEN 环境变量（集群各组件须一致；
+不设置时为兼容模式，不校验也不注入）`
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -63,6 +68,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runClientCmd(cmd, rest, stdout, stderr)
 	case "gc":
 		return runGC(rest, stdout, stderr)
+	case "auth":
+		return runAuth(rest, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprintln(stdout, usageText)
 		return 0
@@ -70,6 +77,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "atoll: unknown command %q\n\n%s\n", cmd, usageText)
 		return 2
 	}
+}
+
+// ---- auth ----
+
+func runAuth(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 || args[0] != "gen" {
+		fmt.Fprintln(stderr, "用法: atoll auth gen")
+		return 2
+	}
+	tok, err := auth.Generate()
+	if err != nil {
+		fmt.Fprintf(stderr, "生成失败: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, tok)
+	return 0
 }
 
 // ---- master ----
@@ -82,6 +105,7 @@ func runMaster(args []string, stderr io.Writer) int {
 	nodeMaxAge := fs.Duration("node-max-age", 30*time.Second, "节点心跳超时阈值")
 	repairIntv := fs.Duration("repair-interval", 15*time.Second, "副本修复扫描周期")
 	gcIntv := fs.Duration("gc-interval", 10*time.Minute, "GC 对账扫描周期")
+	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -96,10 +120,12 @@ func runMaster(args []string, stderr io.Writer) int {
 	defer cancel()
 
 	scanner := master.NewScanner(store, *nodeMaxAge, *repairIntv, *gcIntv)
+	scanner.SetToken(auth.Token(*token))
 	scanner.Start(ctx) // 内部为三个循环各起 goroutine
 
 	srv := master.NewServer(store, *nodeMaxAge)
 	srv.SetScanner(scanner)
+	srv.SetToken(auth.Token(*token))
 	httpSrv := &http.Server{Addr: *listen, Handler: srv.Handler()}
 	go func() {
 		<-ctx.Done() // SIGTERM/SIGINT：NotifyContext 拦截了默认终止行为，必须显式退出
@@ -125,6 +151,7 @@ func runNode(args []string, stderr io.Writer) int {
 	advertise := fs.String("advertise", "", "注册到 master 供客户端直连的地址；跨机部署必须显式指定（如 203.0.113.5:9421）")
 	dataDir := fs.String("data-dir", "./node-data", "对象存储目录")
 	totalBytes := fs.Int64("total-bytes", 100<<30, "声明容量（字节）")
+	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -141,6 +168,7 @@ func runNode(args []string, stderr io.Writer) int {
 		return 1
 	}
 	n := node.New(*dataDir, *masterURL, adv, *totalBytes)
+	n.SetToken(auth.Token(*token))
 	if err := n.InitUsedBytes(); err != nil {
 		fmt.Fprintf(stderr, "atoll node: %v\n", err)
 		return 1
@@ -179,6 +207,7 @@ func runMount(args []string, stderr io.Writer) int {
 	replicas := fset.Int("replicas", 2, "新写入文件的副本数")
 	cacheDir := fset.String("cache", filepath.Join(os.TempDir(), "atoll-cache"), "写缓冲临时目录")
 	debug := fset.Bool("debug", false, "输出 FUSE 调试日志")
+	token := fset.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
 	if err := fset.Parse(args); err != nil {
 		return 2
 	}
@@ -192,8 +221,8 @@ func runMount(args []string, stderr io.Writer) int {
 		return 1
 	}
 
-	c := client.New(*masterURL)
-	m, err := mount.New(c, *cacheDir, *replicas)
+	c := client.NewWithToken(*masterURL, auth.Token(*token))
+	m, err := mount.NewWithToken(c, *cacheDir, *replicas, auth.Token(*token))
 	if err != nil {
 		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
 		return 1
@@ -226,10 +255,11 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
 	replicas := fs.Int("replicas", 2, "副本数（仅 put 使用，含主副本）")
 	force := fs.Bool("f", false, "强制覆盖远程已存在的同名文件（仅 put 使用）")
+	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	c := client.New(*masterURL)
+	c := client.NewWithToken(*masterURL, auth.Token(*token))
 
 	switch cmd {
 	case "put":
@@ -308,10 +338,11 @@ func runGC(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
 	execute := fs.Bool("execute", false, "执行删除（默认仅 dry-run）")
+	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	c := client.New(*masterURL)
+	c := client.NewWithToken(*masterURL, auth.Token(*token))
 	reports, err := c.GC(*execute)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc 失败: %v\n", err)
