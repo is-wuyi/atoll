@@ -249,6 +249,7 @@ func parentOf(p string) string {
 // ---- 文件打开 ----
 
 // Open 读打开返回 Range 流式读句柄；写打开返回本地缓冲句柄。
+// 分块文件（Chunked=true）返回 chunkedReadHandle：按块表换算对象 ID 与块内偏移。
 func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	remote := n.path()
 	writeIntent := flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0 || flags&syscall.O_TRUNC != 0
@@ -266,6 +267,27 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 	if err != nil {
 		return nil, 0, syscall.ENOENT
 	}
+	hc := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &auth.Transport{Token: n.m.token},
+	}
+	if in.Chunked {
+		addr := make(map[uint64]string)
+		for _, r := range reps {
+			addr[r.ID] = r.Addr
+		}
+		if len(addr) == 0 {
+			return nil, 0, syscall.EIO
+		}
+		return &chunkedReadHandle{
+			ino:    in.ID,
+			size:   in.Size,
+			chunks: in.Chunks,
+			addr:   addr,
+			next:   make(map[int]int),
+			http:   hc,
+		}, 0, 0
+	}
 	addrs := candidateAddrs(reps)
 	if len(addrs) == 0 {
 		return nil, 0, syscall.EIO
@@ -274,10 +296,7 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 		ino:   in.ID,
 		size:  in.Size,
 		addrs: addrs,
-		http: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: &auth.Transport{Token: n.m.token},
-		},
+		http:  hc,
 	}, 0, 0
 }
 
@@ -331,6 +350,16 @@ func candidateAddrs(reps []client.Replica) []string {
 	}
 	rand.Shuffle(len(done), func(i, j int) { done[i], done[j] = done[j], done[i] })
 	return append(done, pending...)
+}
+
+// containsUint64 判断 v 是否在 list 中。
+func containsUint64(list []uint64, v uint64) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // mapErrno 把 client 错误映射为 errno。
@@ -415,6 +444,126 @@ func (rh *readHandle) Read(_ context.Context, dest []byte, off int64) (fuse.Read
 	return fuse.ReadResultData(data), 0
 }
 
+// ---- 分块读句柄：按块表定位 → 块内 Range 读取 ----
+
+// chunkedReadHandle 分块文件的流式读句柄。
+// offset → (块 index, 块内偏移) 的换算由块表顺序推累计基址；
+// 每个块的候选节点：Done 副本优先、组内随机打散（打开时预排，读时轮换故障转移）。
+type chunkedReadHandle struct {
+	ino    uint64
+	size   int64
+	chunks []types.ChunkInfo
+	addr   map[uint64]string // 节点 ID → 地址（lookup 的地址表）
+	next   map[int]int      // 块 index → 下一个候选起点（读时记忆可用节点）
+	http   *http.Client
+	mu     sync.Mutex
+}
+
+var _ fs.FileReader = (*chunkedReadHandle)(nil)
+
+// readChunkRange 读块的 [start, end] 闭区间；失败在该块候选节点间轮换。
+func (ch *chunkedReadHandle) readChunkRange(c types.ChunkInfo, start, end int64) ([]byte, syscall.Errno) {
+	want := end - start + 1
+	// done 优先、组内打散（与 candidateAddrs 同语义，但面向节点 ID）。
+	var primary, pending []uint64
+	for _, id := range c.Replicas {
+		if len(c.Done) > 0 && containsUint64(c.Done, id) {
+			primary = append(primary, id)
+		} else {
+			pending = append(pending, id)
+		}
+	}
+	rand.Shuffle(len(primary), func(i, j int) { primary[i], primary[j] = primary[j], primary[i] })
+	candidates := append(append([]uint64{}, primary...), pending...)
+
+	chunkID := types.ChunkID(ch.ino, c.Index)
+	ch.mu.Lock()
+	next := ch.next[c.Index]
+	ch.mu.Unlock()
+
+	var lastErr error
+	for i := 0; i < len(candidates); i++ {
+		id := candidates[(next+i)%len(candidates)]
+		a, ok := ch.addr[id]
+		if !ok || a == "" {
+			lastErr = fmt.Errorf("节点 %d 地址未知", id)
+			continue
+		}
+		req, err := http.NewRequest(http.MethodGet,
+			fmt.Sprintf("http://%s/objects/%d", a, chunkID), nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+		resp, err := ch.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("node %s: status %d", a, resp.StatusCode)
+			continue
+		}
+		buf := make([]byte, want)
+		n, err := io.ReadFull(resp.Body, buf)
+		resp.Body.Close()
+		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+			lastErr = err
+			continue
+		}
+		ch.mu.Lock()
+		ch.next[c.Index] = (next + i + 1) % len(candidates)
+		ch.mu.Unlock()
+		return buf[:n], 0
+	}
+	_ = lastErr
+	return nil, syscall.EIO
+}
+
+// Read 读取 [off, off+len(dest)) ：按块表顺序切分，逐块发 Range，跨块自动循环。
+func (ch *chunkedReadHandle) Read(_ context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	if off >= ch.size {
+		return fuse.ReadResultData(nil), 0 // EOF
+	}
+	end := off + int64(len(dest)) - 1
+	if end >= ch.size {
+		end = ch.size - 1
+	}
+	// 定位起始块：块表按 Index 升序，块基址 = Σ前序块大小。
+	var base int64
+	idx := 0
+	for i, c := range ch.chunks {
+		if off < base+c.Size {
+			idx = i
+			break
+		}
+		base += c.Size
+	}
+	// 逐块读取拼装（dest 一次 Read 最多跨若干块）。
+	out := make([]byte, 0, end-off+1)
+	cur := off
+	for cur <= end && idx < len(ch.chunks) {
+		c := ch.chunks[idx]
+		chunkStart := cur - base          // 块内偏移（cur 是绝对偏移）
+		chunkEnd := min(end-base, c.Size-1) // 同为块内偏移：end 绝对 → 相对
+		n := chunkEnd - chunkStart + 1
+		data, errno := ch.readChunkRange(c, chunkStart, chunkEnd)
+		if errno != 0 {
+			return nil, errno
+		}
+		if int64(len(data)) != n {
+			return nil, syscall.EIO // 块数据不完整（大小与块表不符）
+		}
+		out = append(out, data...)
+		cur += n
+		base += c.Size
+		idx++
+	}
+	return fuse.ReadResultData(out), 0
+}
+
 // ---- 写句柄：本地缓冲，Flush 整传 ----
 
 type writeHandle struct {
@@ -474,6 +623,8 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 }
 
 // Flush 上传缓冲文件到集群。可能被多次调用（每次 close），有变更才重传。
+// 非空文件走分块流水线（覆盖写由 commit 单事务原子换名，旧版本或新版本必居其一）；
+// 空文件走 legacy 单对象路径（chunked 模式要求至少一块）。
 func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -487,7 +638,13 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
 		return syscall.EIO
 	}
-	if err := w.m.client.PutReaderOverwrite(w.remote, st.Size(), w.f, w.m.replicas, true); err != nil {
+	var err2 error
+	if st.Size() > 0 {
+		err2 = w.m.client.PutChunkedReaderOverwrite(w.remote, st.Size(), w.f, w.m.replicas, true)
+	} else {
+		err2 = w.m.client.PutReaderOverwrite(w.remote, st.Size(), w.f, w.m.replicas, true)
+	}
+	if err2 != nil {
 		return syscall.EIO
 	}
 	w.dirty = false

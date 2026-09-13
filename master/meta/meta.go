@@ -366,6 +366,339 @@ func (s *Store) UpdateFile(id uint64, size int64, replicas []uint64) error {
 	})
 }
 
+// ---- 分块文件操作（批次 C）----
+//
+// 分块模型：Chunked=true 的文件由 64MB 块组成，每块独立副本，块对象 ID
+// 由 types.ChunkID(stagingInodeID, index) 编码。写入流程：
+//
+//	CreateStagingFile（隐藏 inode，不挂 children）
+//	→ AssignChunk × N（每块独立分配副本）
+//	→ CommitStagingFile（单事务校验 + 原子换名，解决审计 #1/#8）
+//	→ AbortStaging（客户端中断时显式放弃；崩溃残留由 TTL 回收）
+//
+// staging inode 用独立计数器编号（≥ 2^32，见 types.StagingInodeBase），
+// 与 legacy inode ID、块对象 ID 三者空间互不重叠。
+
+var (
+	keyNextStagingInode = []byte("next_staging_inode")
+)
+
+// ErrNotStaging 对非 staging inode 执行了 staging 专属操作。
+var ErrNotStaging = errors.New("not a staging inode")
+
+// ErrChunkBadIndex 块下标越界。
+var ErrChunkBadIndex = errors.New("chunk index out of range")
+
+// ErrChunkBadSize 块大小非法。
+var ErrChunkBadSize = errors.New("chunk size out of range")
+
+// ErrChunkNotExist 目标 inode 无此块。
+var ErrChunkNotExist = errors.New("chunk not found")
+
+// ErrCommitFailed commit 校验失败（块缺失/主副本未落盘/大小不符）。
+var ErrCommitFailed = errors.New("commit validation failed")
+
+// CreateStagingFile 在 parentID 下分配一个写入中的隐藏文件 inode。
+// Staging=true, Chunked=true，不挂 children——路径解析天然看不见它。
+func (s *Store) CreateStagingFile(parentID uint64) (types.Inode, error) {
+	var in types.Inode
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		parent, err := getInodeTx(tx, parentID)
+		if err != nil {
+			return err
+		}
+		if parent.Type != types.TypeDir {
+			return ErrNotDir
+		}
+		id, err := nextStagingID(tx)
+		if err != nil {
+			return err
+		}
+		in = types.Inode{
+			ID:       id,
+			ParentID: parentID,
+			Type:     types.TypeFile,
+			Mtime:    time.Now(),
+			Staging:  true,
+			Chunked:  true,
+		}
+		return putInode(tx, &in)
+	})
+	if err != nil {
+		return types.Inode{}, err
+	}
+	return in, nil
+}
+
+// nextStagingID 读取并自增 staging 计数器，从 StagingInodeBase 起。
+func nextStagingID(tx *bolt.Tx) (uint64, error) {
+	b := tx.Bucket(bucketMeta)
+	cur := types.StagingInodeBase
+	if v := b.Get(keyNextStagingInode); v != nil {
+		cur = beU64(v)
+	}
+	if err := b.Put(keyNextStagingInode, u64be(cur+1)); err != nil {
+		return 0, err
+	}
+	return cur, nil
+}
+
+// AssignChunk 为 staging 文件的第 index 块分配副本节点。
+// 幂等：该块已分配则原样返回既有分配（重试安全）。
+func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []uint64) (types.ChunkInfo, error) {
+	var chunk types.ChunkInfo
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		in, err := getInodeTx(tx, inodeID)
+		if err != nil {
+			return err
+		}
+		if !in.Staging {
+			return ErrNotStaging
+		}
+		if index < 0 || index >= types.MaxChunksPerFile {
+			return ErrChunkBadIndex
+		}
+		if size <= 0 || size > types.ChunkSize {
+			return ErrChunkBadSize
+		}
+		for _, c := range in.Chunks {
+			if c.Index == index {
+				chunk = c // 已分配，幂等返回
+				return nil
+			}
+		}
+		in.Chunks = append(in.Chunks, types.ChunkInfo{Index: index, Size: size, Replicas: replicas})
+		// 并发 Assign 可能乱序插入，保持块表按 Index 升序。
+		sort.Slice(in.Chunks, func(i, j int) bool { return in.Chunks[i].Index < in.Chunks[j].Index })
+		if err := putInode(tx, &in); err != nil {
+			return err
+		}
+		for _, c := range in.Chunks {
+			if c.Index == index {
+				chunk = c
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return types.ChunkInfo{}, err
+	}
+	return chunk, nil
+}
+
+// ReassignChunk 废弃某块现有分配并重新分配（主副本持续失败时换节点）。
+// 返回新分配。块 Done 集合重置。
+func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64) (types.ChunkInfo, error) {
+	var chunk types.ChunkInfo
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		in, err := getInodeTx(tx, inodeID)
+		if err != nil {
+			return err
+		}
+		if !in.Staging {
+			return ErrNotStaging
+		}
+		for i := range in.Chunks {
+			if in.Chunks[i].Index == index {
+				in.Chunks[i].Replicas = replicas
+				in.Chunks[i].Done = nil
+				chunk = in.Chunks[i]
+				return putInode(tx, &in)
+			}
+		}
+		return ErrChunkNotExist
+	})
+	if err != nil {
+		return types.ChunkInfo{}, err
+	}
+	return chunk, nil
+}
+
+// MarkChunkDone 把 nodeID 记入块 Done 集合（块对象落盘完成上报，幂等）。
+// chunkID 由 types.ChunkID 编码；commit 前后调用均合法。
+func (s *Store) MarkChunkDone(chunkID, nodeID uint64) error {
+	inodeID, index := types.ParseChunkID(chunkID)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		in, err := getInodeTx(tx, inodeID)
+		if err != nil {
+			return err
+		}
+		if !in.Chunked {
+			return ErrChunkNotExist
+		}
+		for i := range in.Chunks {
+			if in.Chunks[i].Index == index {
+				in.Chunks[i].Done = appendUnique(in.Chunks[i].Done, nodeID)
+				return putInode(tx, &in)
+			}
+		}
+		return ErrChunkNotExist
+	})
+}
+
+// ReplaceChunkReplica 块级槽位替换（修复扫描）：Replicas 中 oldNodeID → newNodeID，
+// 同时从 Done 中移除 oldNodeID。staging 与已提交的分块文件均适用。
+func (s *Store) ReplaceChunkReplica(inodeID uint64, index int, oldNodeID, newNodeID uint64) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		in, err := getInodeTx(tx, inodeID)
+		if err != nil {
+			return err
+		}
+		if !in.Chunked {
+			return ErrChunkNotExist
+		}
+		for i := range in.Chunks {
+			if in.Chunks[i].Index != index {
+				continue
+			}
+			found := false
+			for j, rid := range in.Chunks[i].Replicas {
+				if rid == oldNodeID {
+					in.Chunks[i].Replicas[j] = newNodeID
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("node %d not in replicas of chunk %d", oldNodeID, index)
+			}
+			filtered := in.Chunks[i].Done[:0]
+			for _, d := range in.Chunks[i].Done {
+				if d != oldNodeID {
+					filtered = append(filtered, d)
+				}
+			}
+			in.Chunks[i].Done = filtered
+			return putInode(tx, &in)
+		}
+		return ErrChunkNotExist
+	})
+}
+
+// CommitStagingFile 校验并单事务原子提交：
+// 每块主副本 Done 且 Σ块大小 = size → 同名旧 inode 一并删除 → staging 换名挂 children。
+// 事务前读者看到旧版本，事务后看到新版本——不存在中间态（审计 #1）。
+// 返回提交后的 inode 与被替换的旧 inode（ok=false 表示无旧版本）。
+func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (types.Inode, types.Inode, bool, error) {
+	var out, old types.Inode
+	var hadOld bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		in, err := getInodeTx(tx, inodeID)
+		if err != nil {
+			return err
+		}
+		if !in.Staging || !in.Chunked {
+			return ErrNotStaging
+		}
+		if len(in.Chunks) == 0 {
+			return fmt.Errorf("%w: no chunks assigned", ErrCommitFailed)
+		}
+		var sum int64
+		for _, c := range in.Chunks {
+			if len(c.Replicas) == 0 || !containsUint64(c.Done, c.Replicas[0]) {
+				return fmt.Errorf("%w: chunk %d primary not done", ErrCommitFailed, c.Index)
+			}
+			sum += c.Size
+		}
+		if sum != size {
+			return fmt.Errorf("%w: chunk size sum %d != %d", ErrCommitFailed, sum, size)
+		}
+		parent, err := getInodeTx(tx, in.ParentID)
+		if err != nil {
+			return err
+		}
+		if parent.Type != types.TypeDir {
+			return ErrNotDir
+		}
+		// 同名旧 inode：目录则拒绝覆盖，文件则同事务删除（原子替换）。
+		if oldID := tx.Bucket(bucketChildren).Get(childKey(in.ParentID, name)); oldID != nil {
+			old, err = getInodeTx(tx, beU64(oldID))
+			if err != nil {
+				return err
+			}
+			if old.Type == types.TypeDir {
+				return ErrExist
+			}
+			if err := tx.Bucket(bucketInodes).Delete(u64be(old.ID)); err != nil {
+				return err
+			}
+			hadOld = true
+		}
+		in.Name = name
+		in.Size = size
+		in.Staging = false
+		in.Mtime = time.Now()
+		if err := putInode(tx, &in); err != nil {
+			return err
+		}
+		if err := tx.Bucket(bucketChildren).Put(childKey(in.ParentID, name), u64be(in.ID)); err != nil {
+			return err
+		}
+		out = in
+		return nil
+	})
+	if err != nil {
+		return types.Inode{}, types.Inode{}, false, err
+	}
+	return out, old, hadOld, nil
+}
+
+// AbortStaging 删除 staging inode（幂等）。已落盘块对象的回收由调用方负责。
+func (s *Store) AbortStaging(inodeID uint64) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		in, err := getInodeTx(tx, inodeID)
+		if err != nil {
+			if errors.Is(err, ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !in.Staging {
+			return ErrNotStaging
+		}
+		return tx.Bucket(bucketInodes).Delete(u64be(inodeID))
+	})
+}
+
+// ForEachStaging 遍历全部 staging inode（TTL 回收/诊断用）。
+func (s *Store) ForEachStaging(fn func(types.Inode) error) error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketInodes).ForEach(func(_, v []byte) error {
+			var in types.Inode
+			if err := json.Unmarshal(v, &in); err != nil {
+				return err
+			}
+			if in.Staging {
+				return fn(in)
+			}
+			return nil
+		})
+	})
+}
+
+// containsUint64 判断 v 是否在 list 中。
+func containsUint64(list []uint64, v uint64) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// NodeInfos 按 ID 列表取节点详情（缺失的跳过）。
+func (s *Store) NodeInfos(ids []uint64) ([]types.NodeInfo, error) {
+	var out []types.NodeInfo
+	for _, id := range ids {
+		n, err := s.GetNode(id)
+		if err != nil {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
 // ---- 存储节点操作 ----
 
 // RegisterNode 注册一个存储节点，返回节点信息。

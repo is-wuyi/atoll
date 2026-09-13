@@ -2,6 +2,8 @@ package master
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -373,4 +375,140 @@ func putObjectForMaster(t *testing.T, baseURL string, id uint64) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("PUT 状态码 = %d", resp.StatusCode)
 	}
+}
+
+// ---- 批次 C：块级修复 / GC 两轮确认 / staging TTL ----
+
+// TestChunkRepairReplaceDead 分块文件一块的主副本 dead → ReplaceChunkReplica + pull（chunkID）。
+func TestChunkRepairReplaceDead(t *testing.T) {
+	_, store := newTestScanner(t, time.Hour)
+
+	// 注册 3 个节点：1,2 alive；3 注册后心跳过期（dead）。
+	for i := 1; i <= 2; i++ {
+		n, _ := store.RegisterNode(fmt.Sprintf("n%d:9421", i), 1<<30)
+		_ = n
+	}
+	n3, _ := store.RegisterNode("n3:9421", 1<<30)
+
+	// 建一个已提交的分块文件：chunk0 副本 [1,3]，Done [1]。
+	st, _ := store.CreateStagingFile(1)
+	store.AssignChunk(st.ID, 0, 100, []uint64{1, n3.ID})
+	store.MarkChunkDone(types.ChunkID(st.ID, 0), 1)
+	store.CommitStagingFile(st.ID, "f.bin", 100)
+
+	// 验证块任务复用 planRepairs（伪 inode）：dead 槽产出 replaceDead。
+	chunkID := types.ChunkID(st.ID, 0)
+	in, _ := store.GetInode(st.ID)
+	nodes := mkNodes([]uint64{1, 2}, []uint64{1, 2, n3.ID})
+	pseudo := types.Inode{
+		ID:           chunkID,
+		Replicas:     in.Chunks[0].Replicas,
+		DoneReplicas: in.Chunks[0].Done,
+		Size:         100,
+	}
+	tasks := planRepairs(pseudo, nodes, time.Hour)
+	if len(tasks) != 1 || tasks[0].Action != repairReplaceDead {
+		t.Fatalf("应产出 1 个 replaceDead 任务, got %+v", tasks)
+	}
+	if tasks[0].OldNodeID != n3.ID {
+		t.Fatalf("OldNodeID 应为 dead 节点 %d, got %d", n3.ID, tasks[0].OldNodeID)
+	}
+}
+
+// TestGCConfirmTwoRounds GC 两轮确认：第一轮 execute 不删，第二轮才删。
+func TestGCConfirmTwoRounds(t *testing.T) {
+	s, store := newTestScanner(t, time.Hour)
+
+	// 源节点上放一个孤儿对象（不在任何元数据中）。
+	_, nTS := newTestNodeForMaster(t)
+	nInfo, _ := store.RegisterNode(nTS.Listener.Addr().String(), 1<<30)
+	store.Heartbeat(nInfo.ID, 0)
+	putObjectForMaster(t, nTS.URL, 99999)
+
+	// 第一轮 execute：报告孤儿但不删（上轮快照为空）。
+	reports, err := s.RunGC(true)
+	if err != nil {
+		t.Fatalf("GC 第一轮: %v", err)
+	}
+	found := false
+	for _, r := range reports {
+		for _, o := range r.Orphans {
+			if o.ID == 99999 {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("第一轮应报告孤儿")
+	}
+	// 第二轮 execute：上轮见过 → 删除。
+	_, err = s.RunGC(true)
+	if err != nil {
+		t.Fatalf("GC 第二轮: %v", err)
+	}
+	// 验证删除：对象清单里不再有 99999。
+	resp, err := http.Get(nTS.URL + "/admin/objects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var objects []ObjectEntry
+	json.NewDecoder(resp.Body).Decode(&objects)
+	for _, o := range objects {
+		if o.ID == 99999 {
+			t.Fatal("两轮确认后孤儿应被删除")
+		}
+	}
+}
+
+// TestSweepStagingExpiredTTL 超 TTL 的 staging 被回收，未超时保留。
+func TestSweepStagingExpiredTTL(t *testing.T) {
+	s, store := newTestScanner(t, time.Hour)
+	s.stagingTTL = 100 * time.Millisecond
+
+	// old：mtime 超过 TTL 的 staging。
+	old, _ := store.CreateStagingFile(1)
+	store.AssignChunk(old.ID, 0, 10, []uint64{7})
+	// 把 mtime 改老：meta 层没有 API，用直接改 TTL 的方式 —— 等待 TTL 过期。
+	time.Sleep(150 * time.Millisecond)
+
+	// fresh：刚建的 staging。
+	fresh, _ := store.CreateStagingFile(1)
+
+	s.sweepStaging()
+
+	if _, err := store.GetInode(old.ID); !errors.Is(err, meta.ErrNotExist) {
+		t.Fatalf("超时 staging 应被回收: %v", err)
+	}
+	if _, err := store.GetInode(fresh.ID); err != nil {
+		t.Fatalf("未超时 staging 不应被回收: %v", err)
+	}
+}
+
+// TestGCKeepStagingChunk staging 未提交的块不算孤儿（防上传竞态误删）。
+func TestGCKeepStagingChunk(t *testing.T) {
+	s, store := newTestScanner(t, time.Hour)
+
+	nNode, nTS := newTestNodeForMaster(t)
+	nInfo, _ := store.RegisterNode(nTS.Listener.Addr().String(), 1<<30)
+	store.Heartbeat(nInfo.ID, 0)
+
+	// staging inode 分配一块并真实落盘（模拟上传中）。
+	st, _ := store.CreateStagingFile(1)
+	store.AssignChunk(st.ID, 0, 10, []uint64{nInfo.ID})
+	putObjectForMaster(t, nTS.URL, types.ChunkID(st.ID, 0))
+
+	// GC dry-run：staging 的块在 validIDs 中，不是孤儿。
+	reports, err := s.RunGC(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range reports {
+		for _, o := range r.Orphans {
+			if o.ID == types.ChunkID(st.ID, 0) {
+				t.Fatal("staging 未提交的块不应被判孤儿")
+			}
+		}
+	}
+	_ = nNode
 }

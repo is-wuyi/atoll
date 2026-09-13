@@ -346,3 +346,200 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("重开后数据丢失: %+v, %v", got, err)
 	}
 }
+
+// ---- 批次 C：staging/分块元数据 ----
+
+func TestStagingInvisibleByPath(t *testing.T) {
+	s := newTestStore(t)
+	st, err := s.CreateStagingFile(RootID)
+	if err != nil {
+		t.Fatalf("CreateStagingFile: %v", err)
+	}
+	// staging inode ID 应从 StagingInodeBase 起（与 legacy 空间隔离）。
+	if st.ID < types.StagingInodeBase {
+		t.Fatalf("staging ID %d < StagingInodeBase %d", st.ID, types.StagingInodeBase)
+	}
+	if !st.Staging || !st.Chunked {
+		t.Fatalf("新 staging inode 字段不符: %+v", st)
+	}
+	// 不可见性：Lookup/ResolvePath 都必须失败。
+	if _, err := s.Lookup(RootID, "anyname"); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("staging 不应出现在 children: %v", err)
+	}
+	// 连续编号。
+	st2, _ := s.CreateStagingFile(RootID)
+	if st2.ID != st.ID+1 {
+		t.Fatalf("staging ID 应连续: %d, %d", st.ID, st2.ID)
+	}
+}
+
+func TestAssignChunkIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	st, _ := s.CreateStagingFile(RootID)
+	c1, err := s.AssignChunk(st.ID, 0, 1024, []uint64{7, 8})
+	if err != nil {
+		t.Fatalf("AssignChunk: %v", err)
+	}
+	// 重复分配返回原样（幂等）。
+	c2, err := s.AssignChunk(st.ID, 0, 1024, []uint64{9, 10})
+	if err != nil {
+		t.Fatalf("重复 AssignChunk 应幂等: %v", err)
+	}
+	if c1.Index != c2.Index || len(c2.Replicas) != 2 || c2.Replicas[0] != 7 {
+		t.Fatalf("重复分配应返回原分配: %+v vs %+v", c1, c2)
+	}
+	// 越界拒绝。
+	if _, err := s.AssignChunk(st.ID, types.MaxChunksPerFile, 1024, nil); !errors.Is(err, ErrChunkBadIndex) {
+		t.Fatalf("越界块下标应拒绝: %v", err)
+	}
+	if _, err := s.AssignChunk(st.ID, 1, types.ChunkSize+1, nil); !errors.Is(err, ErrChunkBadSize) {
+		t.Fatalf("超大块应拒绝: %v", err)
+	}
+	// 非法 size=0 拒绝。
+	if _, err := s.AssignChunk(st.ID, 1, 0, nil); !errors.Is(err, ErrChunkBadSize) {
+		t.Fatalf("size=0 应拒绝: %v", err)
+	}
+	// 乱序 Assign 后块表仍按 Index 升序（index=1 的两次非法分配均被拒绝）。
+	s.AssignChunk(st.ID, 5, 512, []uint64{7})
+	s.AssignChunk(st.ID, 2, 512, []uint64{8})
+	got, _ := s.GetInode(st.ID)
+	if len(got.Chunks) != 3 { // 0,2,5
+		t.Fatalf("块表长度 = %d, want 3", len(got.Chunks))
+	}
+	for i := 1; i < len(got.Chunks); i++ {
+		if got.Chunks[i].Index <= got.Chunks[i-1].Index {
+			t.Fatalf("块表未按 Index 排序: %+v", got.Chunks)
+		}
+	}
+}
+
+func TestMarkChunkDoneAndReassign(t *testing.T) {
+	s := newTestStore(t)
+	st, _ := s.CreateStagingFile(RootID)
+	s.AssignChunk(st.ID, 0, 100, []uint64{7, 8})
+	chunkID := types.ChunkID(st.ID, 0)
+	if err := s.MarkChunkDone(chunkID, 7); err != nil {
+		t.Fatalf("MarkChunkDone: %v", err)
+	}
+	// 幂等。
+	if err := s.MarkChunkDone(chunkID, 7); err != nil {
+		t.Fatalf("重复 MarkChunkDone 应幂等: %v", err)
+	}
+	got, _ := s.GetInode(st.ID)
+	if len(got.Chunks[0].Done) != 1 || got.Chunks[0].Done[0] != 7 {
+		t.Fatalf("Done 集合不符: %+v", got.Chunks[0].Done)
+	}
+	// Reassign 重置 Done、换副本。
+	if _, err := s.ReassignChunk(st.ID, 0, []uint64{9}); err != nil {
+		t.Fatalf("ReassignChunk: %v", err)
+	}
+	got, _ = s.GetInode(st.ID)
+	if len(got.Chunks[0].Replicas) != 1 || got.Chunks[0].Replicas[0] != 9 || len(got.Chunks[0].Done) != 0 {
+		t.Fatalf("Reassign 后字段不符: %+v", got.Chunks[0])
+	}
+	// 不存在的块。
+	if err := s.MarkChunkDone(types.ChunkID(st.ID, 9), 7); !errors.Is(err, ErrChunkNotExist) {
+		t.Fatalf("不存在的块应返回 ErrChunkNotExist: %v", err)
+	}
+}
+
+func TestCommitStagingAtomicReplace(t *testing.T) {
+	s := newTestStore(t)
+	// 先放一个旧版本文件（legacy 模型）。
+	old, _ := s.CreateFile(RootID, "data.bin", []uint64{5})
+	s.UpdateFileSize(old.ID, 100)
+
+	// 新版本走 staging 流程。
+	st, _ := s.CreateStagingFile(RootID)
+	s.AssignChunk(st.ID, 0, 64<<20, []uint64{7})
+	s.AssignChunk(st.ID, 1, 36<<20, []uint64{8})
+	s.MarkChunkDone(types.ChunkID(st.ID, 0), 7)
+	s.MarkChunkDone(types.ChunkID(st.ID, 1), 8)
+
+	// commit 前路径仍指向旧版本。
+	before, err := s.ResolvePath("/data.bin")
+	if err != nil || before.ID != old.ID {
+		t.Fatalf("commit 前应看到旧版本: %+v %v", before, err)
+	}
+	// commit 前的失败尝试（大小不符）不应改变任何东西。
+	if _, _, _, err := s.CommitStagingFile(st.ID, "data.bin", 999); !errors.Is(err, ErrCommitFailed) {
+		t.Fatalf("大小不符应返回 ErrCommitFailed: %v", err)
+	}
+
+	committed, _, hadOld, err := s.CommitStagingFile(st.ID, "data.bin", (64<<20)+(36<<20))
+	if err != nil {
+		t.Fatalf("CommitStagingFile: %v", err)
+	}
+	if !hadOld {
+		t.Fatal("本次提交应替换了旧版本（hadOld 应为 true）")
+	}
+	if committed.Staging || committed.Size != (64<<20)+(36<<20) || len(committed.Chunks) != 2 {
+		t.Fatalf("提交后字段不符: %+v", committed)
+	}
+	// 路径现在指向新 inode；旧 inode 已消失。
+	after, err := s.ResolvePath("/data.bin")
+	if err != nil || after.ID != st.ID {
+		t.Fatalf("commit 后应看到新版本: %+v %v", after, err)
+	}
+	if _, err := s.GetInode(old.ID); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("旧 inode 应已删除: %v", err)
+	}
+	// 已提交的 inode 不能再 commit/abort。
+	if _, _, _, err := s.CommitStagingFile(st.ID, "data.bin", 1); !errors.Is(err, ErrNotStaging) {
+		t.Fatalf("已提交 inode 再 commit 应报错: %v", err)
+	}
+	if err := s.AbortStaging(st.ID); !errors.Is(err, ErrNotStaging) {
+		t.Fatalf("已提交 inode 再 abort 应报错: %v", err)
+	}
+}
+
+func TestCommitStagingRejectsIncomplete(t *testing.T) {
+	s := newTestStore(t)
+	st, _ := s.CreateStagingFile(RootID)
+	// 无块。
+	if _, _, _, err := s.CommitStagingFile(st.ID, "a.bin", 10); !errors.Is(err, ErrCommitFailed) {
+		t.Fatalf("无块 commit 应失败: %v", err)
+	}
+	// 有块但主副本未 Done。
+	s.AssignChunk(st.ID, 0, 10, []uint64{7})
+	if _, _, _, err := s.CommitStagingFile(st.ID, "a.bin", 10); !errors.Is(err, ErrCommitFailed) {
+		t.Fatalf("主副本未 Done commit 应失败: %v", err)
+	}
+	// 覆盖目录名应拒绝。
+	dir, _ := s.CreateDir(RootID, "docs")
+	st2, _ := s.CreateStagingFile(RootID)
+	s.AssignChunk(st2.ID, 0, 10, []uint64{7})
+	s.MarkChunkDone(types.ChunkID(st2.ID, 0), 7)
+	if _, _, _, err := s.CommitStagingFile(st2.ID, "docs", 10); !errors.Is(err, ErrExist) {
+		t.Fatalf("覆盖目录应返回 ErrExist: %v", err)
+	}
+	_ = dir
+}
+
+func TestAbortStagingIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	st, _ := s.CreateStagingFile(RootID)
+	s.AssignChunk(st.ID, 0, 10, []uint64{7})
+	if err := s.AbortStaging(st.ID); err != nil {
+		t.Fatalf("AbortStaging: %v", err)
+	}
+	// 幂等：再 abort 不报错。
+	if err := s.AbortStaging(st.ID); err != nil {
+		t.Fatalf("重复 Abort 应幂等: %v", err)
+	}
+	if _, err := s.GetInode(st.ID); !errors.Is(err, ErrNotExist) {
+		t.Fatal("abort 后 inode 应删除")
+	}
+}
+
+func TestChunkIDRoundtrip(t *testing.T) {
+	for _, c := range []struct{ ino uint64; idx int }{
+		{types.StagingInodeBase, 0}, {types.StagingInodeBase + 123, 255}, {types.StagingInodeBase + 99999, 128},
+	} {
+		id := types.ChunkID(c.ino, c.idx)
+		gotIno, gotIdx := types.ParseChunkID(id)
+		if gotIno != c.ino || gotIdx != c.idx {
+			t.Fatalf("ChunkID(%d,%d) = %d, 解回 (%d,%d)", c.ino, c.idx, id, gotIno, gotIdx)
+		}
+	}
+}

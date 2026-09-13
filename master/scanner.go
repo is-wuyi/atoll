@@ -29,8 +29,11 @@ type Scanner struct {
 
 	mu          sync.Mutex
 	prevAlive   map[uint64]bool      // 上轮 alive 集合
-	failStreak  map[uint64]int       // 修复连续未收敛轮数（按 inode）
-	nextAttempt map[uint64]time.Time // 修复退避：下次允许对该 inode 触发修复的时间
+	failStreak  map[uint64]int       // 修复连续未收敛轮数（按 inode / chunkID）
+	nextAttempt map[uint64]time.Time // 修复退避：下次允许触发修复的时间
+
+	prevOrphans map[uint64]map[uint64]bool // GC 两轮确认：上轮孤儿集合 nodeID → objectID
+	stagingTTL  time.Duration              // staging inode 超时回收阈值
 }
 
 // NewScanner 创建一个新的 Scanner 实例。token 由 SetToken 设置后对出站请求生效。
@@ -44,6 +47,7 @@ func NewScanner(store *meta.Store, nodeMaxAge, repairIntv, gcIntv time.Duration)
 		prevAlive:   make(map[uint64]bool),
 		failStreak:  make(map[uint64]int),
 		nextAttempt: make(map[uint64]time.Time),
+		stagingTTL:  24 * time.Hour,
 	}
 }
 
@@ -97,6 +101,7 @@ func (s *Scanner) runGCLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.gcScanOnce()
+			s.sweepStaging()
 		}
 	}
 }
@@ -268,8 +273,8 @@ func planRepairs(inode types.Inode, nodes []types.NodeInfo, maxAge time.Duration
 func (s *Scanner) RepairScanOnce() { s.repairScanOnce() }
 
 // repairScanOnce 执行一次副本修复扫描。
-// 带 per-inode 指数退避：连续未收敛的文件按 1x→2x→4x... 周期倍增间隔（封顶 40x），
-// 避免源节点长期故障时每轮都重拉大文件造成内网流量风暴。
+// 带 per-inode（legacy）/ per-chunk（分块）指数退避：连续未收敛的目标按
+// 1x→2x→4x... 周期倍增间隔（封顶 40x），避免源节点长期故障时每轮重拉造成流量风暴。
 func (s *Scanner) repairScanOnce() {
 	nodes, err := s.store.ListNodes()
 	if err != nil {
@@ -291,27 +296,103 @@ func (s *Scanner) repairScanOnce() {
 
 	now := time.Now()
 	for _, in := range inodes {
-		tasks := planRepairs(in, nodes, s.nodeMaxAge)
+		// 分块文件（含 staging）：按块粒度修复。
+		// staging 期间从副本未 Done 是正常态，但 pull 有 probeSource 404 探测
+		// 兜底（主副本写完前 GET 是 404 → 跳过），不会拉半成品。
+		if in.Chunked {
+			s.repairChunkedInode(in, nodes, now)
+			continue
+		}
+		s.repairLegacyInode(in, nodes, now)
+	}
+}
+
+// repairLegacyInode 修复一个 legacy 整文件 inode（原 per-inode 路径）。
+func (s *Scanner) repairLegacyInode(in types.Inode, nodes []types.NodeInfo, now time.Time) {
+	tasks := planRepairs(in, nodes, s.nodeMaxAge)
+	if len(tasks) == 0 {
+		s.mu.Lock()
+		delete(s.failStreak, in.ID)
+		delete(s.nextAttempt, in.ID)
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Lock()
+	next, backed := s.nextAttempt[in.ID]
+	s.mu.Unlock()
+	if backed && now.Before(next) {
+		return
+	}
+	s.bumpRepairBackoff(in.ID)
+	for _, t := range tasks {
+		s.executeRepair(in.ID, t)
+	}
+}
+
+// repairChunkedInode 修复一个分块文件：每块视作独立小文件跑同一套修复逻辑。
+// 退避 key 用 chunkID（staging inode 与已提交 inode 的块都修——
+// staging 的块也要保持副本数，客户端可能传得很慢）。
+func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now time.Time) {
+	for _, c := range in.Chunks {
+		chunkID := types.ChunkID(in.ID, c.Index)
+		// 块任务以 ChunkInfo 为"迷你 inode"复用 planRepairs。
+		pseudo := types.Inode{
+			ID:           chunkID,
+			Replicas:     c.Replicas,
+			DoneReplicas: c.Done,
+			Size:         c.Size,
+		}
+		tasks := planRepairs(pseudo, nodes, s.nodeMaxAge)
 		if len(tasks) == 0 {
-			// 本轮全部健康：清零退避状态。
 			s.mu.Lock()
-			delete(s.failStreak, in.ID)
-			delete(s.nextAttempt, in.ID)
+			delete(s.failStreak, chunkID)
+			delete(s.nextAttempt, chunkID)
 			s.mu.Unlock()
 			continue
 		}
-		// 退避窗口内的文件本轮跳过（上一轮修复尚未收敛）。
 		s.mu.Lock()
-		next, backed := s.nextAttempt[in.ID]
+		next, backed := s.nextAttempt[chunkID]
 		s.mu.Unlock()
 		if backed && now.Before(next) {
 			continue
 		}
-		// 记录"未收敛 +1"并安排下次退避窗口，然后执行本轮任务。
-		s.bumpRepairBackoff(in.ID)
+		s.bumpRepairBackoff(chunkID)
 		for _, t := range tasks {
-			s.executeRepair(in.ID, t)
+			s.executeChunkRepair(in.ID, c.Index, t)
 		}
+	}
+}
+
+// executeChunkRepair 执行单个块的修复任务（与 executeRepair 同构，写路径换块级 API）。
+func (s *Scanner) executeChunkRepair(inodeID uint64, index int, t repairTask) {
+	switch t.Action {
+	case repairSkipNoSource:
+		log.Printf("inode %d chunk %d: 无可用源节点，跳过", inodeID, index)
+	case repairSkipNoTarget:
+		log.Printf("inode %d chunk %d: 无合格新目标（dead node %d），跳过", inodeID, index, t.OldNodeID)
+	case repairReplaceDead:
+		chunkID := types.ChunkID(inodeID, index)
+		if !s.probeSource(t.SourceAddr, chunkID) {
+			log.Printf("inode %d chunk %d: 源 %s 上对象缺失（404），跳过修复", inodeID, index, t.SourceAddr)
+			return
+		}
+		if err := s.store.ReplaceChunkReplica(inodeID, index, t.OldNodeID, t.NewNodeID); err != nil {
+			if errors.Is(err, meta.ErrNotExist) || errors.Is(err, meta.ErrChunkNotExist) {
+				return // 文件/块被并发删除，静默跳过
+			}
+			log.Printf("inode %d chunk %d: ReplaceChunkReplica 失败: %v", inodeID, index, err)
+			return
+		}
+		log.Printf("inode %d chunk %d: 替换 dead node %d → %d，触发 pull", inodeID, index, t.OldNodeID, t.NewNodeID)
+		s.triggerPull(t.NewNodeAddr, chunkID, t.SourceAddr)
+	case repairTriggerPull:
+		chunkID := types.ChunkID(inodeID, index)
+		if !s.probeSource(t.SourceAddr, chunkID) {
+			log.Printf("inode %d chunk %d: 源 %s 上对象缺失（404），跳过 pull", inodeID, index, t.SourceAddr)
+			return
+		}
+		log.Printf("inode %d chunk %d: 触发 pull（alive 未 Done）", inodeID, index)
+		s.triggerPull(t.TargetAddr, chunkID, t.SourceAddr)
 	}
 }
 
@@ -445,6 +526,8 @@ func (s *Scanner) RunGC(execute bool) ([]GCNodeReport, error) {
 }
 
 // runGC 执行 GC 比对，execute=true 时删除孤儿。
+// 孤儿两轮确认：只有连续两轮扫描都在孤儿集合中的对象才允许删除。
+// 这消除了"上传中的新块 vs GC 快照"竞态（快照没含新块 → 新块被误判孤儿）。
 func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
 	nodes, err := s.store.ListNodes()
 	if err != nil {
@@ -452,16 +535,23 @@ func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
 	}
 	cutoff := time.Now().Add(-s.nodeMaxAge)
 
-	// 收集全部文件 inode ID。
+	// 收集全部有效对象 ID：legacy 文件自身 ID + 分块文件的块 ID（含 staging 块）。
 	validIDs := make(map[uint64]bool)
 	if err := s.store.ForEachFile(func(in types.Inode) error {
-		validIDs[in.ID] = true
+		if in.Chunked {
+			for _, c := range in.Chunks {
+				validIDs[types.ChunkID(in.ID, c.Index)] = true
+			}
+		} else {
+			validIDs[in.ID] = true
+		}
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("遍历文件: %w", err)
 	}
 
 	var reports []GCNodeReport
+	curOrphans := make(map[uint64]map[uint64]bool) // 本轮孤儿快照
 	for _, n := range nodes {
 		if !n.LastHeartbeat.After(cutoff) {
 			continue // 跳过 dead 节点
@@ -482,12 +572,81 @@ func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
 		}
 		reports = append(reports, report)
 
-		if execute && len(orphans) > 0 {
-			deleted := s.deleteOrphans(n.Addr, orphans)
-			log.Printf("GC 节点 %d (%s): 删除 %d/%d 个孤儿", n.ID, n.Addr, deleted, len(orphans))
+		set := make(map[uint64]bool, len(orphans))
+		for _, o := range orphans {
+			set[o.ID] = true
+		}
+		curOrphans[n.ID] = set
+
+		if execute {
+			// 只删上轮也判孤儿的对象（两轮确认）。
+			s.mu.Lock()
+			prev := s.prevOrphans[n.ID]
+			s.mu.Unlock()
+			var confirmed []ObjectEntry
+			for _, o := range orphans {
+				if prev == nil || !prev[o.ID] {
+					continue // 上轮没见过它，本轮留它到下轮再删
+				}
+				confirmed = append(confirmed, o)
+			}
+			if len(confirmed) > 0 {
+				deleted := s.deleteOrphans(n.Addr, confirmed)
+				log.Printf("GC 节点 %d (%s): 两轮确认删除 %d/%d 个孤儿", n.ID, n.Addr, deleted, len(confirmed))
+			}
 		}
 	}
+	// 保存本轮孤儿集合作为下轮的"上轮"快照。
+	s.mu.Lock()
+	s.prevOrphans = curOrphans
+	s.mu.Unlock()
 	return reports, nil
+}
+
+// sweepStaging 清扫超时 staging inode（客户端崩溃残留）：
+// 删 staging 元数据 + 通知节点回收已落盘的块。TTL 默认 24h。
+func (s *Scanner) sweepStaging() {
+	var expired []types.Inode
+	if err := s.store.ForEachStaging(func(in types.Inode) error {
+		if time.Since(in.Mtime) > s.stagingTTL {
+			expired = append(expired, in)
+		}
+		return nil
+	}); err != nil {
+		log.Printf("staging 清扫: %v", err)
+		return
+	}
+	for _, in := range expired {
+		if err := s.store.AbortStaging(in.ID); err != nil {
+			log.Printf("staging 清扫: 回收 %d 失败: %v", in.ID, err)
+			continue
+		}
+		for _, c := range in.Chunks {
+			s.notifyDeleteAsync(types.ChunkID(in.ID, c.Index), c.Replicas)
+		}
+		log.Printf("staging 清扫: 回收超时上传 %d（%d 块）", in.ID, len(in.Chunks))
+	}
+}
+
+// notifyDeleteAsync 异步通知节点删除对象（staging 清扫用，失败只记日志）。
+func (s *Scanner) notifyDeleteAsync(objectID uint64, replicaNodeIDs []uint64) {
+	for _, id := range replicaNodeIDs {
+		n, err := s.store.GetNode(id)
+		if err != nil {
+			continue
+		}
+		go func(addr string) {
+			req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("http://%s/objects/%d", addr, objectID), nil)
+			if err != nil {
+				return
+			}
+			resp, err := s.httpClient.Do(req)
+			if err != nil {
+				return
+			}
+			resp.Body.Close()
+		}(n.Addr)
+	}
 }
 
 // fetchNodeObjects 获取节点的对象清单。

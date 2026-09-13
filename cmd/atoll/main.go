@@ -36,7 +36,8 @@ const usageText = `usage: atoll <command> [args]
 
 客户端命令 (可用 -master 或环境变量 ATOLL_MASTER 指定 master 地址):
   atoll put <本地文件> <远程路径>    上传文件 [-replicas N] [-f]
-  atoll get <远程路径> <本地文件>    下载文件
+                                    大于零字节默认走分块上传（64MB 块，覆盖写原子）
+  atoll get <远程路径> <本地文件>    下载文件（自动兼容分块/整文件格式）
   atoll ls  <远程路径>              列目录
   atoll mkdir <远程路径>            建目录
   atoll rm  <远程路径>              删除文件/空目录
@@ -227,8 +228,15 @@ func runMount(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
 		return 1
 	}
+	// 内核缓存：master 短暂不可达时避免每个路径访问都实时打 master
+	// （无缓存 + 网络失败 → ENOENT → 内核立即重试的热循环曾致 90% CPU 空转）。
+	// 正存在缓存 1s；负缓存（不存在的路径）1s 防止扫描类负载打爆 master。
+	entryT, attrT, negT := 1*time.Second, 1*time.Second, 1*time.Second
 	server, err := fs.Mount(mountPoint, m.Root(), &fs.Options{
 		MountOptions: fuse.MountOptions{Name: "atoll", Debug: *debug},
+		EntryTimeout: &entryT,
+		AttrTimeout:  &attrT,
+		NegativeTimeout: &negT,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
@@ -267,19 +275,33 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "用法: atoll put [-replicas N] [-f] <本地文件> <远程路径>")
 			return 2
 		}
-		if *force {
-			if err := c.PutOverwrite(fs.Arg(0), fs.Arg(1), *replicas, true); err != nil {
-				fmt.Fprintf(stderr, "put 失败: %v\n", err)
-				return 1
-			}
-			fmt.Fprintf(stdout, "已覆盖 %s → %s（%d 副本）\n", fs.Arg(0), fs.Arg(1), *replicas)
-		} else {
-			if err := c.Put(fs.Arg(0), fs.Arg(1), *replicas); err != nil {
-				fmt.Fprintf(stderr, "put 失败: %v\n", err)
-				return 1
-			}
-			fmt.Fprintf(stdout, "已上传 %s → %s（%d 副本）\n", fs.Arg(0), fs.Arg(1), *replicas)
+		// 分块上传（64MB 块流水线）：覆盖写由 commit 单事务原子换名，
+		// 中断时旧版本/新版本必居其一；空文件回退 legacy 单对象路径。
+		st, statErr := os.Stat(fs.Arg(0))
+		if statErr != nil {
+			fmt.Fprintf(stderr, "put 失败: %v\n", statErr)
+			return 1
 		}
+		var err error
+		if st.Size() > 0 {
+			err = c.PutChunkedOverwrite(fs.Arg(0), fs.Arg(1), *replicas, *force)
+		} else {
+			if *force {
+				err = c.PutOverwrite(fs.Arg(0), fs.Arg(1), *replicas, true)
+			} else {
+				err = c.Put(fs.Arg(0), fs.Arg(1), *replicas)
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "put 失败: %v\n", err)
+			return 1
+		}
+		action := "已上传"
+		if *force {
+			action = "已覆盖"
+		}
+		fmt.Fprintf(stdout, "%s %s → %s（%d 副本，%s）\n", action, fs.Arg(0), fs.Arg(1), *replicas,
+			humanSize(st.Size()))
 	case "get":
 		if fs.NArg() != 2 {
 			fmt.Fprintln(stderr, "用法: atoll get <远程路径> <本地文件>")
@@ -374,4 +396,18 @@ func envDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// humanSize 人类可读的字节数（KiB/MiB/GiB）。
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

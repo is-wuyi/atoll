@@ -12,20 +12,33 @@ import (
 )
 
 // waitReplica 轮询直到文件有 >= n 个已完成副本。
+// 兼容两种格式：分块文件看块表的 Done；legacy 文件看顶层副本列表的 Done。
 func waitReplica(t *testing.T, c *client.Client, path string, n int) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		_, reps, err := c.Lookup(path)
+		in, reps, err := c.Lookup(path)
 		if err == nil {
-			done := 0
-			for _, r := range reps {
-				if r.Done {
-					done++
+			if in.Chunked {
+				ok := true
+				for _, ch := range in.Chunks {
+					if len(ch.Done) < n {
+						ok = false
+					}
 				}
-			}
-			if done >= n {
-				return
+				if ok && len(in.Chunks) > 0 {
+					return
+				}
+			} else {
+				done := 0
+				for _, r := range reps {
+					if r.Done {
+						done++
+					}
+				}
+				if done >= n {
+					return
+				}
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
