@@ -769,6 +769,27 @@ func (s *Store) Heartbeat(nodeID uint64, usedBytes int64) error {
 	})
 }
 
+// SetNodeHeartbeatAt 将节点最后心跳设置为指定时刻（诊断/测试用）。
+func (s *Store) SetNodeHeartbeatAt(nodeID uint64, at time.Time) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketNodes)
+		raw := b.Get(u64be(nodeID))
+		if raw == nil {
+			return ErrNotExist
+		}
+		var n types.NodeInfo
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return err
+		}
+		n.LastHeartbeat = at
+		raw2, err := json.Marshal(n)
+		if err != nil {
+			return err
+		}
+		return b.Put(u64be(nodeID), raw2)
+	})
+}
+
 // ListAliveNodes 返回心跳时间在 maxAge 内的节点。
 func (s *Store) ListAliveNodes(maxAge time.Duration) ([]types.NodeInfo, error) {
 	var out []types.NodeInfo

@@ -32,22 +32,28 @@ type Scanner struct {
 	failStreak  map[uint64]int       // 修复连续未收敛轮数（按 inode / chunkID）
 	nextAttempt map[uint64]time.Time // 修复退避：下次允许触发修复的时间
 
-	prevOrphans map[uint64]map[uint64]bool // GC 两轮确认：上轮孤儿集合 nodeID → objectID
-	stagingTTL  time.Duration              // staging inode 超时回收阈值
+	prevOrphans     map[uint64]map[uint64]bool // GC 两轮确认：上轮孤儿集合 nodeID → objectID
+	stagingTTL      time.Duration              // staging inode 超时回收阈值
+	degradedSince   map[uint64]time.Time       // 块降级追踪（改进项2）：chunkID → 首次发现单副本时刻
+	degradedWarn    map[uint64]bool            // 已告警标记（避免重复刷日志）
+	degradedWarnDur time.Duration              // 持续降级多久后告警
 }
 
 // NewScanner 创建一个新的 Scanner 实例。token 由 SetToken 设置后对出站请求生效。
 func NewScanner(store *meta.Store, nodeMaxAge, repairIntv, gcIntv time.Duration) *Scanner {
 	return &Scanner{
-		store:       store,
-		nodeMaxAge:  nodeMaxAge,
-		repairIntv:  repairIntv,
-		gcIntv:      gcIntv,
-		httpClient:  &http.Client{Timeout: 10 * time.Second, Transport: &auth.Transport{Token: ""}},
-		prevAlive:   make(map[uint64]bool),
-		failStreak:  make(map[uint64]int),
-		nextAttempt: make(map[uint64]time.Time),
-		stagingTTL:  24 * time.Hour,
+		store:           store,
+		nodeMaxAge:      nodeMaxAge,
+		repairIntv:      repairIntv,
+		gcIntv:          gcIntv,
+		httpClient:      &http.Client{Timeout: 10 * time.Second, Transport: &auth.Transport{Token: ""}},
+		prevAlive:       make(map[uint64]bool),
+		failStreak:      make(map[uint64]int),
+		nextAttempt:     make(map[uint64]time.Time),
+		stagingTTL:      24 * time.Hour,
+		degradedSince:   make(map[uint64]time.Time),
+		degradedWarn:    make(map[uint64]bool),
+		degradedWarnDur: 30 * time.Minute,
 	}
 }
 
@@ -162,10 +168,10 @@ func (s *Scanner) deathMonitorOnce() {
 type repairAction int
 
 const (
-	repairReplaceDead repairAction = iota // dead 槽 → 选新目标 ReplaceReplica + pull
-	repairTriggerPull                     // alive 未 Done → 直接 pull
-	repairSkipNoSource                    // 无 alive Done 源，跳过
-	repairSkipNoTarget                    // 无合格新目标，跳过
+	repairReplaceDead  repairAction = iota // dead 槽 → 选新目标 ReplaceReplica + pull
+	repairTriggerPull                      // alive 未 Done → 直接 pull
+	repairSkipNoSource                     // 无 alive Done 源，跳过
+	repairSkipNoTarget                     // 无合格新目标，跳过
 )
 
 // repairTask 一个文件的一个槽位修复任务。
@@ -335,6 +341,10 @@ func (s *Scanner) repairLegacyInode(in types.Inode, nodes []types.NodeInfo, now 
 func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now time.Time) {
 	for _, c := range in.Chunks {
 		chunkID := types.ChunkID(in.ID, c.Index)
+		// 单副本窗口告警（改进项2）：块存活副本数（Done 且节点 alive）< len(Replicas)
+		// 持续超过阈值 → WARN 一次；恢复 → INFO + 清记录。失败告警期间用户至少知道
+		// 哪些块在裸奔（27472 宕机事故的教训：3 块单副本裸奔近 1 小时无人知晓）。
+		s.trackDegradedChunk(in, c, chunkID, nodes, now)
 		// 块任务以 ChunkInfo 为"迷你 inode"复用 planRepairs。
 		pseudo := types.Inode{
 			ID:           chunkID,
@@ -360,6 +370,48 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 		for _, t := range tasks {
 			s.executeChunkRepair(in.ID, c.Index, t)
 		}
+	}
+}
+
+// trackDegradedChunk 单副本窗口告警（改进项2）。
+// 降级定义：Done 且节点 alive 的副本数 < len(Replicas)（含 staging 期间从副本未同步的正常态，
+// 但 staging TTL 会兜底回收；已 commit 文件的降级才是真风险）。
+// 逻辑：首次发现记时刻；持续超 degradedWarnDur → WARN 一次（此后不再重复刷）；
+// 恢复满副本或块消失 → 清记录，恢复时 INFO。
+func (s *Scanner) trackDegradedChunk(in types.Inode, c types.ChunkInfo, chunkID uint64, nodes []types.NodeInfo, now time.Time) {
+	if in.Staging {
+		return // staging 文件降级是正常态（从副本还在路上），不告警
+	}
+	alive := make(map[uint64]bool, len(nodes))
+	for _, n := range nodes {
+		if now.Sub(n.LastHeartbeat) <= s.nodeMaxAge {
+			alive[n.ID] = true
+		}
+	}
+	healthy := 0
+	for _, id := range c.Done {
+		if alive[id] {
+			healthy++
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if healthy >= len(c.Replicas) {
+		if since, ok := s.degradedSince[chunkID]; ok {
+			delete(s.degradedSince, chunkID)
+			delete(s.degradedWarn, chunkID)
+			log.Printf("WARN-解除: inode %d chunk %d 恢复满副本（降级时长 %s）", in.ID, c.Index, now.Sub(since).Round(time.Second))
+		}
+		return
+	}
+	if _, ok := s.degradedSince[chunkID]; !ok {
+		s.degradedSince[chunkID] = now
+		return
+	}
+	if !s.degradedWarn[chunkID] && now.Sub(s.degradedSince[chunkID]) >= s.degradedWarnDur {
+		s.degradedWarn[chunkID] = true
+		log.Printf("WARN: inode %d chunk %d 单副本/降级已持续 %s（healthy=%d/%d）——再丢一节点该块数据可能丢失",
+			in.ID, c.Index, now.Sub(s.degradedSince[chunkID]).Round(time.Second), healthy, len(c.Replicas))
 	}
 }
 
@@ -488,10 +540,10 @@ type ObjectEntry struct {
 
 // GCNodeReport 是 GC 扫描中单个节点的孤儿报告。
 type GCNodeReport struct {
-	NodeID      uint64         `json:"node_id"`
-	NodeAddr    string         `json:"node_addr"`
-	Orphans     []ObjectEntry  `json:"orphans"`
-	OrphanBytes int64          `json:"orphan_bytes"`
+	NodeID      uint64        `json:"node_id"`
+	NodeAddr    string        `json:"node_addr"`
+	Orphans     []ObjectEntry `json:"orphans"`
+	OrphanBytes int64         `json:"orphan_bytes"`
 }
 
 // findOrphans 纯函数：节点对象列表 + 元数据 inode 集合 → 孤儿列表。

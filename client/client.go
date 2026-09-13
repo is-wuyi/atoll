@@ -228,6 +228,13 @@ func (c *Client) PutChunked(localPath, remotePath string, replicas int) error {
 // staging 建档 → 块写满即异步上传（滞后最多一块）→ 全部落盘 → commit 原子换名。
 // 任一环节失败：显式 abort staging（节点上已落盘的块由 master 通知回收）。
 func (c *Client) PutChunkedOverwrite(localPath, remotePath string, replicas int, overwrite bool) error {
+	return c.PutChunkedWithMinCopies(localPath, remotePath, replicas, 0, overwrite)
+}
+
+// PutChunkedWithMinCopies 分块上传 + 持久性档位（改进项3）。
+// minCopies>0：commit 前 master 等每块 ≥N 个"Done 且存活"副本（409 重试轮询，
+// 最长 15 分钟）；minCopies=0 = 现状（仅主副本 Done 即提交，从副本后台慢同步）。
+func (c *Client) PutChunkedWithMinCopies(localPath, remotePath string, replicas, minCopies int, overwrite bool) error {
 	f, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("open local: %w", err)
@@ -237,18 +244,25 @@ func (c *Client) PutChunkedOverwrite(localPath, remotePath string, replicas int,
 	if err != nil {
 		return fmt.Errorf("stat local: %w", err)
 	}
-	return c.PutChunkedReaderOverwrite(remotePath, st.Size(), f, replicas, overwrite)
+	return c.putChunkedCore(remotePath, st.Size(), f, replicas, minCopies, overwrite)
 }
 
 // PutChunkedReader 分块上传 io.Reader（不覆盖）。
 func (c *Client) PutChunkedReader(remotePath string, size int64, r io.Reader, replicas int) error {
-	return c.PutChunkedReaderOverwrite(remotePath, size, r, replicas, false)
+	return c.putChunkedCore(remotePath, size, r, replicas, 0, false)
 }
 
-// PutChunkedReaderOverwrite 分块上传核心：流水线（并发深度 2）。
+// PutChunkedReaderWithMinCopies 分块上传 io.Reader + 持久性档位（mount Flush 等使用）。
+// minCopies>0：commit 前轮询等待每块 ≥N 个"Done 且存活"副本。
+func (c *Client) PutChunkedReaderWithMinCopies(remotePath string, size int64, r io.Reader, replicas, minCopies int, overwrite bool) error {
+	return c.putChunkedCore(remotePath, size, r, replicas, minCopies, overwrite)
+}
+
+// putChunkedCore 分块上传核心：流水线（并发深度 2）+ 可选持久性档位。
 // 读满一块即投入上传（信号量限并发，内存占用恒为 2 块 = 128MB），
 // 全部块落盘后 commit 原子换名；任一环节失败显式 abort。
-func (c *Client) PutChunkedReaderOverwrite(remotePath string, size int64, r io.Reader, replicas int, overwrite bool) error {
+// minCopies>0 时 commit 遇 409（副本未到齐）轮询重试，最长 15 分钟。
+func (c *Client) putChunkedCore(remotePath string, size int64, r io.Reader, replicas, minCopies int, overwrite bool) error {
 	if size <= 0 {
 		return fmt.Errorf("empty file not supported in chunked mode")
 	}
@@ -322,12 +336,26 @@ func (c *Client) PutChunkedReaderOverwrite(remotePath string, size int64, r io.R
 	}
 
 	// 3. commit 原子换名（master 校验每块主副本 Done + Σ大小）。
-	if err := c.postJSON("/files/commit", map[string]any{
+	// minCopies>0：从副本仍在异步同步时 master 返回 409，轮询等待（改进项3）。
+	// 15 分钟超时：正常链路 64MB 块同步远快于此；超时说明从副本节点有问题，
+	// abort 后由用户决定重传（scanner 不会对 staging 做无意义修复）。
+	commitBody := map[string]any{
 		"inode_id": stagingID, "name": name, "size": size, "chunk_count": chunkCount,
-	}, nil); err != nil {
-		return fail(fmt.Errorf("commit: %w", err))
 	}
-	return nil
+	if minCopies > 0 {
+		commitBody["min_copies"] = minCopies
+	}
+	deadline := time.Now().Add(15 * time.Minute)
+	for attempt := 0; ; attempt++ {
+		err := c.postJSON("/files/commit", commitBody, nil)
+		if err == nil {
+			return nil
+		}
+		if minCopies <= 0 || attempt >= 30 || !strings.Contains(err.Error(), "http 409") || time.Now().After(deadline) {
+			return fail(fmt.Errorf("commit: %w", err))
+		}
+		time.Sleep(30 * time.Second) // 副本同步中，等下一轮
+	}
 }
 
 // uploadChunkOnce 上传一个块：分配 → PUT 主副本（带重试）→ 失败 reassign 换节点。

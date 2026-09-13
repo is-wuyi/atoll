@@ -512,3 +512,104 @@ func TestGCKeepStagingChunk(t *testing.T) {
 	}
 	_ = nNode
 }
+
+// TestDegradedChunkWarnAfterThreshold 改进项2：已 commit 的块降级（单副本）
+// 持续超阈值 → WARN 一次；不重复刷。
+func TestDegradedChunkWarnAfterThreshold(t *testing.T) {
+	s, store := newTestScanner(t, time.Hour)
+	s.degradedWarnDur = 0 // 阈值清零：第一次发现即触发（首次只记时刻，第二次告警）
+	buf := captureLogs(t)
+
+	// 节点 1、2 alive；块副本 [1,2]，Done 只有 1 → 降级。
+	for i := 1; i <= 2; i++ {
+		n, _ := store.RegisterNode(fmt.Sprintf("n%d:9421", i), 1<<30)
+		_ = n
+		store.Heartbeat(uint64(i), 0)
+	}
+	st, _ := store.CreateStagingFile(1)
+	store.AssignChunk(st.ID, 0, 100, []uint64{1, 2})
+	store.MarkChunkDone(types.ChunkID(st.ID, 0), 1)
+	store.CommitStagingFile(st.ID, "f.bin", 100)
+
+	in, _ := store.GetInode(st.ID)
+	nodes := mkNodes([]uint64{1, 2}, []uint64{1, 2})
+	now := time.Now()
+	s.trackDegradedChunk(in, in.Chunks[0], types.ChunkID(st.ID, 0), nodes, now)         // 首次：记时刻
+	s.trackDegradedChunk(in, in.Chunks[0], types.ChunkID(st.ID, 0), nodes, now.Add(time.Minute)) // 告警
+	s.trackDegradedChunk(in, in.Chunks[0], types.ChunkID(st.ID, 0), nodes, now.Add(2*time.Minute)) // 不重复
+
+	logs := buf.String()
+	if strings.Count(logs, "WARN: inode") != 1 {
+		t.Fatalf("应恰好 1 次 WARN, got: %s", logs)
+	}
+	if !strings.Contains(logs, "降级已持续") {
+		t.Fatalf("WARN 文案应含降级描述, got: %s", logs)
+	}
+}
+
+// TestDegradedChunkRecoverClearsState 改进项2：恢复满副本 → 解除日志 + 状态清零（再降级重新计时）。
+func TestDegradedChunkRecoverClearsState(t *testing.T) {
+	s, store := newTestScanner(t, time.Hour)
+	s.degradedWarnDur = 0
+	buf := captureLogs(t)
+
+	for i := 1; i <= 2; i++ {
+		store.RegisterNode(fmt.Sprintf("n%d:9421", i), 1<<30)
+		store.Heartbeat(uint64(i), 0)
+	}
+	st, _ := store.CreateStagingFile(1)
+	store.AssignChunk(st.ID, 0, 100, []uint64{1, 2})
+	store.MarkChunkDone(types.ChunkID(st.ID, 0), 1)
+	store.CommitStagingFile(st.ID, "f.bin", 100)
+
+	in, _ := store.GetInode(st.ID)
+	chunkID := types.ChunkID(st.ID, 0)
+	nodes := mkNodes([]uint64{1, 2}, []uint64{1, 2})
+	now := time.Now()
+	s.trackDegradedChunk(in, in.Chunks[0], chunkID, nodes, now)
+	s.trackDegradedChunk(in, in.Chunks[0], chunkID, nodes, now.Add(time.Second)) // WARN
+
+	// 从副本补齐 → 恢复日志 + 清状态。
+	in, _ = store.GetInode(st.ID)
+	// 直接改内存里的 Done 模拟补齐（meta 无该 API，构造新 ChunkInfo）。
+	in.Chunks[0].Done = []uint64{1, 2}
+	s.trackDegradedChunk(in, in.Chunks[0], chunkID, nodes, now.Add(2*time.Second))
+	logs := buf.String()
+	if !strings.Contains(logs, "WARN-解除") {
+		t.Fatalf("恢复应输出 WARN-解除, got: %s", logs)
+	}
+
+	// 再降级：从头计时（degradedSince 已清），首次只记时刻不告警。
+	in.Chunks[0].Done = []uint64{1}
+	buf.Reset()
+	s.trackDegradedChunk(in, in.Chunks[0], chunkID, nodes, now.Add(3*time.Second))
+	if strings.Contains(buf.String(), "WARN: inode") {
+		t.Fatalf("再降级首次不应立即告警（应重新计时）, got: %s", buf.String())
+	}
+	s.trackDegradedChunk(in, in.Chunks[0], chunkID, nodes, now.Add(5*time.Second))
+	if !strings.Contains(buf.String(), "WARN: inode") {
+		t.Fatalf("再降级超阈值应再次告警, got: %s", buf.String())
+	}
+}
+
+// TestDegradedChunkIgnoreStaging 改进项2：staging 文件降级不告警（从副本在路上是正常态）。
+func TestDegradedChunkIgnoreStaging(t *testing.T) {
+	s, store := newTestScanner(t, time.Hour)
+	s.degradedWarnDur = 0
+	buf := captureLogs(t)
+
+	store.RegisterNode("n1:9421", 1<<30)
+	store.Heartbeat(1, 0)
+	st, _ := store.CreateStagingFile(1) // 不 commit：保持 staging
+	store.AssignChunk(st.ID, 0, 100, []uint64{1, 2})
+	store.MarkChunkDone(types.ChunkID(st.ID, 0), 1)
+
+	in, _ := store.GetInode(st.ID)
+	nodes := mkNodes([]uint64{1, 2}, []uint64{1, 2})
+	now := time.Now()
+	s.trackDegradedChunk(in, in.Chunks[0], types.ChunkID(st.ID, 0), nodes, now)
+	s.trackDegradedChunk(in, in.Chunks[0], types.ChunkID(st.ID, 0), nodes, now.Add(time.Minute))
+	if strings.Contains(buf.String(), "WARN: inode") {
+		t.Fatalf("staging 降级不应告警, got: %s", buf.String())
+	}
+}

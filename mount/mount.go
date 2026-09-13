@@ -454,7 +454,7 @@ type chunkedReadHandle struct {
 	size   int64
 	chunks []types.ChunkInfo
 	addr   map[uint64]string // 节点 ID → 地址（lookup 的地址表）
-	next   map[int]int      // 块 index → 下一个候选起点（读时记忆可用节点）
+	next   map[int]int       // 块 index → 下一个候选起点（读时记忆可用节点）
 	http   *http.Client
 	mu     sync.Mutex
 }
@@ -546,7 +546,7 @@ func (ch *chunkedReadHandle) Read(_ context.Context, dest []byte, off int64) (fu
 	cur := off
 	for cur <= end && idx < len(ch.chunks) {
 		c := ch.chunks[idx]
-		chunkStart := cur - base          // 块内偏移（cur 是绝对偏移）
+		chunkStart := cur - base            // 块内偏移（cur 是绝对偏移）
 		chunkEnd := min(end-base, c.Size-1) // 同为块内偏移：end 绝对 → 相对
 		n := chunkEnd - chunkStart + 1
 		data, errno := ch.readChunkRange(c, chunkStart, chunkEnd)
@@ -577,8 +577,8 @@ type writeHandle struct {
 }
 
 var (
-	_ fs.FileWriter  = (*writeHandle)(nil)
-	_ fs.FileFlusher = (*writeHandle)(nil)
+	_ fs.FileWriter   = (*writeHandle)(nil)
+	_ fs.FileFlusher  = (*writeHandle)(nil)
 	_ fs.FileReleaser = (*writeHandle)(nil)
 )
 
@@ -640,7 +640,9 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	}
 	var err2 error
 	if st.Size() > 0 {
-		err2 = w.m.client.PutChunkedReaderOverwrite(w.remote, st.Size(), w.f, w.m.replicas, true)
+		// mount 写入走满副本档位：Flush 阻塞至每块全部副本落盘，
+		// 避免 cp 完就拔盘/断网时单副本窗口（改进项3 的 mount 侧应用）。
+		err2 = w.m.client.PutChunkedReaderWithMinCopies(w.remote, st.Size(), w.f, w.m.replicas, w.m.replicas, true)
 	} else {
 		err2 = w.m.client.PutReaderOverwrite(w.remote, st.Size(), w.f, w.m.replicas, true)
 	}

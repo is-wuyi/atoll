@@ -35,7 +35,7 @@ const usageText = `usage: atoll <command> [args]
   atoll node     启动存储节点（对象存储 + 心跳）
 
 客户端命令 (可用 -master 或环境变量 ATOLL_MASTER 指定 master 地址):
-  atoll put <本地文件> <远程路径>    上传文件 [-replicas N] [-f]
+  atoll put <本地文件> <远程路径>    上传文件 [-replicas N] [-min-copies N] [-f]
                                     大于零字节默认走分块上传（64MB 块，覆盖写原子）
   atoll get <远程路径> <本地文件>    下载文件（自动兼容分块/整文件格式）
   atoll ls  <远程路径>              列目录
@@ -233,9 +233,9 @@ func runMount(args []string, stderr io.Writer) int {
 	// 正存在缓存 1s；负缓存（不存在的路径）1s 防止扫描类负载打爆 master。
 	entryT, attrT, negT := 1*time.Second, 1*time.Second, 1*time.Second
 	server, err := fs.Mount(mountPoint, m.Root(), &fs.Options{
-		MountOptions: fuse.MountOptions{Name: "atoll", Debug: *debug},
-		EntryTimeout: &entryT,
-		AttrTimeout:  &attrT,
+		MountOptions:    fuse.MountOptions{Name: "atoll", Debug: *debug},
+		EntryTimeout:    &entryT,
+		AttrTimeout:     &attrT,
 		NegativeTimeout: &negT,
 	})
 	if err != nil {
@@ -262,6 +262,7 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
 	replicas := fs.Int("replicas", 2, "副本数（仅 put 使用，含主副本）")
+	minCopies := fs.Int("min-copies", 0, "put 提交前每块需落盘的副本数下限（0=仅主副本，最快；=replicas 则等全部副本，最稳）")
 	force := fs.Bool("f", false, "强制覆盖远程已存在的同名文件（仅 put 使用）")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
 	if err := fs.Parse(args); err != nil {
@@ -272,7 +273,7 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	switch cmd {
 	case "put":
 		if fs.NArg() != 2 {
-			fmt.Fprintln(stderr, "用法: atoll put [-replicas N] [-f] <本地文件> <远程路径>")
+			fmt.Fprintln(stderr, "用法: atoll put [-replicas N] [-min-copies N] [-f] <本地文件> <远程路径>")
 			return 2
 		}
 		// 分块上传（64MB 块流水线）：覆盖写由 commit 单事务原子换名，
@@ -284,7 +285,7 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 		}
 		var err error
 		if st.Size() > 0 {
-			err = c.PutChunkedOverwrite(fs.Arg(0), fs.Arg(1), *replicas, *force)
+			err = c.PutChunkedWithMinCopies(fs.Arg(0), fs.Arg(1), *replicas, *minCopies, *force)
 		} else {
 			if *force {
 				err = c.PutOverwrite(fs.Arg(0), fs.Arg(1), *replicas, true)

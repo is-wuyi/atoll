@@ -2,9 +2,13 @@ package master
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
+	"atoll/master/meta"
 	"atoll/pkg/types"
 )
 
@@ -174,5 +178,79 @@ func TestChunkedCreateConflictWithoutOverwrite(t *testing.T) {
 	resp := postJSON(t, ts.URL+"/files", map[string]any{"path": "/x.bin", "chunked": true, "replicas": 2}, nil)
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("无 overwrite 的 chunked 重名创建应 409, got %d", resp.StatusCode)
+	}
+}
+
+// min-copies 档位（改进项3）：副本未到齐 409；全部 Done 后放行。
+func TestChunkedCommitMinCopies(t *testing.T) {
+	ts := newTestServer(t)
+	registerNode(t, ts.URL, 1)
+	registerNode(t, ts.URL, 2)
+
+	st := stagingCreate(t, ts.URL, "/mc.bin", false)
+	c0, _ := assignChunk(t, ts.URL, st.ID, 0, 100, false)
+	// 主副本 Done。
+	postJSON(t, ts.URL+"/files/replicated", map[string]any{
+		"inode_id": types.ChunkID(st.ID, 0), "node_id": c0.Replicas[0]}, nil)
+
+	// min_copies=2：从副本未 Done → 409。
+	resp := postJSON(t, ts.URL+"/files/commit", map[string]any{
+		"inode_id": st.ID, "name": "mc.bin", "size": 100, "chunk_count": 1, "min_copies": 2,
+	}, nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("min_copies=2 且从副本未 Done 应 409, got %d", resp.StatusCode)
+	}
+
+	// 从副本 Done → 放行。
+	postJSON(t, ts.URL+"/files/replicated", map[string]any{
+		"inode_id": types.ChunkID(st.ID, 0), "node_id": c0.Replicas[1]}, nil)
+	resp = postJSON(t, ts.URL+"/files/commit", map[string]any{
+		"inode_id": st.ID, "name": "mc.bin", "size": 100, "chunk_count": 1, "min_copies": 2,
+	}, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("副本齐后 min_copies=2 应放行, got %d", resp.StatusCode)
+	}
+}
+
+// newTestServerWithStore 同 newTestServer，但额外返回 store（测试需要直接操作元数据）。
+func newTestServerWithStore(t *testing.T) (*httptest.Server, *meta.Store) {
+	t.Helper()
+	store, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatalf("meta.Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	srv := NewServer(store, time.Hour)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { ts.Close() })
+	return ts, store
+}
+
+// min-copies 存活校验（改进项1）：死节点上的 Done 不计数。
+// 两副本都 Done，但从副本节点心跳过期（模拟宕机）→ min_copies=2 仍应 409。
+func TestChunkedCommitMinCopiesDeadNodeNotCounted(t *testing.T) {
+	ts, store := newTestServerWithStore(t)
+	registerNode(t, ts.URL, 1)
+	registerNode(t, ts.URL, 2)
+
+	st := stagingCreate(t, ts.URL, "/md.bin", false)
+	c0, _ := assignChunk(t, ts.URL, st.ID, 0, 100, false)
+	// 两副本都 Done。
+	postJSON(t, ts.URL+"/files/replicated", map[string]any{
+		"inode_id": types.ChunkID(st.ID, 0), "node_id": c0.Replicas[0]}, nil)
+	postJSON(t, ts.URL+"/files/replicated", map[string]any{
+		"inode_id": types.ChunkID(st.ID, 0), "node_id": c0.Replicas[1]}, nil)
+
+	// 把从副本节点的最后心跳拨到 2 小时前（nodeMaxAge=1h → 判死）。
+	deadID := c0.Replicas[1]
+	if err := store.SetNodeHeartbeatAt(deadID, time.Now().Add(-2*time.Hour)); err != nil {
+		t.Fatalf("拨心跳失败: %v", err)
+	}
+
+	resp := postJSON(t, ts.URL+"/files/commit", map[string]any{
+		"inode_id": st.ID, "name": "md.bin", "size": 100, "chunk_count": 1, "min_copies": 2,
+	}, nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("死节点 Done 不应计数 → 应 409, got %d", resp.StatusCode)
 	}
 }

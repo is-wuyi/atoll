@@ -49,12 +49,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /meta", s.handleLookup) // ?path=/a/b
 	mux.HandleFunc("POST /files", s.handleCreateFile)
 	mux.HandleFunc("POST /files/commit", s.handleCommitFile)
-	mux.HandleFunc("POST /files/chunks", s.handleAssignChunk)         // 分块：分配块副本
-	mux.HandleFunc("DELETE /files/staging/{id}", s.handleAbortStaging) // 分块：放弃上传
+	mux.HandleFunc("POST /files/chunks", s.handleAssignChunk)            // 分块：分配块副本
+	mux.HandleFunc("DELETE /files/staging/{id}", s.handleAbortStaging)   // 分块：放弃上传
 	mux.HandleFunc("GET /files/replica-targets", s.handleReplicaTargets) // node 查询推送目标
 	mux.HandleFunc("POST /files/replicated", s.handleReplicated)         // 从副本上报同步完成
 	mux.HandleFunc("POST /entry/rename", s.handleRename)                 // 同目录改名
-	mux.HandleFunc("DELETE /entry", s.handleDelete) // ?path=/a/b
+	mux.HandleFunc("DELETE /entry", s.handleDelete)                      // ?path=/a/b
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("POST /nodes/heartbeat", s.handleNodeHeartbeat)
 	mux.HandleFunc("POST /admin/gc", s.handleGC)
@@ -441,7 +441,7 @@ func (s *Server) handleAssignChunk(w http.ResponseWriter, r *http.Request) {
 
 // chunkAssignResp 块分配响应。
 type chunkAssignResp struct {
-	Chunk types.ChunkInfo `json:"chunk"`
+	Chunk types.ChunkInfo  `json:"chunk"`
 	Nodes []types.NodeInfo `json:"nodes"`
 }
 
@@ -486,6 +486,7 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 		Size       int64  `json:"size"`
 		ChunkCount int    `json:"chunk_count"` // >0 = 分块提交（批次 C）
 		Name       string `json:"name"`        // 分块提交的目标文件名
+		MinCopies  int    `json:"min_copies"`  // >0 = commit 前每块需 ≥N 个 Done 且存活的副本（改进项3）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
@@ -499,6 +500,8 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 		// 主副本 Done 兜底：客户端 PUT 成功与 node 查询推送目标（顺带标记 Done）
 		// 之间有竞态窗口——commit 前对每块主副本做一次同步探测，确认落盘即标记。
 		// 探测失败的块由 ErrCommitFailed 拒绝（客户端应重试或 reassign）。
+		// 同时校验主副本节点存活（改进项1）：死节点上的 Done 不可信——
+		// 27472 宕机期间它的块仍标记 Done，commit 若不查心跳会把数据承诺到死节点。
 		if st, err := s.store.GetInode(req.InodeID); err == nil && st.Staging {
 			for _, c := range st.Chunks {
 				if len(c.Replicas) == 0 || containsUint64ID(c.Done, c.Replicas[0]) {
@@ -508,8 +511,22 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					continue
 				}
+				if time.Since(n.LastHeartbeat) > s.nodeMaxAge {
+					continue // 节点已死，探测无意义
+				}
 				if s.probeObject(n.Addr, types.ChunkID(req.InodeID, c.Index)) {
 					_ = s.store.MarkChunkDone(types.ChunkID(req.InodeID, c.Index), c.Replicas[0])
+				}
+			}
+		}
+		// min-copies 档位（改进项3）：每块需 ≥minCopies 个"Done 且节点存活"的副本才放行 commit。
+		// minCopies<=0 = 现状（仅主副本 Done）。副本没到齐 → 409，客户端轮询重试。
+		if req.MinCopies > 0 {
+			if st, err := s.store.GetInode(req.InodeID); err == nil && st.Staging {
+				if n := s.countCommitReadyChunks(st, req.MinCopies); n < len(st.Chunks) {
+					httpError(w, http.StatusConflict, fmt.Sprintf(
+						"min_copies=%d not reached: %d/%d chunks ready", req.MinCopies, n, len(st.Chunks)))
+					return
 				}
 			}
 		}
@@ -626,6 +643,31 @@ func (s *Server) probeObject(nodeAddr string, objectID uint64) bool {
 	return resp.StatusCode != http.StatusNotFound
 }
 
+// countCommitReadyChunks 统计满足 minCopies 的块数（Done 且节点心跳未超时）。
+// 节点已死时其 Done 不可信——min-copies 校验必须同时看存活（改进项1 同理）。
+func (s *Server) countCommitReadyChunks(st types.Inode, minCopies int) int {
+	aliveDone := make(map[uint64]bool)
+	ready := 0
+	for _, c := range st.Chunks {
+		n := 0
+		for _, nodeID := range c.Done {
+			ok, has := aliveDone[nodeID]
+			if !has {
+				nd, err := s.store.GetNode(nodeID)
+				ok = err == nil && time.Since(nd.LastHeartbeat) <= s.nodeMaxAge
+				aliveDone[nodeID] = ok
+			}
+			if ok {
+				n++
+			}
+		}
+		if n >= minCopies {
+			ready++
+		}
+	}
+	return ready
+}
+
 // notifyObjectDelete 通知持有该对象的所有节点删除本地文件。
 func (s *Server) notifyObjectDelete(inodeID uint64, replicaNodeIDs []uint64) {
 	client := &http.Client{
@@ -654,8 +696,8 @@ func (s *Server) notifyObjectDelete(inodeID uint64, replicaNodeIDs []uint64) {
 
 func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Addr        string `json:"addr"` // 供客户端直连的 host:port
-		TotalBytes  int64  `json:"total_bytes"`
+		Addr       string `json:"addr"` // 供客户端直连的 host:port
+		TotalBytes int64  `json:"total_bytes"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
@@ -755,5 +797,3 @@ func httpErrorFromMeta(w http.ResponseWriter, err error) {
 		httpError(w, http.StatusInternalServerError, err.Error())
 	}
 }
-
-
