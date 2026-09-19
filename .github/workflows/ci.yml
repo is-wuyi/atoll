@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
 
 permissions:
@@ -19,13 +19,13 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: stable
+          cache: true
 
-      # 本地无 Go 环境，go.sum 由 CI 生成并提交回仓库（仅在 main 分支推送时）。
       - name: Tidy modules
         run: go mod tidy
 
       - name: Commit go.sum if changed
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
         run: |
           if ! git diff --quiet go.mod go.sum; then
             git config user.name "github-actions[bot]"
@@ -41,5 +41,5 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test -v ./...
+      - name: Test with race detector
+        run: go test -race -v ./...
