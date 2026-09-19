@@ -11,9 +11,9 @@
     <a class="{{if eq .Active "integrity"}}active{{end}}" href="/integrity"><span class="ico">✓</span> 完整性与修复</a>
     <a class="{{if eq .Active "gc"}}active{{end}}" href="/gc"><span class="ico">⌫</span> 垃圾回收</a>
     <div class="nav-group-label">路线图</div>
-    <a class="soon"><span class="ico">◔</span> 用户与租户 <span class="tag-soon">Soon</span></a>
-    <a class="soon"><span class="ico">⇄</span> 协议网关 (SMB) <span class="tag-soon">Soon</span></a>
-    <a class="soon"><span class="ico">▚</span> 冗余策略 (EC) <span class="tag-soon">Soon</span></a>
+    <a class="{{if eq .Active "users"}}active{{end}}" href="/roadmap/users"><span class="ico">◔</span> 用户与租户 <span class="tag-soon">Soon</span></a>
+    <a class="{{if eq .Active "smb"}}active{{end}}" href="/roadmap/smb"><span class="ico">⇄</span> 协议网关 (SMB) <span class="tag-soon">Soon</span></a>
+    <a class="{{if eq .Active "ec"}}active{{end}}" href="/roadmap/ec"><span class="ico">▚</span> 冗余策略 (EC) <span class="tag-soon">Soon</span></a>
   </nav>
 </aside>
 {{end}}

@@ -1,0 +1,32 @@
+{{define "soon"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · {{.SoonTitle}}</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  {{template "sidebar" .}}
+  <div class="main">
+    {{template "topbar" .}}
+    <div class="content">
+      <div class="section">
+        <div class="panel">
+          <div class="soon-hero">
+            <span class="soon-ico">{{.SoonIcon}}</span>
+            <h2>{{.SoonTitle}} <span class="badge">规划中</span></h2>
+            <p class="soon-lead">{{.SoonLead}}</p>
+            <ul class="soon-list">
+              {{range .SoonPoints}}<li>{{.}}</li>{{end}}
+            </ul>
+            <p class="hint">此功能后端尚未实现；面板已预留位置，后端就绪后这里点亮。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>{{end}}

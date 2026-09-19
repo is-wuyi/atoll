@@ -122,6 +122,62 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, sess sessio
 	}{newPageBase("nodes", "节点", sess), nodes})
 }
 
+// ---- 路线图占位页 ----
+
+// soonTopic 描述一个尚未实现的功能分区（导航占位 + 规划说明）。
+type soonTopic struct {
+	Active string
+	Icon   string
+	Title  string
+	Lead   string
+	Points []string
+}
+
+var soonTopics = map[string]soonTopic{
+	"users": {
+		Active: "users", Icon: "◔", Title: "用户与租户",
+		Lead: "多用户与独立存储空间：每个用户/租户拥有隔离的命名空间与配额。",
+		Points: []string{
+			"用户账号与登录（区别于当前的控制台管理账号）",
+			"命名空间隔离：各租户的目录树与对象互不可见",
+			"每租户容量配额与用量统计",
+			"顶部命名空间切换器接入真实多租户（现恒为 default）",
+		},
+	},
+	"smb": {
+		Active: "smb", Icon: "⇄", Title: "协议网关 (SMB)",
+		Lead: "对外 SMB 协议网关：让 Windows/macOS 直接挂载 atoll 为网络共享。",
+		Points: []string{
+			"SMB 网关服务状态与连接数",
+			"共享（share）的创建与权限映射",
+			"网关与后端命名空间的绑定关系",
+		},
+	},
+	"ec": {
+		Active: "ec", Icon: "▚", Title: "冗余策略 (EC)",
+		Lead: "纠删码（Erasure Coding）：用更低的存储开销达到同等容错。",
+		Points: []string{
+			"每命名空间/文件选择副本或 EC 策略（如 4+2）",
+			"块×副本矩阵扩展为 EC 分片视图（数据片/校验片）",
+			"冗余策略字段已在元数据预留（现为 replica ×N）",
+		},
+	},
+}
+
+func (s *Server) handleSoon(topic string) func(http.ResponseWriter, *http.Request, session) {
+	t := soonTopics[topic]
+	return func(w http.ResponseWriter, r *http.Request, sess session) {
+		base := newPageBase(t.Active, t.Title, sess)
+		s.render(w, "soon", struct {
+			pageBase
+			SoonIcon   string
+			SoonTitle  string
+			SoonLead   string
+			SoonPoints []string
+		}{base, t.Icon, t.Title, t.Lead, t.Points})
+	}
+}
+
 // ---- 完整性与修复 ----
 
 func (s *Server) handleIntegrity(w http.ResponseWriter, r *http.Request, sess session) {

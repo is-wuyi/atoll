@@ -80,6 +80,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /integrity", s.requireAuth(s.handleIntegrity))
 	mux.HandleFunc("GET /gc", s.requireAuth(s.handleGC))
 	mux.HandleFunc("POST /gc/execute", s.requireAuth(s.handleGCExecute))
+	mux.HandleFunc("GET /roadmap/users", s.requireAuth(s.handleSoon("users")))
+	mux.HandleFunc("GET /roadmap/smb", s.requireAuth(s.handleSoon("smb")))
+	mux.HandleFunc("GET /roadmap/ec", s.requireAuth(s.handleSoon("ec")))
 
 	return securityHeaders(mux)
 }

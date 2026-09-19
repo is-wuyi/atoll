@@ -39,6 +39,26 @@ go build -o atoll ./cmd/atoll
 - **认证 + 读/管分离**：`-token` 为集群读写钥匙；`-admin-token`（master 侧 `-admin-token`，客户端 `atoll gc -admin-token`）单独保护 `/admin/gc` 这类破坏性操作，单钥匙泄露不至于连带删除权限。空 token = 兼容模式（不校验）。
 - **可选 TLS**：master/node 加 `-tls-cert -tls-key` 即走 https；客户端/挂载/节点用 `-tls-ca <CA文件>` 信任自签名 CA，或 `-tls-skip-verify` 跳过校验（仅限可信内网）。master 地址用 `https://` 时，直连节点也自动走 https。不配则明文 HTTP（向后兼容）。
 
+## Web 管理后台（atoll console）
+
+独立进程的只读为主管理后台，Go 服务端渲染，通过集群 token 调 master 的只读 `/admin/*` API，自带控制台账号与会话（与集群文件用户无关）。
+
+```bash
+# 1. 建控制台账号（密码经环境变量传入，避免进 shell 历史）
+ATOLL_CONSOLE_PASSWORD='你的密码' ./atoll console useradd -data-dir ./console-data admin
+
+# 2. 启动（默认 :9430）
+./atoll console -listen :9430 -master http://127.0.0.1:9420 -token <集群token> -data-dir ./console-data
+# 浏览器打开 http://127.0.0.1:9430
+```
+
+- **端口**：默认 `:9430`（`-listen` 改）。
+- **账号与角色**：`console useradd <名> -role admin|readonly`（默认 admin）。`admin` 可执行破坏性操作（GC 删除）；`readonly` 只读，界面隐藏危险按钮。账号 bcrypt 存 `-data-dir/users.json`；会话在内存，重启失效。
+- **页面**：概览、节点、文件浏览、文件详情（块×副本放置健康矩阵）、完整性与修复（降级块 + 修复状态）、垃圾回收（孤儿 dry-run + admin 执行）。概览/节点/完整性页每 5 秒自动局部刷新。
+- **破坏性操作 token**：`-admin-token` 单独用于 GC 执行（不设则回退集群 token）。
+- **TLS**：`-tls-cert/-tls-key` 让 console 自身走 https；`-tls-ca/-tls-skip-verify` 用于校验 master 证书（master 走 https 时）。
+- **一键 demo**：`bash scripts/demo-console.sh`（起 master+2节点+样例文件+console）；`degrade` 参数造降级看完整性页；`stop` 停止。
+
 ## 限制
 
 - **单文件上限 16 GiB**：分块模型固定 64 MiB/块、每文件最多 256 块（`ChunkSize × MaxChunksPerFile`）。超过上限的 `put` 会直接报错。
