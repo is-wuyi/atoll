@@ -1,0 +1,86 @@
+{{define "accounts"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 账号管理</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  {{template "sidebar" .}}
+  <div class="main">
+    {{template "topbar" .}}
+    <div class="content">
+      {{if .Notice}}<div class="flash ok">{{.Notice}}</div>{{end}}
+      {{if .ErrMsg}}<div class="flash bad">{{.ErrMsg}}</div>{{end}}
+
+      <div class="section">
+        <div class="section-head">
+          <h2>控制台账号</h2>
+          <span class="count">{{len .Accounts}} 个 · {{.AdminCount}} 个 admin</span>
+        </div>
+        <p class="hint">这些是登录本管理后台的账号，与集群内的文件用户无关。admin 可执行删除、垃圾回收等破坏性操作；readonly 仅可观测。</p>
+        <div class="panel">
+          <table>
+            <thead><tr><th>用户名</th><th>角色</th><th></th></tr></thead>
+            <tbody>
+            {{range .Accounts}}
+              <tr>
+                <td>{{.Username}}{{if .IsSelf}} <span class="badge">当前登录</span>{{end}}</td>
+                <td>
+                  {{if .IsAdmin}}<span class="dot ok"></span><span class="status-txt ok">admin</span>
+                  {{else}}<span class="dot"></span><span class="status-txt">readonly</span>{{end}}
+                </td>
+                <td class="num">
+                  {{if not .IsSelf}}
+                  <div class="row-actions">
+                    <form method="post" action="/accounts/role" style="margin:0">
+                      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                      <input type="hidden" name="username" value="{{.Username}}">
+                      <input type="hidden" name="role" value="{{if .IsAdmin}}readonly{{else}}admin{{end}}">
+                      <button type="submit" class="btn">{{if .IsAdmin}}降为 readonly{{else}}升为 admin{{end}}</button>
+                    </form>
+                    <form method="post" action="/accounts/delete" onsubmit="return confirm('确认删除账号 {{.Username}}？');" style="margin:0">
+                      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                      <input type="hidden" name="username" value="{{.Username}}">
+                      <button type="submit" class="btn-danger">删除</button>
+                    </form>
+                  </div>
+                  {{else}}<span class="row-type">—</span>{{end}}
+                </td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-head"><h2>新建账号</h2></div>
+        <div class="panel">
+          <form method="post" action="/accounts/create" class="form-grid">
+            <input type="hidden" name="csrf" value="{{.CSRF}}">
+            <label>用户名
+              <input type="text" name="username" autocomplete="off" required
+                     pattern="[A-Za-z0-9._-]{2,32}" placeholder="2–32 位，字母/数字/._-">
+            </label>
+            <label>密码
+              <input type="password" name="password" autocomplete="new-password" required
+                     minlength="8" placeholder="至少 8 位">
+            </label>
+            <label>角色
+              <select name="role">
+                <option value="readonly">readonly（仅观测）</option>
+                <option value="admin">admin（可管理）</option>
+              </select>
+            </label>
+            <div class="form-actions"><button type="submit" class="btn-primary">创建</button></div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>{{end}}

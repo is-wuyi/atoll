@@ -100,3 +100,77 @@ func TestUserStore(t *testing.T) {
 	}
 	_ = filepath.Join // 保留 import
 }
+
+// 账号管理：list 排序、最后一个 admin 锁死保护、改角色、删除持久化。
+func TestUserManagement(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openUserStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(s.Add("root", "password1", RoleAdmin))
+	must(s.Add("alice", "password1", RoleReadonly))
+	must(s.Add("bob", "password1", RoleReadonly))
+
+	// list 按用户名升序。
+	list := s.list()
+	if len(list) != 3 || list[0].Username != "alice" || list[2].Username != "root" {
+		t.Fatalf("list 排序不符: %+v", list)
+	}
+
+	// 唯一 admin 不能删。
+	if err := s.remove("root"); err != errLastAdmin {
+		t.Fatalf("删最后一个 admin 应拒绝, got %v", err)
+	}
+	// 唯一 admin 不能降级。
+	if err := s.setRole("root", RoleReadonly); err != errLastAdmin {
+		t.Fatalf("降级最后一个 admin 应拒绝, got %v", err)
+	}
+
+	// 升 alice 为 admin 后，root 可删（不再是唯一 admin）。
+	must(s.setRole("alice", RoleAdmin))
+	must(s.remove("root"))
+	if _, ok := s.verify("root", "password1"); ok {
+		t.Error("root 删除后不应能登录")
+	}
+
+	// 删不存在账号。
+	if err := s.remove("ghost"); err != errUserNotFound {
+		t.Fatalf("删不存在账号应报 not found, got %v", err)
+	}
+
+	// 持久化：重开后 alice=admin、bob=readonly、无 root。
+	s2, err := openUserStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Role{}
+	for _, u := range s2.list() {
+		got[u.Username] = u.Role
+	}
+	if len(got) != 2 || got["alice"] != RoleAdmin || got["bob"] != RoleReadonly {
+		t.Fatalf("持久化后状态不符: %+v", got)
+	}
+}
+
+// validUsername 边界。
+func TestValidUsername(t *testing.T) {
+	ok := []string{"ab", "user_1", "a.b-c", "ABC123"}
+	bad := []string{"a", "", "has space", "汉字", "a/b", string(make([]byte, 33))}
+	for _, u := range ok {
+		if !validUsername(u) {
+			t.Errorf("%q 应合法", u)
+		}
+	}
+	for _, u := range bad {
+		if validUsername(u) {
+			t.Errorf("%q 应非法", u)
+		}
+	}
+}

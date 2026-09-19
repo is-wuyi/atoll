@@ -157,3 +157,19 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .btn-danger { background: #fff; color: var(--bad); border: 1px solid #f0c0c0; border-radius: 7px; padding: 4px 12px; font-size: 12.5px; cursor: pointer; }
 .btn-danger:hover { background: var(--bad); color: #fff; border-color: var(--bad); }
+
+/* 账号管理 */
+.dot:not(.ok):not(.warn):not(.bad):not(.idle) { background: var(--faint); }
+.flash { padding: 9px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 18px; }
+.flash.ok { background: #f0fdf4; border: 1px solid #bbf7d0; color: var(--ok); }
+.flash.bad { background: #fef2f2; border: 1px solid #fecaca; color: var(--bad); }
+.row-actions { display: inline-flex; gap: 8px; justify-content: flex-end; }
+.btn { background: #fff; color: var(--text); border: 1px solid var(--border-strong); border-radius: 7px; padding: 4px 12px; font-size: 12.5px; cursor: pointer; }
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.form-grid { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 16px; padding: 18px; }
+.form-grid label { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--muted); }
+.form-grid input, .form-grid select { padding: 8px 11px; border: 1px solid var(--border-strong); border-radius: 8px; font-size: 13.5px; min-width: 200px; background: #fff; }
+.form-grid input:focus, .form-grid select:focus { outline: none; border-color: var(--accent); }
+.form-actions { margin-left: auto; }
+.btn-primary { padding: 9px 20px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-size: 13.5px; font-weight: 550; cursor: pointer; }
+.btn-primary:hover { background: #1d4ed8; }

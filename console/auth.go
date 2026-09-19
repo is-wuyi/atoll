@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -105,6 +106,68 @@ func (s *userStore) add(username, password string, role Role) error {
 		return err
 	}
 	s.users[username] = User{Username: username, Hash: string(hash), Role: role}
+	return s.save()
+}
+
+// list 返回全部账号（按用户名升序），供管理 UI 展示。Hash 字段不会出现在模板里。
+func (s *userStore) list() []User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]User, 0, len(s.users))
+	for _, u := range s.users {
+		out = append(out, u)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Username < out[j].Username })
+	return out
+}
+
+// adminCount 统计 admin 角色账号数（在锁内调用）。
+func (s *userStore) adminCount() int {
+	n := 0
+	for _, u := range s.users {
+		if u.Role == RoleAdmin {
+			n++
+		}
+	}
+	return n
+}
+
+var (
+	errUserNotFound = errors.New("user not found")
+	errLastAdmin    = errors.New("cannot remove or demote the last admin")
+)
+
+// remove 删除账号。拒绝删掉最后一个 admin（否则控制台会永久锁死）。
+func (s *userStore) remove(username string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[username]
+	if !ok {
+		return errUserNotFound
+	}
+	if u.Role == RoleAdmin && s.adminCount() == 1 {
+		return errLastAdmin
+	}
+	delete(s.users, username)
+	return s.save()
+}
+
+// setRole 改角色。把最后一个 admin 降级为 readonly 同样会锁死，拒绝。
+func (s *userStore) setRole(username string, role Role) error {
+	if role != RoleAdmin && role != RoleReadonly {
+		return fmt.Errorf("invalid role %q (want admin|readonly)", role)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[username]
+	if !ok {
+		return errUserNotFound
+	}
+	if u.Role == RoleAdmin && role == RoleReadonly && s.adminCount() == 1 {
+		return errLastAdmin
+	}
+	u.Role = role
+	s.users[username] = u
 	return s.save()
 }
 

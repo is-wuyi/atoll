@@ -182,6 +182,161 @@ func (s *Server) handleSoon(topic string) func(http.ResponseWriter, *http.Reques
 	}
 }
 
+// ---- 账号管理（控制台账号，非集群文件用户）----
+
+// accountRow 是账号列表的一行。IsSelf 用于在 UI 上禁用对自己的删除/降级。
+type accountRow struct {
+	Username string
+	Role     Role
+	IsAdmin  bool
+	IsSelf   bool
+}
+
+// handleAccounts GET /accounts —— 账号列表 + 新建表单。仅 admin。
+func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request, sess session) {
+	if sess.Role != RoleAdmin {
+		s.renderError(w, sess, http.StatusForbidden, "权限不足", "只有 admin 角色可以管理控制台账号")
+		return
+	}
+	s.renderAccounts(w, sess, "", "")
+}
+
+// renderAccounts 渲染账号页，notice/errMsg 用于操作后的结果提示。
+func (s *Server) renderAccounts(w http.ResponseWriter, sess session, notice, errMsg string) {
+	rows := make([]accountRow, 0)
+	adminN := 0
+	for _, u := range s.users.list() {
+		if u.Role == RoleAdmin {
+			adminN++
+		}
+		rows = append(rows, accountRow{
+			Username: u.Username, Role: u.Role,
+			IsAdmin: u.Role == RoleAdmin, IsSelf: u.Username == sess.Username,
+		})
+	}
+	s.render(w, "accounts", struct {
+		pageBase
+		Accounts   []accountRow
+		AdminCount int
+		Notice     string
+		ErrMsg     string
+	}{newPageBase("accounts", "账号管理", sess), rows, adminN, notice, errMsg})
+}
+
+// validUsername 限制用户名字符集，避免奇怪输入混进 users.json / 会话。
+func validUsername(u string) bool {
+	if len(u) < 2 || len(u) > 32 {
+		return false
+	}
+	for _, r := range u {
+		ok := r == '_' || r == '-' || r == '.' ||
+			(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// handleAccountCreate POST /accounts/create —— 新建账号。仅 admin，需 CSRF。
+func (s *Server) handleAccountCreate(w http.ResponseWriter, r *http.Request, sess session) {
+	if sess.Role != RoleAdmin {
+		s.renderError(w, sess, http.StatusForbidden, "权限不足", "只有 admin 角色可以管理控制台账号")
+		return
+	}
+	if r.FormValue("csrf") != sess.CSRF {
+		http.Error(w, "csrf mismatch", http.StatusForbidden)
+		return
+	}
+	username := strings.TrimSpace(r.FormValue("username"))
+	password := r.FormValue("password")
+	role := Role(r.FormValue("role"))
+	if !validUsername(username) {
+		s.renderAccounts(w, sess, "", "用户名不合法（2–32 位，仅限字母/数字/._-）")
+		return
+	}
+	if len(password) < 8 {
+		s.renderAccounts(w, sess, "", "密码至少 8 位")
+		return
+	}
+	if role != RoleAdmin && role != RoleReadonly {
+		s.renderAccounts(w, sess, "", "角色只能是 admin 或 readonly")
+		return
+	}
+	if err := s.users.Add(username, password, role); err != nil {
+		if err == errUserExists {
+			s.renderAccounts(w, sess, "", "账号已存在："+username)
+			return
+		}
+		s.renderError(w, sess, http.StatusInternalServerError, "创建失败", err.Error())
+		return
+	}
+	s.renderAccounts(w, sess, "已创建账号 "+username+"（"+string(role)+"）", "")
+}
+
+// handleAccountDelete POST /accounts/delete —— 删除账号。仅 admin，需 CSRF。
+// 禁止删自己；禁止删最后一个 admin（userStore.remove 里兜底）。
+func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request, sess session) {
+	if sess.Role != RoleAdmin {
+		s.renderError(w, sess, http.StatusForbidden, "权限不足", "只有 admin 角色可以管理控制台账号")
+		return
+	}
+	if r.FormValue("csrf") != sess.CSRF {
+		http.Error(w, "csrf mismatch", http.StatusForbidden)
+		return
+	}
+	username := r.FormValue("username")
+	if username == sess.Username {
+		s.renderAccounts(w, sess, "", "不能删除当前登录的账号")
+		return
+	}
+	if err := s.users.remove(username); err != nil {
+		if err == errLastAdmin {
+			s.renderAccounts(w, sess, "", "不能删除最后一个 admin 账号")
+			return
+		}
+		if err == errUserNotFound {
+			s.renderAccounts(w, sess, "", "账号不存在："+username)
+			return
+		}
+		s.renderError(w, sess, http.StatusInternalServerError, "删除失败", err.Error())
+		return
+	}
+	s.renderAccounts(w, sess, "已删除账号 "+username, "")
+}
+
+// handleAccountRole POST /accounts/role —— 改角色。仅 admin，需 CSRF。
+// 禁止改自己（避免自锁）；禁止把最后一个 admin 降级（userStore.setRole 里兜底）。
+func (s *Server) handleAccountRole(w http.ResponseWriter, r *http.Request, sess session) {
+	if sess.Role != RoleAdmin {
+		s.renderError(w, sess, http.StatusForbidden, "权限不足", "只有 admin 角色可以管理控制台账号")
+		return
+	}
+	if r.FormValue("csrf") != sess.CSRF {
+		http.Error(w, "csrf mismatch", http.StatusForbidden)
+		return
+	}
+	username := r.FormValue("username")
+	role := Role(r.FormValue("role"))
+	if username == sess.Username {
+		s.renderAccounts(w, sess, "", "不能修改当前登录账号的角色")
+		return
+	}
+	if err := s.users.setRole(username, role); err != nil {
+		if err == errLastAdmin {
+			s.renderAccounts(w, sess, "", "不能降级最后一个 admin 账号")
+			return
+		}
+		if err == errUserNotFound {
+			s.renderAccounts(w, sess, "", "账号不存在："+username)
+			return
+		}
+		s.renderError(w, sess, http.StatusBadRequest, "修改角色失败", err.Error())
+		return
+	}
+	s.renderAccounts(w, sess, "已将 "+username+" 的角色改为 "+string(role), "")
+}
+
 // ---- 完整性与修复 ----
 
 func (s *Server) handleIntegrity(w http.ResponseWriter, r *http.Request, sess session) {
