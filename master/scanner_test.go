@@ -392,7 +392,7 @@ func TestChunkRepairReplaceDead(t *testing.T) {
 
 	// 建一个已提交的分块文件：chunk0 副本 [1,3]，Done [1]。
 	st, _ := store.CreateStagingFile(1)
-	store.AssignChunk(st.ID, 0, 100, []uint64{1, n3.ID})
+	store.AssignChunk(st.ID, 0, 100, []uint64{1, n3.ID}, 0)
 	store.MarkChunkDone(types.ChunkID(st.ID, 0), 1)
 	store.CommitStagingFile(st.ID, "f.bin", 100)
 
@@ -468,7 +468,7 @@ func TestSweepStagingExpiredTTL(t *testing.T) {
 
 	// old：mtime 超过 TTL 的 staging。
 	old, _ := store.CreateStagingFile(1)
-	store.AssignChunk(old.ID, 0, 10, []uint64{7})
+	store.AssignChunk(old.ID, 0, 10, []uint64{7}, 0)
 	// 把 mtime 改老：meta 层没有 API，用直接改 TTL 的方式 —— 等待 TTL 过期。
 	// 留足余量（TTL 的数倍）：-race + 并行满载下 50ms 边距会偶发不足。
 	time.Sleep(400 * time.Millisecond)
@@ -496,7 +496,7 @@ func TestGCKeepStagingChunk(t *testing.T) {
 
 	// staging inode 分配一块并真实落盘（模拟上传中）。
 	st, _ := store.CreateStagingFile(1)
-	store.AssignChunk(st.ID, 0, 10, []uint64{nInfo.ID})
+	store.AssignChunk(st.ID, 0, 10, []uint64{nInfo.ID}, 0)
 	putObjectForMaster(t, nTS.URL, types.ChunkID(st.ID, 0))
 
 	// GC dry-run：staging 的块在 validIDs 中，不是孤儿。
@@ -528,7 +528,7 @@ func TestDegradedChunkWarnAfterThreshold(t *testing.T) {
 		store.Heartbeat(uint64(i), 0)
 	}
 	st, _ := store.CreateStagingFile(1)
-	store.AssignChunk(st.ID, 0, 100, []uint64{1, 2})
+	store.AssignChunk(st.ID, 0, 100, []uint64{1, 2}, 0)
 	store.MarkChunkDone(types.ChunkID(st.ID, 0), 1)
 	store.CommitStagingFile(st.ID, "f.bin", 100)
 
@@ -559,7 +559,7 @@ func TestDegradedChunkRecoverClearsState(t *testing.T) {
 		store.Heartbeat(uint64(i), 0)
 	}
 	st, _ := store.CreateStagingFile(1)
-	store.AssignChunk(st.ID, 0, 100, []uint64{1, 2})
+	store.AssignChunk(st.ID, 0, 100, []uint64{1, 2}, 0)
 	store.MarkChunkDone(types.ChunkID(st.ID, 0), 1)
 	store.CommitStagingFile(st.ID, "f.bin", 100)
 
@@ -602,7 +602,7 @@ func TestDegradedChunkIgnoreStaging(t *testing.T) {
 	store.RegisterNode("n1:9421", 1<<30)
 	store.Heartbeat(1, 0)
 	st, _ := store.CreateStagingFile(1) // 不 commit：保持 staging
-	store.AssignChunk(st.ID, 0, 100, []uint64{1, 2})
+	store.AssignChunk(st.ID, 0, 100, []uint64{1, 2}, 0)
 	store.MarkChunkDone(types.ChunkID(st.ID, 0), 1)
 
 	in, _ := store.GetInode(st.ID)

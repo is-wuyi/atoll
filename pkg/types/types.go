@@ -1,7 +1,35 @@
 // Package types 定义 atoll 各角色共享的核心数据结构。
 package types
 
-import "time"
+import (
+	"hash"
+	"hash/crc32"
+	"time"
+)
+
+// crcTable 是 CRC32C（Castagnoli）查表，硬件加速。用于检测静默数据损坏
+// （磁盘位翻转、传输撕裂）——非加密用途，不防篡改。
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+// CRC32C 计算字节切片的 CRC32C 校验和。
+func CRC32C(b []byte) uint32 { return crc32.Checksum(b, crcTable) }
+
+// NewCRC32C 返回一个流式 CRC32C hash（边写边算，用于不便整块驻留内存的路径）。
+func NewCRC32C() hash.Hash32 { return crc32.New(crcTable) }
+
+// ContainsUint64 判断 v 是否在 list 中（各角色共用，取代此前 4 处重复实现）。
+func ContainsUint64(list []uint64, v uint64) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// ChecksumHeader 是客户端 PUT/节点 replicate 携带期望 CRC32C 的 HTTP 头。
+// 存在则节点落盘后校验；缺失则跳过（向后兼容旧客户端）。
+const ChecksumHeader = "X-Atoll-Crc32c"
 
 // EntryType 区分目录与文件。
 type EntryType uint8
@@ -34,6 +62,9 @@ type Inode struct {
 	Chunked bool `json:"chunked,omitempty"`
 	// Chunks 是分块文件（Chunked=true）的块表，按 Index 升序。
 	Chunks []ChunkInfo `json:"chunks,omitempty"`
+	// Checksum 是 legacy 整对象文件内容的 CRC32C（0 = 未记录）。
+	// 分块文件不用此字段（校验和在每块的 ChunkInfo.Checksum 里）。
+	Checksum uint32 `json:"checksum,omitempty"`
 }
 
 // ChunkInfo 是分块文件的一个块。
@@ -45,6 +76,9 @@ type ChunkInfo struct {
 	Replicas []uint64 `json:"replicas"`
 	// Done 已确认落盘的副本节点 ID（含主副本），是 Replicas 的子集。
 	Done []uint64 `json:"done,omitempty"`
+	// Checksum 块内容的 CRC32C（0 = 未记录，旧数据向后兼容跳过校验）。
+	// 读取时逐块比对，不符则故障转移——检测磁盘/传输静默损坏。
+	Checksum uint32 `json:"checksum,omitempty"`
 }
 
 // ---- 分块常量与 ChunkID 编解码 ----

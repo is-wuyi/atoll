@@ -2,11 +2,13 @@ package client
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"atoll/pkg/types"
@@ -125,5 +127,60 @@ func TestGetShortReadFailover(t *testing.T) {
 	// 只有坏副本时必须失败（不能把 100 字节当成功）。
 	if err := c.getFromReplicas(in, []Replica{badReplica}, out); err == nil {
 		t.Fatal("只有截断副本时 Get 应失败，而非返回截断数据")
+	}
+}
+
+// objectDiskPath 复刻 node.objectPath 的分桶规则，用于测试里直接改盘上对象。
+func objectDiskPath(dataDir string, id uint64) string {
+	return filepath.Join(dataDir, "objects", fmt.Sprintf("%02x", id%256), strconv.FormatUint(id, 10))
+}
+
+// TestGetChecksumFailover 一个副本的盘上内容被静默篡改（长度不变、内容变）时，
+// client.Get 应靠校验和识别损坏并从完好副本读回正确内容。
+func TestGetChecksumFailover(t *testing.T) {
+	c, nodes := newClusterV2(t, 3)
+	dir := t.TempDir()
+	content := bytes.Repeat([]byte("integrity-"), 5000) // 50000B
+	local := filepath.Join(dir, "c.bin")
+	os.WriteFile(local, content, 0o644)
+	if err := c.Put(local, "/c.bin", 3); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	waitDone(t, c, "/c.bin", 3)
+
+	in, _, _ := c.Lookup("/c.bin")
+	if in.Checksum == 0 {
+		t.Fatal("legacy 文件应记录校验和")
+	}
+	// 篡改其中一个副本盘上的对象：等长翻转前 200 字节。
+	corrupted := 0
+	for _, cn := range nodes {
+		p := objectDiskPath(cn.node.DataDirForTest(), in.ID)
+		orig, err := os.ReadFile(p)
+		if err != nil {
+			continue // 该节点没有此对象
+		}
+		bad := append([]byte(nil), orig...)
+		for i := 0; i < 200 && i < len(bad); i++ {
+			bad[i] ^= 0xff
+		}
+		os.WriteFile(p, bad, 0o644)
+		corrupted++
+		break // 只坏一个副本
+	}
+	if corrupted == 0 {
+		t.Fatal("未找到可篡改的副本对象")
+	}
+
+	// Get 应绕过损坏副本，从完好副本读回正确内容。多试几次抵消随机顺序。
+	for i := 0; i < 5; i++ {
+		out := filepath.Join(dir, "c_out.bin")
+		if err := c.Get("/c.bin", out); err != nil {
+			t.Fatalf("Get 应能从完好副本读回: %v", err)
+		}
+		got, _ := os.ReadFile(out)
+		if !bytes.Equal(got, content) {
+			t.Fatalf("校验和应挡住损坏副本，读回内容却不符（第 %d 次）", i)
+		}
 	}
 }

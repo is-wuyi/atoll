@@ -11,7 +11,9 @@ package mount
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math/rand"
 	"net/http"
@@ -35,6 +37,7 @@ type Mount struct {
 	replicas int    // 新写入文件的副本数
 	cacheDir string // 写缓冲临时文件目录
 	token    auth.Token
+	tlsCfg   *tls.Config // 读句柄直连节点的 TLS 配置（nil = 普通 HTTP）
 
 	mu     sync.Mutex
 	writes map[string]*writeHandle // 远程路径 → 进行中的本地写入
@@ -46,6 +49,11 @@ func New(c *client.Client, cacheDir string, replicas int) (*Mount, error) {
 
 // NewWithToken 创建带认证的挂载会话：读句柄的节点直连请求也注入 token。
 func NewWithToken(c *client.Client, cacheDir string, replicas int, token auth.Token) (*Mount, error) {
+	return NewWithTLS(c, cacheDir, replicas, token, nil)
+}
+
+// NewWithTLS 创建带认证 + TLS 的挂载会话。tlsCfg 为空等价于 NewWithToken。
+func NewWithTLS(c *client.Client, cacheDir string, replicas int, token auth.Token, tlsCfg *tls.Config) (*Mount, error) {
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
@@ -54,8 +62,17 @@ func NewWithToken(c *client.Client, cacheDir string, replicas int, token auth.To
 		replicas: replicas,
 		cacheDir: cacheDir,
 		token:    token,
+		tlsCfg:   tlsCfg,
 		writes:   make(map[string]*writeHandle),
 	}, nil
+}
+
+// scheme 返回读句柄直连节点用的 URL scheme，从 client.MasterURL 推导。
+func (m *Mount) scheme() string {
+	if strings.HasPrefix(m.client.MasterURL, "https://") {
+		return "https"
+	}
+	return "http"
 }
 
 // Root 返回挂载根节点。
@@ -103,6 +120,16 @@ func (n *node) newChildNode(ctx context.Context, ino uint64, mode uint32) *fs.In
 	return n.NewInode(ctx, &node{m: n.m}, fs.StableAttr{Ino: ino, Mode: mode})
 }
 
+// syntheticIno 为"写入中、尚无 master inode ID"的文件生成稳定且不与真实 ID 冲突的号。
+// 最高位置 1：真实 atoll ID（legacy < 2^32、块对象 ≈ staging<<8）都远低于 2^63，
+// 故这个高位区间专属于 in-progress 文件，既稳定（同路径恒定）又避免与真实 ID 碰撞。
+// 此前这些文件报 Ino=0，由 go-fuse 自增分配——号会在 lookup 间变化，且与真实 ID 同域可能撞。
+func syntheticIno(path string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(path))
+	return (1 << 63) | (h.Sum64() >> 1)
+}
+
 // fillEntry 把 master 的 inode 属性填入 EntryOut/AttrOut。
 func fillEntry(a *fuse.Attr, in *types.Inode) {
 	if in.Type == types.TypeDir {
@@ -148,7 +175,7 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	n.m.mu.Unlock()
 	if w != nil {
 		w.attr(&out.Attr)
-		return n.newChildNode(ctx, 0, fuse.S_IFREG), 0
+		return n.newChildNode(ctx, syntheticIno(remote), fuse.S_IFREG), 0
 	}
 	in, _, err := n.m.client.Lookup(remote)
 	if err != nil {
@@ -277,8 +304,9 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 	}
 	hc := &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: &auth.Transport{Token: n.m.token},
+		Transport: auth.HTTPTransport(n.m.token, n.m.tlsCfg, nil),
 	}
+	scheme := n.m.scheme()
 	if in.Chunked {
 		addr := make(map[uint64]string)
 		for _, r := range reps {
@@ -294,6 +322,7 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 			addr:   addr,
 			next:   make(map[int]int),
 			http:   hc,
+			scheme: scheme,
 		}, 0, 0
 	}
 	addrs := candidateAddrs(reps)
@@ -301,10 +330,11 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 		return nil, 0, syscall.EIO
 	}
 	return &readHandle{
-		ino:   in.ID,
-		size:  in.Size,
-		addrs: addrs,
-		http:  hc,
+		ino:    in.ID,
+		size:   in.Size,
+		addrs:  addrs,
+		http:   hc,
+		scheme: scheme,
 	}, 0, 0
 }
 
@@ -315,7 +345,7 @@ func (n *node) Create(ctx context.Context, name string, _ uint32, _ uint32, out 
 		return nil, nil, 0, syscall.EIO
 	}
 	w.attr(&out.Attr)
-	return n.newChildNode(ctx, 0, fuse.S_IFREG), w, 0, 0
+	return n.newChildNode(ctx, syntheticIno(n.remotePath(name)), fuse.S_IFREG), w, 0, 0
 }
 
 // Setattr 处理 truncate（打开的写句柄）；其余属性修改忽略。
@@ -360,16 +390,6 @@ func candidateAddrs(reps []client.Replica) []string {
 	return append(done, pending...)
 }
 
-// containsUint64 判断 v 是否在 list 中。
-func containsUint64(list []uint64, v uint64) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
 // mapErrno 把 client 错误映射为 errno。
 func mapErrno(err error) syscall.Errno {
 	if err == nil {
@@ -391,11 +411,12 @@ func mapErrno(err error) syscall.Errno {
 // ---- 读句柄：按 Range 请求读取，故障切换 ----
 
 type readHandle struct {
-	ino   uint64
-	size  int64
-	addrs []string
-	next  int
-	http  *http.Client
+	ino    uint64
+	size   int64
+	addrs  []string
+	next   int
+	http   *http.Client
+	scheme string
 }
 
 var _ fs.FileReader = (*readHandle)(nil)
@@ -407,7 +428,7 @@ func (rh *readHandle) readRange(start, end int64) ([]byte, syscall.Errno) {
 	for i := 0; i < len(rh.addrs); i++ {
 		addr := rh.addrs[(rh.next+i)%len(rh.addrs)]
 		req, err := http.NewRequest(http.MethodGet,
-			fmt.Sprintf("http://%s/objects/%d", addr, rh.ino), nil)
+			fmt.Sprintf("%s://%s/objects/%d", rh.scheme, addr, rh.ino), nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -471,6 +492,7 @@ type chunkedReadHandle struct {
 	addr   map[uint64]string // 节点 ID → 地址（lookup 的地址表）
 	next   map[int]int       // 块 index → 下一个候选起点（读时记忆可用节点）
 	http   *http.Client
+	scheme string
 	mu     sync.Mutex
 }
 
@@ -482,7 +504,7 @@ func (ch *chunkedReadHandle) readChunkRange(c types.ChunkInfo, start, end int64)
 	// done 优先、组内打散（与 candidateAddrs 同语义，但面向节点 ID）。
 	var primary, pending []uint64
 	for _, id := range c.Replicas {
-		if len(c.Done) > 0 && containsUint64(c.Done, id) {
+		if len(c.Done) > 0 && types.ContainsUint64(c.Done, id) {
 			primary = append(primary, id)
 		} else {
 			pending = append(pending, id)
@@ -505,7 +527,7 @@ func (ch *chunkedReadHandle) readChunkRange(c types.ChunkInfo, start, end int64)
 			continue
 		}
 		req, err := http.NewRequest(http.MethodGet,
-			fmt.Sprintf("http://%s/objects/%d", a, chunkID), nil)
+			fmt.Sprintf("%s://%s/objects/%d", ch.scheme, a, chunkID), nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -653,11 +675,16 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
 		return syscall.EIO
 	}
+	// commit 前等待的持久性下限：取 min(replicas, 2)。此前硬等满副本，
+	// replicas=3 时只要一个从副本慢/掉就阻塞到 15 分钟再 EIO（cp 卡死）。
+	// 2 份已能扛单节点丢失，其余由后台复制 + 修复补齐——既有持久性又不卡写。
+	minCopies := w.m.replicas
+	if minCopies > 2 {
+		minCopies = 2
+	}
 	var err2 error
 	if st.Size() > 0 {
-		// mount 写入走满副本档位：Flush 阻塞至每块全部副本落盘，
-		// 避免 cp 完就拔盘/断网时单副本窗口（改进项3 的 mount 侧应用）。
-		err2 = w.m.client.PutChunkedReaderWithMinCopies(w.remote, st.Size(), w.f, w.m.replicas, w.m.replicas, true)
+		err2 = w.m.client.PutChunkedReaderWithMinCopies(w.remote, st.Size(), w.f, w.m.replicas, minCopies, true)
 	} else {
 		err2 = w.m.client.PutReaderOverwrite(w.remote, st.Size(), w.f, w.m.replicas, true)
 	}
@@ -720,7 +747,7 @@ func (w *writeHandle) attr(a *fuse.Attr) {
 		a.Mode = fuse.S_IFREG | 0o644
 		return
 	}
-	a.Ino = 0
+	a.Ino = syntheticIno(w.remote) // 写入中文件：稳定且不与真实 inode ID 冲突
 	a.Size = uint64(st.Size())
 	a.Mode = fuse.S_IFREG | 0o644
 	a.Mtime = uint64(st.ModTime().Unix())

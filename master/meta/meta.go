@@ -326,7 +326,7 @@ func (s *Store) Rename(id uint64, newName string) error {
 
 // UpdateFileSize 更新文件大小，并把主副本（Replicas[0]）标记为已同步。
 // 客户端直连主副本写完数据后 commit 时调用。
-func (s *Store) UpdateFileSize(id uint64, size int64) error {
+func (s *Store) UpdateFileSize(id uint64, size int64, checksum uint32) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		in, err := getInodeTx(tx, id)
 		if err != nil {
@@ -336,6 +336,7 @@ func (s *Store) UpdateFileSize(id uint64, size int64) error {
 			return ErrNotFile
 		}
 		in.Size = size
+		in.Checksum = checksum
 		in.Mtime = time.Now()
 		if len(in.Replicas) > 0 {
 			in.DoneReplicas = appendUnique(in.DoneReplicas, in.Replicas[0])
@@ -353,6 +354,10 @@ func (s *Store) AddReplicaDone(id, nodeID uint64) error {
 		}
 		if in.Type != types.TypeFile {
 			return ErrNotFile
+		}
+		// 成员资格校验：只有副本集内的节点上报才计入 DoneReplicas（同 MarkChunkDone）。
+		if !types.ContainsUint64(in.Replicas, nodeID) {
+			return nil
 		}
 		in.DoneReplicas = appendUnique(in.DoneReplicas, nodeID)
 		return putInode(tx, &in)
@@ -468,7 +473,7 @@ func nextStagingID(tx *bolt.Tx) (uint64, error) {
 
 // AssignChunk 为 staging 文件的第 index 块分配副本节点。
 // 幂等：该块已分配则原样返回既有分配（重试安全）。
-func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []uint64) (types.ChunkInfo, error) {
+func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []uint64, checksum uint32) (types.ChunkInfo, error) {
 	var chunk types.ChunkInfo
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		in, err := getInodeTx(tx, inodeID)
@@ -490,9 +495,12 @@ func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []ui
 				return nil
 			}
 		}
-		in.Chunks = append(in.Chunks, types.ChunkInfo{Index: index, Size: size, Replicas: replicas})
+		in.Chunks = append(in.Chunks, types.ChunkInfo{Index: index, Size: size, Replicas: replicas, Checksum: checksum})
 		// 并发 Assign 可能乱序插入，保持块表按 Index 升序。
 		sort.Slice(in.Chunks, func(i, j int) bool { return in.Chunks[i].Index < in.Chunks[j].Index })
+		// 刷新 Mtime：staging TTL 据此判"多久没活动"。此前锚定创建时间，
+		// 上传 >24h 的合法大文件会被连数据一起清掉——改为按活跃度续期。
+		in.Mtime = time.Now()
 		if err := putInode(tx, &in); err != nil {
 			return err
 		}
@@ -511,7 +519,7 @@ func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []ui
 
 // ReassignChunk 废弃某块现有分配并重新分配（主副本持续失败时换节点）。
 // 返回新分配。块 Done 集合重置。
-func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64) (types.ChunkInfo, error) {
+func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64, checksum uint32) (types.ChunkInfo, error) {
 	var chunk types.ChunkInfo
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		in, err := getInodeTx(tx, inodeID)
@@ -525,7 +533,11 @@ func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64) (typ
 			if in.Chunks[i].Index == index {
 				in.Chunks[i].Replicas = replicas
 				in.Chunks[i].Done = nil
+				if checksum != 0 {
+					in.Chunks[i].Checksum = checksum
+				}
 				chunk = in.Chunks[i]
+				in.Mtime = time.Now() // 换节点重试也是活跃上传，刷新 TTL
 				return putInode(tx, &in)
 			}
 		}
@@ -551,6 +563,12 @@ func (s *Store) MarkChunkDone(chunkID, nodeID uint64) error {
 		}
 		for i := range in.Chunks {
 			if in.Chunks[i].Index == index {
+				// 成员资格校验：只有该块副本集内的节点上报才计入 Done。
+				// reassign 后旧节点、或伪造上报的节点不应把自己刷成 Done（否则
+				// min-copies 会被虚高副本满足）。非成员静默忽略（保持上报幂等）。
+				if !types.ContainsUint64(in.Chunks[i].Replicas, nodeID) {
+					return nil
+				}
 				in.Chunks[i].Done = appendUnique(in.Chunks[i].Done, nodeID)
 				return putInode(tx, &in)
 			}
@@ -575,7 +593,7 @@ func (s *Store) ReplaceChunkReplica(inodeID uint64, index int, oldNodeID, newNod
 				continue
 			}
 			// 查重：newNodeID 已在该块副本集则拒绝（同 ReplaceReplica，防并发修复造重复）。
-			if containsUint64(in.Chunks[i].Replicas, newNodeID) {
+			if types.ContainsUint64(in.Chunks[i].Replicas, newNodeID) {
 				return fmt.Errorf("%w: node %d already a replica of chunk %d", ErrReplicaDup, newNodeID, index)
 			}
 			found := false
@@ -631,7 +649,7 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 			if c.Index != i {
 				return fmt.Errorf("%w: chunk index gap at position %d (got index %d)", ErrCommitFailed, i, c.Index)
 			}
-			if len(c.Replicas) == 0 || !containsUint64(c.Done, c.Replicas[0]) {
+			if len(c.Replicas) == 0 || !types.ContainsUint64(c.Done, c.Replicas[0]) {
 				return fmt.Errorf("%w: chunk %d primary not done", ErrCommitFailed, c.Index)
 			}
 			sum += c.Size
@@ -710,16 +728,6 @@ func (s *Store) ForEachStaging(fn func(types.Inode) error) error {
 			return nil
 		})
 	})
-}
-
-// containsUint64 判断 v 是否在 list 中。
-func containsUint64(list []uint64, v uint64) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 // NodeInfos 按 ID 列表取节点详情（缺失的跳过）。
@@ -909,7 +917,7 @@ func (s *Store) ReplaceReplica(inodeID, oldNodeID, newNodeID uint64) error {
 		// 查重：newNodeID 已在副本集则拒绝——两轮修复并发可能各自选中同一新节点，
 		// 落库后变成 [5,5,x]，物理副本数虚高，扫描器会把降级文件误判为满健康。
 		// 拒绝后由下一轮修复重新选一个不重复的候选（ErrReplicaDup 幂等可重试）。
-		if containsUint64(in.Replicas, newNodeID) {
+		if types.ContainsUint64(in.Replicas, newNodeID) {
 			return fmt.Errorf("%w: node %d already a replica of inode %d", ErrReplicaDup, newNodeID, inodeID)
 		}
 		found := false

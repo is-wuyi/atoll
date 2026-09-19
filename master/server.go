@@ -2,6 +2,7 @@
 package master
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,9 @@ type Server struct {
 	nodeMaxAge time.Duration // 节点心跳超时阈值
 	scanner    *Scanner      // GC 需要调用
 	token      auth.Token    // 集群认证；空 = 兼容模式
+	adminToken auth.Token    // 破坏性操作（/admin/gc）专用；空 = 回退用 token
+	scheme     string        // 出站访问节点的 scheme：http（默认）/https
+	tlsCfg     *tls.Config   // 出站 TLS 客户端配置（nil = 普通 HTTP）
 }
 
 func NewServer(store *meta.Store, nodeMaxAge time.Duration) *Server {
@@ -32,6 +36,29 @@ func NewServer(store *meta.Store, nodeMaxAge time.Duration) *Server {
 
 // SetToken 设置集群认证 token（包装 Handler 生效）。空 token = 兼容模式。
 func (s *Server) SetToken(token auth.Token) { s.token = token }
+
+// SetAdminToken 设置破坏性操作（/admin/gc）专用 token。空 = 回退用集群 token。
+func (s *Server) SetAdminToken(token auth.Token) { s.adminToken = token }
+
+// SetTLS 启用出站访问节点的 TLS（探测/回收对象走 https）。cfg 为空则不启用。
+func (s *Server) SetTLS(cfg *tls.Config) {
+	if cfg == nil {
+		return
+	}
+	s.tlsCfg = cfg
+	s.scheme = "https"
+}
+
+// nodeScheme 返回访问节点的 scheme（默认 http）。
+func (s *Server) nodeScheme() string {
+	if s.scheme == "" {
+		return "http"
+	}
+	return s.scheme
+}
+
+// adminPaths 需要 adminToken 的破坏性路径。/admin/objects 是只读清单、不在内。
+var adminPaths = map[string]bool{"/admin/gc": true}
 
 // SetScanner 绑定扫描器，供 /admin/gc 等接口使用。
 func (s *Server) SetScanner(scanner *Scanner) {
@@ -58,7 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("POST /nodes/heartbeat", s.handleNodeHeartbeat)
 	mux.HandleFunc("POST /admin/gc", s.handleGC)
-	return auth.Wrap(mux, s.token)
+	return auth.WrapTokens(mux, s.token, s.adminToken, adminPaths)
 }
 
 // ---- 目录 ----
@@ -67,7 +94,7 @@ func (s *Server) handleCreateDir(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
@@ -134,7 +161,7 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 				if time.Since(n.LastHeartbeat) > s.nodeMaxAge {
 					continue
 				}
-				resp.Nodes = append(resp.Nodes, nodeEntry{NodeInfo: n, Done: contains(in.DoneReplicas, id)})
+				resp.Nodes = append(resp.Nodes, nodeEntry{NodeInfo: n, Done: types.ContainsUint64(in.DoneReplicas, id)})
 			}
 		}
 		writeJSON(w, http.StatusOK, resp)
@@ -148,7 +175,7 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 		if time.Since(n.LastHeartbeat) > s.nodeMaxAge {
 			continue // 已判定宕机，不提供给客户端
 		}
-		resp.Nodes = append(resp.Nodes, nodeEntry{NodeInfo: n, Done: contains(in.DoneReplicas, id)})
+		resp.Nodes = append(resp.Nodes, nodeEntry{NodeInfo: n, Done: types.ContainsUint64(in.DoneReplicas, id)})
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -159,14 +186,6 @@ type nodeEntry struct {
 	Done bool `json:"done"`
 }
 
-func contains(list []uint64, v uint64) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
 
 // handleReplicaTargets 主副本节点查询：除自己外还需要推送到哪些节点。
 // ?inode_id=N&node_id=self。inode_id 可以是块对象 ID（分块模型）：
@@ -199,7 +218,7 @@ func (s *Server) handleReplicaTargets(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			for _, id := range c.Replicas {
-				if id == nodeID || contains(c.Done, id) {
+				if id == nodeID || types.ContainsUint64(c.Done, id) {
 					continue
 				}
 				n, err := s.store.GetNode(id)
@@ -224,7 +243,7 @@ func (s *Server) handleReplicaTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	var targets []types.NodeInfo
 	for _, id := range in.Replicas {
-		if id == nodeID || contains(in.DoneReplicas, id) {
+		if id == nodeID || types.ContainsUint64(in.DoneReplicas, id) {
 			continue // 跳过自己和已完成的
 		}
 		n, err := s.store.GetNode(id)
@@ -246,7 +265,7 @@ func (s *Server) handleReplicated(w http.ResponseWriter, r *http.Request) {
 		InodeID uint64 `json:"inode_id"`
 		NodeID  uint64 `json:"node_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
@@ -282,7 +301,7 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 		Overwrite bool   `json:"overwrite"` // 覆盖已有文件
 		Chunked   bool   `json:"chunked"`   // 分块上传模式（批次 C）
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
@@ -389,8 +408,9 @@ func (s *Server) handleAssignChunk(w http.ResponseWriter, r *http.Request) {
 		Size     int64  `json:"size"`
 		Replicas int    `json:"replicas"`
 		Reassign bool   `json:"reassign"`
+		Checksum uint32 `json:"checksum"` // 块内容 CRC32C（0 = 未提供）
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
@@ -428,9 +448,9 @@ func (s *Server) handleAssignChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	var chunk types.ChunkInfo
 	if req.Reassign {
-		chunk, err = s.store.ReassignChunk(req.InodeID, req.Index, nodeIDs)
+		chunk, err = s.store.ReassignChunk(req.InodeID, req.Index, nodeIDs, req.Checksum)
 	} else {
-		chunk, err = s.store.AssignChunk(req.InodeID, req.Index, req.Size, nodeIDs)
+		chunk, err = s.store.AssignChunk(req.InodeID, req.Index, req.Size, nodeIDs, req.Checksum)
 	}
 	if err != nil {
 		httpErrorFromMeta(w, err)
@@ -487,8 +507,9 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 		ChunkCount int    `json:"chunk_count"` // >0 = 分块提交（批次 C）
 		Name       string `json:"name"`        // 分块提交的目标文件名
 		MinCopies  int    `json:"min_copies"`  // >0 = commit 前每块需 ≥N 个 Done 且存活的副本（改进项3）
+		Checksum   uint32 `json:"checksum"`    // legacy 整对象 CRC32C（0 = 未提供）
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
@@ -514,7 +535,7 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 		// 27472 宕机期间它的块仍标记 Done，commit 若不查心跳会把数据承诺到死节点。
 		if st, err := s.store.GetInode(req.InodeID); err == nil && st.Staging {
 			for _, c := range st.Chunks {
-				if len(c.Replicas) == 0 || containsUint64ID(c.Done, c.Replicas[0]) {
+				if len(c.Replicas) == 0 || types.ContainsUint64(c.Done, c.Replicas[0]) {
 					continue
 				}
 				n, err := s.store.GetNode(c.Replicas[0])
@@ -561,7 +582,7 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "inode_id required")
 		return
 	}
-	if err := s.store.UpdateFileSize(req.InodeID, req.Size); err != nil {
+	if err := s.store.UpdateFileSize(req.InodeID, req.Size, req.Checksum); err != nil {
 		httpErrorFromMeta(w, err)
 		return
 	}
@@ -603,7 +624,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		Path    string `json:"path"`
 		NewName string `json:"new_name"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
@@ -624,26 +645,16 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// containsUint64ID 判断 v 是否在 list 中。
-func containsUint64ID(list []uint64, v uint64) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
 // probeObject 探测节点上对象是否存在（Range 1 字节；404 = 不存在）。
 // 网络/服务错误返回 false（保守：不标记 Done，让 commit 校验拒绝）。
 func (s *Server) probeObject(nodeAddr string, objectID uint64) bool {
 	req, err := http.NewRequest(http.MethodGet,
-		fmt.Sprintf("http://%s/objects/%d", nodeAddr, objectID), nil)
+		fmt.Sprintf("%s://%s/objects/%d", s.nodeScheme(), nodeAddr, objectID), nil)
 	if err != nil {
 		return false
 	}
 	req.Header.Set("Range", "bytes=0-0")
-	client := &http.Client{Timeout: 5 * time.Second, Transport: &auth.Transport{Token: s.token}}
+	client := &http.Client{Timeout: 5 * time.Second, Transport: auth.HTTPTransport(s.token, s.tlsCfg, nil)}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -685,14 +696,14 @@ func (s *Server) countCommitReadyChunks(st types.Inode, minCopies int) int {
 func (s *Server) notifyObjectDelete(inodeID uint64, replicaNodeIDs []uint64) {
 	client := &http.Client{
 		Timeout:   5 * time.Second,
-		Transport: &auth.Transport{Token: s.token},
+		Transport: auth.HTTPTransport(s.token, s.tlsCfg, nil),
 	}
 	for _, id := range replicaNodeIDs {
 		n, err := s.store.GetNode(id)
 		if err != nil {
 			continue
 		}
-		req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("http://%s/objects/%d", n.Addr, inodeID), nil)
+		req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s://%s/objects/%d", s.nodeScheme(), n.Addr, inodeID), nil)
 		if err != nil {
 			continue
 		}
@@ -712,7 +723,7 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 		Addr       string `json:"addr"` // 供客户端直连的 host:port
 		TotalBytes int64  `json:"total_bytes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
@@ -733,7 +744,7 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		NodeID    uint64 `json:"node_id"`
 		UsedBytes int64  `json:"used_bytes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
@@ -755,7 +766,7 @@ func (s *Server) handleGC(w http.ResponseWriter, r *http.Request) {
 		Execute bool `json:"execute"`
 	}
 	if r.Body != nil {
-		json.NewDecoder(r.Body).Decode(&req)
+		decodeJSON(w, r, &req)
 	}
 	reports, err := s.scanner.RunGC(req.Execute)
 	if err != nil {
@@ -782,6 +793,16 @@ func splitPath(p string) (parent, name string) {
 		}
 	}
 	return "/", p
+}
+
+// maxRequestBody 限制 master 接收的 JSON 请求体大小。元数据请求都很小（路径/ID/名字），
+// 对象数据是客户端直连 node 的、不经过 master——1MiB 足够，且能挡住超大 body 打爆 master。
+const maxRequestBody = 1 << 20
+
+// decodeJSON 带大小上限地解码请求体（超限返回错误，由调用方转 400）。
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	return json.NewDecoder(r.Body).Decode(v)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

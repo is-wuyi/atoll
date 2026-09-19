@@ -4,6 +4,7 @@ package master
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,9 @@ type Scanner struct {
 	repairIntv time.Duration
 	gcIntv     time.Duration
 	httpClient *http.Client
+	scheme     string // 出站访问节点的 URL scheme：http（默认）或 https
+
+	wg sync.WaitGroup // 后台循环生命周期，供 Wait() 优雅关闭
 
 	mu          sync.Mutex
 	prevAlive   map[uint64]bool      // 上轮 alive 集合
@@ -47,6 +51,7 @@ func NewScanner(store *meta.Store, nodeMaxAge, repairIntv, gcIntv time.Duration)
 		repairIntv:      repairIntv,
 		gcIntv:          gcIntv,
 		httpClient:      &http.Client{Timeout: 10 * time.Second, Transport: &auth.Transport{Token: ""}},
+		scheme:          "http",
 		prevAlive:       make(map[uint64]bool),
 		failStreak:      make(map[uint64]int),
 		nextAttempt:     make(map[uint64]time.Time),
@@ -62,12 +67,31 @@ func (s *Scanner) SetToken(t auth.Token) {
 	s.httpClient.Transport = &auth.Transport{Token: t}
 }
 
+// SetTLS 启用出站 TLS（scheme 切到 https 并给 httpClient 装 TLS 配置）。
+// 必须在 SetToken 之后调用（会保留当前 token）。cfg 为空则不启用。
+func (s *Scanner) SetTLS(cfg *tls.Config) {
+	if cfg == nil {
+		return
+	}
+	tok := auth.Token("")
+	if tr, ok := s.httpClient.Transport.(*auth.Transport); ok {
+		tok = tr.Token
+	}
+	s.httpClient.Transport = auth.HTTPTransport(tok, cfg, nil)
+	s.scheme = "https"
+}
+
 // Start 启动三个后台扫描器，ctx 取消时退出。
 func (s *Scanner) Start(ctx context.Context) {
-	go s.runDeathMonitor(ctx)
-	go s.runRepairLoop(ctx)
-	go s.runGCLoop(ctx)
+	s.wg.Add(3)
+	go func() { defer s.wg.Done(); s.runDeathMonitor(ctx) }()
+	go func() { defer s.wg.Done(); s.runRepairLoop(ctx) }()
+	go func() { defer s.wg.Done(); s.runGCLoop(ctx) }()
 }
+
+// Wait 阻塞直到三个后台扫描器全部退出（ctx 取消后调用）。
+// runMaster 在关闭 store 前调用它，避免扫描器还在用 store 时库被关闭。
+func (s *Scanner) Wait() { s.wg.Wait() }
 
 // runDeathMonitor 死亡判定：10s 周期。
 func (s *Scanner) runDeathMonitor(ctx context.Context) {
@@ -533,7 +557,7 @@ func (s *Scanner) executeRepair(inodeID uint64, t repairTask) {
 // 仅当明确返回 404 才判"源数据丢失"；网络错误等其他失败保持乐观（仍触发 pull，由重试兜底）。
 func (s *Scanner) probeSource(sourceAddr string, inodeID uint64) bool {
 	req, err := http.NewRequest(http.MethodGet,
-		fmt.Sprintf("http://%s/objects/%d", sourceAddr, inodeID), nil)
+		fmt.Sprintf("%s://%s/objects/%d", s.scheme, sourceAddr, inodeID), nil)
 	if err != nil {
 		return true
 	}
@@ -553,7 +577,7 @@ func (s *Scanner) triggerPull(targetAddr string, inodeID uint64, sourceAddr stri
 		"inode_id":    inodeID,
 		"source_addr": sourceAddr,
 	})
-	resp, err := s.httpClient.Post(fmt.Sprintf("http://%s/pull", targetAddr), "application/json", bytes.NewReader(body))
+	resp, err := s.httpClient.Post(fmt.Sprintf("%s://%s/pull", s.scheme, targetAddr), "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("pull inode %d → %s 失败: %v", inodeID, targetAddr, err)
 		return
@@ -578,6 +602,9 @@ type GCNodeReport struct {
 	NodeAddr    string        `json:"node_addr"`
 	Orphans     []ObjectEntry `json:"orphans"`
 	OrphanBytes int64         `json:"orphan_bytes"`
+	// Deleted 本轮实际删除的孤儿数（仅 execute）。两轮确认下首轮恒为 0——
+	// 此前 CLI 直接拿 len(Orphans) 当删除数打印"已删除 N"，首轮会虚报。
+	Deleted int `json:"deleted"`
 }
 
 // findOrphans 纯函数：节点对象列表 + 元数据 inode 集合 → 孤儿列表。
@@ -656,7 +683,6 @@ func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
 		for _, o := range orphans {
 			report.OrphanBytes += o.Size
 		}
-		reports = append(reports, report)
 
 		set := make(map[uint64]bool, len(orphans))
 		for _, o := range orphans {
@@ -677,10 +703,11 @@ func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
 				confirmed = append(confirmed, o)
 			}
 			if len(confirmed) > 0 {
-				deleted := s.deleteOrphans(n.Addr, confirmed)
-				log.Printf("GC 节点 %d (%s): 两轮确认删除 %d/%d 个孤儿", n.ID, n.Addr, deleted, len(confirmed))
+				report.Deleted = s.deleteOrphans(n.Addr, confirmed)
+				log.Printf("GC 节点 %d (%s): 两轮确认删除 %d/%d 个孤儿", n.ID, n.Addr, report.Deleted, len(confirmed))
 			}
 		}
+		reports = append(reports, report)
 	}
 	// 保存本轮孤儿集合作为下轮的"上轮"快照。
 	s.mu.Lock()
@@ -722,7 +749,7 @@ func (s *Scanner) notifyDeleteAsync(objectID uint64, replicaNodeIDs []uint64) {
 			continue
 		}
 		go func(addr string) {
-			req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("http://%s/objects/%d", addr, objectID), nil)
+			req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s://%s/objects/%d", s.scheme, addr, objectID), nil)
 			if err != nil {
 				return
 			}
@@ -737,7 +764,7 @@ func (s *Scanner) notifyDeleteAsync(objectID uint64, replicaNodeIDs []uint64) {
 
 // fetchNodeObjects 获取节点的对象清单。
 func (s *Scanner) fetchNodeObjects(addr string) ([]ObjectEntry, error) {
-	resp, err := s.httpClient.Get(fmt.Sprintf("http://%s/admin/objects", addr))
+	resp, err := s.httpClient.Get(fmt.Sprintf("%s://%s/admin/objects", s.scheme, addr))
 	if err != nil {
 		return nil, err
 	}
@@ -756,7 +783,7 @@ func (s *Scanner) fetchNodeObjects(addr string) ([]ObjectEntry, error) {
 func (s *Scanner) deleteOrphans(addr string, orphans []ObjectEntry) int {
 	deleted := 0
 	for _, o := range orphans {
-		req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("http://%s/objects/%d", addr, o.ID), nil)
+		req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s://%s/objects/%d", s.scheme, addr, o.ID), nil)
 		if err != nil {
 			continue
 		}

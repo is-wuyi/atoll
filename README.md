@@ -33,10 +33,15 @@ go build -o atoll ./cmd/atoll
 ./atoll mount -master http://<master-ip>:9420 /mnt/atoll
 ```
 
+## 数据完整性与安全
+
+- **端到端校验和（CRC32C）**：上传时每块/整对象算 CRC32C 存入元数据；节点落盘时按 PUT 头即时校验，读取时逐块比对，损坏副本自动跳过并故障转移。检测磁盘静默位翻转与传输撕裂。
+- **认证 + 读/管分离**：`-token` 为集群读写钥匙；`-admin-token`（master 侧 `-admin-token`，客户端 `atoll gc -admin-token`）单独保护 `/admin/gc` 这类破坏性操作，单钥匙泄露不至于连带删除权限。空 token = 兼容模式（不校验）。
+- **可选 TLS**：master/node 加 `-tls-cert -tls-key` 即走 https；客户端/挂载/节点用 `-tls-ca <CA文件>` 信任自签名 CA，或 `-tls-skip-verify` 跳过校验（仅限可信内网）。master 地址用 `https://` 时，直连节点也自动走 https。不配则明文 HTTP（向后兼容）。
+
 ## 限制
 
 - **单文件上限 16 GiB**：分块模型固定 64 MiB/块、每文件最多 256 块（`ChunkSize × MaxChunksPerFile`）。超过上限的 `put` 会直接报错。
-- **传输明文**：组件间为静态 Bearer Token 认证，无 TLS——仅适用于可信内网。
 - **master 单点**：单个 bbolt 文件，无 HA/自动备份；请自行定期备份该 db 文件。
 
 ## 节点重加入行为

@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"crypto/tls"
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +36,23 @@ func NewWithToken(masterURL string, token auth.Token) *Client {
 		MasterURL: strings.TrimRight(masterURL, "/"),
 		HTTP:      &http.Client{Transport: &auth.Transport{Token: token}},
 	}
+}
+
+// NewWithTLS 创建带认证 + TLS 配置的客户端。tlsCfg 为空等价于 NewWithToken。
+// 直连存储节点用的 scheme 从 masterURL 推导（https:// → 节点也走 https）。
+func NewWithTLS(masterURL string, token auth.Token, tlsCfg *tls.Config) *Client {
+	return &Client{
+		MasterURL: strings.TrimRight(masterURL, "/"),
+		HTTP:      &http.Client{Transport: auth.HTTPTransport(token, tlsCfg, nil)},
+	}
+}
+
+// scheme 返回直连存储节点用的 URL scheme，从 MasterURL 推导。
+func (c *Client) scheme() string {
+	if strings.HasPrefix(c.MasterURL, "https://") {
+		return "https"
+	}
+	return "http"
 }
 
 // ---- 元数据操作 ----
@@ -142,13 +159,35 @@ func (c *Client) PutReaderOverwrite(remotePath string, size int64, r io.Reader, 
 		return fmt.Errorf("master 未分配任何存储节点")
 	}
 
-	// 2. 直连主副本写入数据。
-	if err := c.putObject(created.Nodes[0].Addr, created.Inode.ID, r); err != nil {
-		return fmt.Errorf("write object: %w", err)
+	// 2. 直连主副本写入数据，边传边算 CRC32C（流式上传无法预先知道校验和，
+	//    故不带 PUT 头让 node 即时校验；改由 commit 落库、读取时按元数据比对）。
+	//    带重试：主副本瞬时故障时，若源可重放（io.Seeker）则回到开头重传。
+	//    此前 legacy 路径只 PUT 一次、无重试无换节点，一次抖动就整体失败。
+	seeker, seekable := r.(io.Seeker)
+	var crcVal uint32
+	var putErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		hh := types.NewCRC32C()
+		if putErr = c.putObject(created.Nodes[0].Addr, created.Inode.ID, io.TeeReader(r, hh)); putErr == nil {
+			crcVal = hh.Sum32()
+			break
+		}
+		if !seekable {
+			break // 不可重放，单次即止
+		}
+		if _, serr := seeker.Seek(0, io.SeekStart); serr != nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+	}
+	if putErr != nil {
+		return fmt.Errorf("write object: %w", putErr)
 	}
 
-	// 3. commit 实际大小（主副本会随后异步推送到其余节点）。
-	return c.postJSON("/files/commit", map[string]any{"inode_id": created.Inode.ID, "size": size}, nil)
+	// 3. commit 实际大小 + 校验和（主副本会随后异步推送到其余节点）。
+	return c.postJSON("/files/commit", map[string]any{
+		"inode_id": created.Inode.ID, "size": size, "checksum": crcVal,
+	}, nil)
 }
 
 // Get 下载远程文件：查元数据 → 优先从已同步完成的副本随机挑一个直连读。
@@ -166,30 +205,27 @@ func (c *Client) Get(remotePath, localPath string) error {
 	if len(nodes) == 0 {
 		return fmt.Errorf("无可用副本节点")
 	}
-	var candidates []Replica
+	// Done 副本优先、组内随机打散做负载均衡；未 Done 的追加在后作兜底
+	// （异步复制中可能已落盘只是上报延迟，或 Done 副本全宕时抢救数据）。
+	// 此前是"整体 shuffle 再 stable-sort"，绕了一圈；分组各自 shuffle 更直观。
+	var done, pending []Replica
 	for _, nd := range nodes {
 		if nd.Done {
-			candidates = append(candidates, nd)
+			done = append(done, nd)
+		} else {
+			pending = append(pending, nd)
 		}
 	}
-	// 非完成副本追加在后面作为兜底：异步复制中它们可能已落盘只是上报延迟，
-	// 或完成副本全部宕机时从它们抢救数据。
-	for _, nd := range nodes {
-		if !nd.Done {
-			candidates = append(candidates, nd)
-		}
-	}
-	// done 节点内部打乱实现随机负载均衡（保持 done 整体在前），依次尝试：宕机节点自动跳过。
-	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
-	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Done && !candidates[j].Done })
-	return c.getFromReplicas(in, candidates, localPath)
+	rand.Shuffle(len(done), func(i, j int) { done[i], done[j] = done[j], done[i] })
+	rand.Shuffle(len(pending), func(i, j int) { pending[i], pending[j] = pending[j], pending[i] })
+	return c.getFromReplicas(in, append(done, pending...), localPath)
 }
 
 // getFromReplicas 依次尝试候选副本下载整对象到 localPath，带长度校验与故障转移。
 func (c *Client) getFromReplicas(in types.Inode, candidates []Replica, localPath string) error {
 	var lastErr error
 	for _, n := range candidates {
-		resp, err := c.HTTP.Get(fmt.Sprintf("http://%s/objects/%d", n.Addr, in.ID))
+		resp, err := c.HTTP.Get(fmt.Sprintf("%s://%s/objects/%d", c.scheme(), n.Addr, in.ID))
 		if err != nil {
 			lastErr = fmt.Errorf("节点 %s: %w", n.Addr, err)
 			continue
@@ -204,7 +240,8 @@ func (c *Client) getFromReplicas(in types.Inode, candidates []Replica, localPath
 			resp.Body.Close()
 			return err
 		}
-		written, copyErr := io.Copy(out, resp.Body)
+		h := types.NewCRC32C()
+		written, copyErr := io.Copy(out, io.TeeReader(resp.Body, h))
 		closeErr := out.Close()
 		resp.Body.Close()
 		if copyErr != nil || closeErr != nil {
@@ -215,6 +252,11 @@ func (c *Client) getFromReplicas(in types.Inode, candidates []Replica, localPath
 		// 短读 → 换下一个副本重试（os.Create 会截断，重试覆盖不残留半份）。
 		if written != in.Size {
 			lastErr = fmt.Errorf("节点 %s: 短读 %d != 声明大小 %d", n.Addr, written, in.Size)
+			continue
+		}
+		// 校验和：元数据有记录（非 0）且不符 → 该副本内容损坏，换下一个副本。
+		if in.Checksum != 0 && h.Sum32() != in.Checksum {
+			lastErr = fmt.Errorf("节点 %s: 校验和不符 %08x != %08x", n.Addr, h.Sum32(), in.Checksum)
 			continue
 		}
 		return nil
@@ -375,8 +417,9 @@ func (c *Client) putChunkedCore(remotePath string, size int64, r io.Reader, repl
 
 // uploadChunkOnce 上传一个块：分配 → PUT 主副本（带重试）→ 失败 reassign 换节点。
 func (c *Client) uploadChunkOnce(stagingID uint64, index int, data []byte, replicas int) error {
+	crc := types.CRC32C(data) // 块内容校验和：随分配上报 master，PUT 时也带头让 node 落盘即校验。
 	// 分配（幂等）：拿到节点列表。
-	assign, err := c.assignChunk(stagingID, index, len(data), replicas)
+	assign, err := c.assignChunk(stagingID, index, len(data), replicas, crc)
 	if err != nil {
 		return fmt.Errorf("assign chunk %d: %w", index, err)
 	}
@@ -384,7 +427,7 @@ func (c *Client) uploadChunkOnce(stagingID uint64, index int, data []byte, repli
 	for round := 0; round < 2; round++ {
 		nodes := assign.Nodes
 		if round == 1 {
-			assign, err = c.reassignChunk(stagingID, index, len(data), replicas)
+			assign, err = c.reassignChunk(stagingID, index, len(data), replicas, crc)
 			if err != nil {
 				return fmt.Errorf("reassign chunk %d: %w", index, err)
 			}
@@ -397,10 +440,11 @@ func (c *Client) uploadChunkOnce(stagingID uint64, index int, data []byte, repli
 		ok := false
 		for attempt := 0; attempt < 2; attempt++ {
 			req, err := http.NewRequest(http.MethodPut,
-				fmt.Sprintf("http://%s/objects/%d", primary, types.ChunkID(stagingID, index)),
+				fmt.Sprintf("%s://%s/objects/%d", c.scheme(), primary, types.ChunkID(stagingID, index)),
 				bytes.NewReader(data))
 			if err == nil {
 				req.ContentLength = int64(len(data))
+				req.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", crc))
 				resp, err := c.HTTP.Do(req)
 				if err == nil {
 					io.Copy(io.Discard, resp.Body)
@@ -420,20 +464,20 @@ func (c *Client) uploadChunkOnce(stagingID uint64, index int, data []byte, repli
 	return fmt.Errorf("chunk %d: 全部尝试失败", index)
 }
 
-// assignChunk 向 master 申请块分配（幂等）。
-func (c *Client) assignChunk(stagingID uint64, index int, size int, replicas int) (chunkAssignOut, error) {
+// assignChunk 向 master 申请块分配（幂等）。checksum 为块内容 CRC32C。
+func (c *Client) assignChunk(stagingID uint64, index int, size int, replicas int, checksum uint32) (chunkAssignOut, error) {
 	var out chunkAssignOut
 	err := c.postJSON("/files/chunks", map[string]any{
-		"inode_id": stagingID, "index": index, "size": size, "replicas": replicas,
+		"inode_id": stagingID, "index": index, "size": size, "replicas": replicas, "checksum": checksum,
 	}, &out)
 	return out, err
 }
 
 // reassignChunk 请求 master 强制换一组节点。
-func (c *Client) reassignChunk(stagingID uint64, index int, size int, replicas int) (chunkAssignOut, error) {
+func (c *Client) reassignChunk(stagingID uint64, index int, size int, replicas int, checksum uint32) (chunkAssignOut, error) {
 	var out chunkAssignOut
 	err := c.postJSON("/files/chunks", map[string]any{
-		"inode_id": stagingID, "index": index, "size": size, "replicas": replicas, "reassign": true,
+		"inode_id": stagingID, "index": index, "size": size, "replicas": replicas, "reassign": true, "checksum": checksum,
 	}, &out)
 	return out, err
 }
@@ -480,7 +524,7 @@ func (c *Client) getChunked(in types.Inode, nodes []Replica, localPath string) e
 func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uint64]string, w io.Writer) error {
 	var primary, fallback []uint64
 	for _, id := range ch.Replicas {
-		if containsUint64(ch.Done, id) {
+		if types.ContainsUint64(ch.Done, id) {
 			primary = append(primary, id)
 		} else {
 			fallback = append(fallback, id)
@@ -497,7 +541,7 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 			lastErr = fmt.Errorf("节点 %d 地址未知", id)
 			continue
 		}
-		resp, err := c.HTTP.Get(fmt.Sprintf("http://%s/objects/%d", a, chunkID))
+		resp, err := c.HTTP.Get(fmt.Sprintf("%s://%s/objects/%d", c.scheme(), a, chunkID))
 		if err != nil {
 			lastErr = fmt.Errorf("节点 %s: %w", a, err)
 			continue
@@ -507,24 +551,28 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 			lastErr = fmt.Errorf("节点 %s 返回 %d", a, resp.StatusCode)
 			continue
 		}
-		_, copyErr := io.Copy(w, resp.Body)
+		// 先整块读入内存再校验后写出：块 ≤64MB，可整块驻留。必须校验后才写，
+		// 否则损坏块已落到输出文件、故障转移重写会导致内容重复错位。
+		buf, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if copyErr != nil {
-			return copyErr
+		if readErr != nil {
+			lastErr = fmt.Errorf("节点 %s: 读取失败 %w", a, readErr)
+			continue
+		}
+		if int64(len(buf)) != ch.Size {
+			lastErr = fmt.Errorf("节点 %s: 块 %d 短读 %d != %d", a, ch.Index, len(buf), ch.Size)
+			continue
+		}
+		if ch.Checksum != 0 && types.CRC32C(buf) != ch.Checksum {
+			lastErr = fmt.Errorf("节点 %s: 块 %d 校验和不符", a, ch.Index)
+			continue
+		}
+		if _, err := w.Write(buf); err != nil {
+			return err
 		}
 		return nil
 	}
 	return fmt.Errorf("全部副本失败: %w", lastErr)
-}
-
-// containsUint64 判断 v 是否在 list 中。
-func containsUint64(list []uint64, v uint64) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 // putObject 向节点写入对象数据。
@@ -532,7 +580,7 @@ func (c *Client) putObject(nodeAddr string, inodeID uint64, r io.Reader) error {
 	// io.NopCloser 包裹：http transport 上传完成后会关闭 req.Body，
 	// 若直接传 *os.File 会被关掉句柄，导致同一写句柄后续 Write 报 EIO
 	// （实机覆盖写 bug 根因：FLUSH 上传后 transport 关文件 → 再 WRITE 失败）。
-	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://%s/objects/%d", nodeAddr, inodeID), io.NopCloser(r))
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("%s://%s/objects/%d", c.scheme(), nodeAddr, inodeID), io.NopCloser(r))
 	if err != nil {
 		return err
 	}
@@ -604,6 +652,7 @@ type GCNodeReport struct {
 	NodeAddr    string `json:"node_addr"`
 	OrphanCount int    `json:"-"` // 从 Orphans 长度计算
 	OrphanBytes int64  `json:"orphan_bytes"`
+	Deleted     int    `json:"deleted"` // 本轮实际删除数（execute；两轮确认下首轮为 0）
 	Orphans     []struct {
 		ID   uint64 `json:"id"`
 		Size int64  `json:"size"`

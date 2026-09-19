@@ -194,7 +194,7 @@ func TestChunkedReadHandleRanges(t *testing.T) {
 	}
 	spread := [][]uint64{{ids[0], ids[1]}, {ids[1], ids[2]}, {ids[0], ids[2]}}
 	for i := 0; i < 3; i++ {
-		if _, err := store.AssignChunk(st.ID, i, blk, spread[i]); err != nil {
+		if _, err := store.AssignChunk(st.ID, i, blk, spread[i], 0); err != nil {
 			t.Fatalf("AssignChunk %d: %v", i, err)
 		}
 		chunkID := types.ChunkID(st.ID, i)
@@ -227,6 +227,7 @@ func TestChunkedReadHandleRanges(t *testing.T) {
 		addr:   addr,
 		next:   make(map[int]int),
 		http:   http.DefaultClient,
+		scheme: "http",
 	}
 
 	ctx := context.Background()
@@ -297,7 +298,7 @@ func TestChunkedReadHandleFailover(t *testing.T) {
 		t.Fatalf("CreateStagingFile: %v", err)
 	}
 	data := []byte("failover-chunk-data-0123456789")
-	if _, err := store.AssignChunk(st.ID, 0, int64(len(data)), []uint64{primary, secondary}); err != nil {
+	if _, err := store.AssignChunk(st.ID, 0, int64(len(data)), []uint64{primary, secondary}, 0); err != nil {
 		t.Fatalf("AssignChunk: %v", err)
 	}
 	chunkID := types.ChunkID(st.ID, 0)
@@ -325,6 +326,7 @@ func TestChunkedReadHandleFailover(t *testing.T) {
 		addr:   addr,
 		next:   make(map[int]int),
 		http:   http.DefaultClient,
+		scheme: "http",
 	}
 	// next[0]=1：候选顺序 [primary(done), secondary(pending)]，
 	// 从 secondary 起步 → 404 → 轮换回 primary。

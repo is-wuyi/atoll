@@ -376,12 +376,12 @@ func TestStagingInvisibleByPath(t *testing.T) {
 func TestAssignChunkIdempotent(t *testing.T) {
 	s := newTestStore(t)
 	st, _ := s.CreateStagingFile(RootID)
-	c1, err := s.AssignChunk(st.ID, 0, 1024, []uint64{7, 8})
+	c1, err := s.AssignChunk(st.ID, 0, 1024, []uint64{7, 8}, 0)
 	if err != nil {
 		t.Fatalf("AssignChunk: %v", err)
 	}
 	// 重复分配返回原样（幂等）。
-	c2, err := s.AssignChunk(st.ID, 0, 1024, []uint64{9, 10})
+	c2, err := s.AssignChunk(st.ID, 0, 1024, []uint64{9, 10}, 0)
 	if err != nil {
 		t.Fatalf("重复 AssignChunk 应幂等: %v", err)
 	}
@@ -389,19 +389,19 @@ func TestAssignChunkIdempotent(t *testing.T) {
 		t.Fatalf("重复分配应返回原分配: %+v vs %+v", c1, c2)
 	}
 	// 越界拒绝。
-	if _, err := s.AssignChunk(st.ID, types.MaxChunksPerFile, 1024, nil); !errors.Is(err, ErrChunkBadIndex) {
+	if _, err := s.AssignChunk(st.ID, types.MaxChunksPerFile, 1024, nil, 0); !errors.Is(err, ErrChunkBadIndex) {
 		t.Fatalf("越界块下标应拒绝: %v", err)
 	}
-	if _, err := s.AssignChunk(st.ID, 1, types.ChunkSize+1, nil); !errors.Is(err, ErrChunkBadSize) {
+	if _, err := s.AssignChunk(st.ID, 1, types.ChunkSize+1, nil, 0); !errors.Is(err, ErrChunkBadSize) {
 		t.Fatalf("超大块应拒绝: %v", err)
 	}
 	// 非法 size=0 拒绝。
-	if _, err := s.AssignChunk(st.ID, 1, 0, nil); !errors.Is(err, ErrChunkBadSize) {
+	if _, err := s.AssignChunk(st.ID, 1, 0, nil, 0); !errors.Is(err, ErrChunkBadSize) {
 		t.Fatalf("size=0 应拒绝: %v", err)
 	}
 	// 乱序 Assign 后块表仍按 Index 升序（index=1 的两次非法分配均被拒绝）。
-	s.AssignChunk(st.ID, 5, 512, []uint64{7})
-	s.AssignChunk(st.ID, 2, 512, []uint64{8})
+	s.AssignChunk(st.ID, 5, 512, []uint64{7}, 0)
+	s.AssignChunk(st.ID, 2, 512, []uint64{8}, 0)
 	got, _ := s.GetInode(st.ID)
 	if len(got.Chunks) != 3 { // 0,2,5
 		t.Fatalf("块表长度 = %d, want 3", len(got.Chunks))
@@ -416,7 +416,7 @@ func TestAssignChunkIdempotent(t *testing.T) {
 func TestMarkChunkDoneAndReassign(t *testing.T) {
 	s := newTestStore(t)
 	st, _ := s.CreateStagingFile(RootID)
-	s.AssignChunk(st.ID, 0, 100, []uint64{7, 8})
+	s.AssignChunk(st.ID, 0, 100, []uint64{7, 8}, 0)
 	chunkID := types.ChunkID(st.ID, 0)
 	if err := s.MarkChunkDone(chunkID, 7); err != nil {
 		t.Fatalf("MarkChunkDone: %v", err)
@@ -430,7 +430,7 @@ func TestMarkChunkDoneAndReassign(t *testing.T) {
 		t.Fatalf("Done 集合不符: %+v", got.Chunks[0].Done)
 	}
 	// Reassign 重置 Done、换副本。
-	if _, err := s.ReassignChunk(st.ID, 0, []uint64{9}); err != nil {
+	if _, err := s.ReassignChunk(st.ID, 0, []uint64{9}, 0); err != nil {
 		t.Fatalf("ReassignChunk: %v", err)
 	}
 	got, _ = s.GetInode(st.ID)
@@ -447,12 +447,12 @@ func TestCommitStagingAtomicReplace(t *testing.T) {
 	s := newTestStore(t)
 	// 先放一个旧版本文件（legacy 模型）。
 	old, _ := s.CreateFile(RootID, "data.bin", []uint64{5})
-	s.UpdateFileSize(old.ID, 100)
+	s.UpdateFileSize(old.ID, 100, 0)
 
 	// 新版本走 staging 流程。
 	st, _ := s.CreateStagingFile(RootID)
-	s.AssignChunk(st.ID, 0, 64<<20, []uint64{7})
-	s.AssignChunk(st.ID, 1, 36<<20, []uint64{8})
+	s.AssignChunk(st.ID, 0, 64<<20, []uint64{7}, 0)
+	s.AssignChunk(st.ID, 1, 36<<20, []uint64{8}, 0)
 	s.MarkChunkDone(types.ChunkID(st.ID, 0), 7)
 	s.MarkChunkDone(types.ChunkID(st.ID, 1), 8)
 
@@ -501,14 +501,14 @@ func TestCommitStagingRejectsIncomplete(t *testing.T) {
 		t.Fatalf("无块 commit 应失败: %v", err)
 	}
 	// 有块但主副本未 Done。
-	s.AssignChunk(st.ID, 0, 10, []uint64{7})
+	s.AssignChunk(st.ID, 0, 10, []uint64{7}, 0)
 	if _, _, _, err := s.CommitStagingFile(st.ID, "a.bin", 10); !errors.Is(err, ErrCommitFailed) {
 		t.Fatalf("主副本未 Done commit 应失败: %v", err)
 	}
 	// 覆盖目录名应拒绝。
 	dir, _ := s.CreateDir(RootID, "docs")
 	st2, _ := s.CreateStagingFile(RootID)
-	s.AssignChunk(st2.ID, 0, 10, []uint64{7})
+	s.AssignChunk(st2.ID, 0, 10, []uint64{7}, 0)
 	s.MarkChunkDone(types.ChunkID(st2.ID, 0), 7)
 	if _, _, _, err := s.CommitStagingFile(st2.ID, "docs", 10); !errors.Is(err, ErrExist) {
 		t.Fatalf("覆盖目录应返回 ErrExist: %v", err)
@@ -519,7 +519,7 @@ func TestCommitStagingRejectsIncomplete(t *testing.T) {
 func TestAbortStagingIdempotent(t *testing.T) {
 	s := newTestStore(t)
 	st, _ := s.CreateStagingFile(RootID)
-	s.AssignChunk(st.ID, 0, 10, []uint64{7})
+	s.AssignChunk(st.ID, 0, 10, []uint64{7}, 0)
 	if err := s.AbortStaging(st.ID); err != nil {
 		t.Fatalf("AbortStaging: %v", err)
 	}

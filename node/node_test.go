@@ -386,11 +386,11 @@ func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 func TestStoreObjectOverwriteKeepsOldOnFailure(t *testing.T) {
 	n, _ := newTestNode(t)
 	// 先落一个正式对象。
-	if _, err := n.storeObject(7, bytes.NewReader([]byte("old"))); err != nil {
+	if _, _, err := n.storeObject(7, bytes.NewReader([]byte("old")), 0); err != nil {
 		t.Fatal(err)
 	}
 	// 模拟中途断流：Reader 第一次读就报错。
-	if _, err := n.storeObject(7, errReader{}); err == nil {
+	if _, _, err := n.storeObject(7, errReader{}, 0); err == nil {
 		t.Fatal("写入应失败")
 	}
 	// 旧对象原样保留。
@@ -422,7 +422,7 @@ func TestStoreObjectOverwriteKeepsOldOnFailure(t *testing.T) {
 // TestInitUsedBytesCleansTmp 验证重启时清理 .tmp-* 残留且不计入用量。
 func TestInitUsedBytesCleansTmp(t *testing.T) {
 	n, _ := newTestNode(t)
-	if _, err := n.storeObject(1, bytes.NewReader([]byte("hello"))); err != nil {
+	if _, _, err := n.storeObject(1, bytes.NewReader([]byte("hello")), 0); err != nil {
 		t.Fatal(err)
 	}
 	// 手动放置一个崩溃残留的临时文件。

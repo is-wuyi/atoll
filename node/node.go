@@ -15,11 +15,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"crypto/tls"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"atoll/pkg/auth"
+	"atoll/pkg/types"
 )
 
 // Node 是一个存储节点实例。
@@ -76,6 +78,37 @@ func (n *Node) SetToken(t auth.Token) {
 	}
 }
 
+// SetTLS 给出站请求（master 交互 + 对等节点传输）装上 TLS 客户端配置。
+// 必须在 Register() 之前调用。cfg 为空则不启用（普通 HTTP）。
+func (n *Node) SetTLS(cfg *tls.Config) {
+	if cfg == nil {
+		return
+	}
+	setTLSOnTransport(n.httpClient.Transport, cfg)
+	setTLSOnTransport(n.bulkClient.Transport, cfg)
+}
+
+func setTLSOnTransport(rt http.RoundTripper, cfg *tls.Config) {
+	tr, ok := rt.(*auth.Transport)
+	if !ok {
+		return
+	}
+	base, ok := tr.Fallback.(*http.Transport)
+	if !ok {
+		base = http.DefaultTransport.(*http.Transport).Clone()
+		tr.Fallback = base
+	}
+	base.TLSClientConfig = cfg
+}
+
+// scheme 返回直连对等节点/源节点用的 URL scheme，从 masterURL 推导。
+func (n *Node) scheme() string {
+	if strings.HasPrefix(n.masterURL, "https://") {
+		return "https"
+	}
+	return "http"
+}
+
 // ---- 对象存储 HTTP API ----
 
 // Handler 返回对象存储路由（整体经 auth 包装，healthz 豁免）。
@@ -100,7 +133,7 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	size, err := n.storeObject(id, r.Body)
+	size, _, err := n.storeObject(id, r.Body, parseChecksumHeader(r))
 	if err != nil {
 		log.Printf("put object %d: %v", id, err)
 		httpError(w, http.StatusInternalServerError, "write object failed")
@@ -174,7 +207,7 @@ func (n *Node) pushObject(peerAddr string, inodeID uint64) error {
 	}
 	defer f.Close()
 	// io.NopCloser 包裹：防止 http transport 上传后关闭 *os.File（同 client.putObject）。
-	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://%s/replicate/%d", peerAddr, inodeID), io.NopCloser(f))
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("%s://%s/replicate/%d", n.scheme(), peerAddr, inodeID), io.NopCloser(f))
 	if err != nil {
 		return err
 	}
@@ -221,7 +254,7 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	size, err := n.storeObject(id, r.Body)
+	size, _, err := n.storeObject(id, r.Body, parseChecksumHeader(r))
 	if err != nil {
 		log.Printf("replicate object %d: %v", id, err)
 		httpError(w, http.StatusInternalServerError, "write object failed")
@@ -262,7 +295,7 @@ func (n *Node) handlePull(w http.ResponseWriter, r *http.Request) {
 // pullObject 后台从源节点拉取对象并落盘，完成后上报 master。
 func (n *Node) pullObject(inodeID uint64, sourceAddr string) {
 	defer n.pulling.Delete(inodeID)
-	url := fmt.Sprintf("http://%s/objects/%d", sourceAddr, inodeID)
+	url := fmt.Sprintf("%s://%s/objects/%d", n.scheme(), sourceAddr, inodeID)
 	resp, err := n.bulkClient.Get(url)
 	if err != nil {
 		log.Printf("pull %d from %s: %v", inodeID, sourceAddr, err)
@@ -273,7 +306,7 @@ func (n *Node) pullObject(inodeID uint64, sourceAddr string) {
 		log.Printf("pull %d from %s: status %d", inodeID, sourceAddr, resp.StatusCode)
 		return
 	}
-	size, err := n.storeObject(inodeID, resp.Body)
+	size, _, err := n.storeObject(inodeID, resp.Body, 0) // pull 源无期望值，读时由客户端按元数据校验
 	if err != nil {
 		log.Printf("pull %d: %v", inodeID, err)
 		return
@@ -287,10 +320,10 @@ func (n *Node) pullObject(inodeID uint64, sourceAddr string) {
 // storeObject 把 r 的内容安全落盘为对象 id：临时文件 → fsync → 原子改名。
 // fsync 保证掉电后文件内容完整，rename 前的数据才计入用量。
 // 返回写入字节数；失败时清理临时文件、不影响已有对象。
-func (n *Node) storeObject(id uint64, r io.Reader) (int64, error) {
+func (n *Node) storeObject(id uint64, r io.Reader, expectCRC uint32) (int64, uint32, error) {
 	objPath := n.objectPath(id)
 	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	// 覆盖写场景：先记下旧对象大小，成功后按差值计费。
 	var oldSize int64
@@ -299,28 +332,37 @@ func (n *Node) storeObject(id uint64, r io.Reader) (int64, error) {
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(objPath), ".tmp-*")
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	tmpName := tmp.Name()
-	size, err := io.Copy(tmp, r)
+	// 边写边算 CRC32C：落盘后与客户端声明的校验和比对，捕获上传途中损坏。
+	crc := types.NewCRC32C()
+	size, err := io.Copy(tmp, io.TeeReader(r, crc))
 	if err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
-		return 0, err
+		return 0, 0, err
+	}
+	got := crc.Sum32()
+	// 校验：调用方给了期望值且不符 → 拒绝落盘（不 rename，删临时文件）。
+	if expectCRC != 0 && got != expectCRC {
+		tmp.Close()
+		os.Remove(tmpName)
+		return 0, 0, fmt.Errorf("checksum mismatch: got %08x want %08x", got, expectCRC)
 	}
 	// 数据先落盘再改名：掉电后要么旧对象、要么新对象，绝不出现半份新对象。
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
-		return 0, err
+		return 0, 0, err
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
-		return 0, err
+		return 0, 0, err
 	}
 	if err := os.Rename(tmpName, objPath); err != nil {
 		os.Remove(tmpName)
-		return 0, err
+		return 0, 0, err
 	}
 	// fsync 父目录：POSIX 下 rename 的持久性依赖目录项落盘，否则掉电后
 	// "已 fsync 的新对象 + 已改名"仍可能整个消失。这是本系统唯一还缺的持久性缺口
@@ -333,7 +375,20 @@ func (n *Node) storeObject(id uint64, r io.Reader) (int64, error) {
 		dir.Close()
 	}
 	n.used.Add(size - oldSize)
-	return size, nil
+	return size, got, nil
+}
+
+// parseChecksumHeader 读取请求里的期望 CRC32C（缺失/非法返回 0 = 不校验）。
+func parseChecksumHeader(r *http.Request) uint32 {
+	v := r.Header.Get(types.ChecksumHeader)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseUint(v, 16, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(n)
 }
 
 // handleAdminObjects 返回本机全部对象的 ID 和大小，跳过 .tmp-* 临时文件。
@@ -421,6 +476,8 @@ func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// 整对象读：显式给出 Content-Length，客户端才能预知长度、检测截断。
+	w.Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
 	if _, err := io.Copy(w, f); err != nil {
 		log.Printf("serve object %d: %v", id, err)
 	}

@@ -26,7 +26,7 @@ func stageChunks(t *testing.T, s *Store, chunks [][2]int64) uint64 {
 		t.Fatalf("CreateStagingFile: %v", err)
 	}
 	for _, c := range chunks {
-		if _, err := s.AssignChunk(st.ID, int(c[0]), c[1], []uint64{1}); err != nil {
+		if _, err := s.AssignChunk(st.ID, int(c[0]), c[1], []uint64{1}, 0); err != nil {
 			t.Fatalf("AssignChunk %d: %v", c[0], err)
 		}
 		if err := s.MarkChunkDone(types.ChunkID(st.ID, int(c[0])), 1); err != nil {
@@ -98,7 +98,7 @@ func TestReplaceReplicaRejectsDuplicate(t *testing.T) {
 func TestReplaceChunkReplicaRejectsDuplicate(t *testing.T) {
 	s := openTestStore(t)
 	st, _ := s.CreateStagingFile(RootID)
-	if _, err := s.AssignChunk(st.ID, 0, 10, []uint64{1, 2}); err != nil {
+	if _, err := s.AssignChunk(st.ID, 0, 10, []uint64{1, 2}, 0); err != nil {
 		t.Fatalf("AssignChunk: %v", err)
 	}
 	if err := s.ReplaceChunkReplica(st.ID, 0, 1, 2); !errors.Is(err, ErrReplicaDup) {

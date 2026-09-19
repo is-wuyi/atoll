@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -108,26 +109,40 @@ func runMaster(args []string, stderr io.Writer) int {
 	repairIntv := fs.Duration("repair-interval", 15*time.Second, "副本修复扫描周期")
 	gcIntv := fs.Duration("gc-interval", 10*time.Minute, "GC 对账扫描周期")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
+	adminToken := fs.String("admin-token", envDefault("ATOLL_ADMIN_TOKEN", ""), "破坏性操作(/admin/gc)专用 token（空 = 回退用集群 token）")
+	tlsCert := fs.String("tls-cert", "", "TLS 证书文件（配 -tls-key 后 master 走 https）")
+	tlsKey := fs.String("tls-key", "", "TLS 私钥文件")
+	tlsCA := fs.String("tls-ca", "", "校验节点证书用的 CA（出站到节点走 https 时）")
+	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过节点证书校验（自签名内网）")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	outTLS, err := clientTLS(*tlsCA, *tlsSkip)
+	if err != nil {
+		fmt.Fprintf(stderr, "atoll master: %v\n", err)
+		return 1
 	}
 	store, err := meta.Open(*dbPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "atoll master: %v\n", err)
 		return 1
 	}
-	defer store.Close()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	scanner := master.NewScanner(store, *nodeMaxAge, *repairIntv, *gcIntv)
 	scanner.SetToken(auth.Token(*token))
+	scanner.SetTLS(outTLS)
 	scanner.Start(ctx) // 内部为三个循环各起 goroutine
+	// 关闭顺序：等扫描器 goroutine 全部退出后再关 store，避免关库时扫描器仍在读写。
+	defer func() { scanner.Wait(); store.Close() }()
 
 	srv := master.NewServer(store, *nodeMaxAge)
 	srv.SetScanner(scanner)
 	srv.SetToken(auth.Token(*token))
+	srv.SetAdminToken(auth.Token(*adminToken))
+	srv.SetTLS(outTLS)
 	httpSrv := &http.Server{Addr: *listen, Handler: srv.Handler()}
 	go func() {
 		<-ctx.Done() // SIGTERM/SIGINT：NotifyContext 拦截了默认终止行为，必须显式退出
@@ -135,12 +150,29 @@ func runMaster(args []string, stderr io.Writer) int {
 		defer cancel()
 		httpSrv.Shutdown(shutdownCtx)
 	}()
-	log.Printf("atoll master listening on %s (db=%s)", *listen, *dbPath)
-	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
-		fmt.Fprintf(stderr, "atoll master: %v\n", err)
+	serveErr := serve(httpSrv, *tlsCert, *tlsKey, stderr, fmt.Sprintf("atoll master listening on %s (db=%s)", *listen, *dbPath))
+	if serveErr != nil {
+		fmt.Fprintf(stderr, "atoll master: %v\n", serveErr)
 		return 1
 	}
 	return 0
+}
+
+// serve 启动 HTTP 或 HTTPS 服务：cert+key 都非空则 ListenAndServeTLS。
+// 返回非 ErrServerClosed 的错误；正常关闭返回 nil。
+func serve(srv *http.Server, certFile, keyFile string, stderr io.Writer, banner string) error {
+	var err error
+	if certFile != "" && keyFile != "" {
+		log.Printf("%s [TLS]", banner)
+		err = srv.ListenAndServeTLS(certFile, keyFile)
+	} else {
+		log.Printf("%s", banner)
+		err = srv.ListenAndServe()
+	}
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
 }
 
 // ---- node ----
@@ -154,8 +186,17 @@ func runNode(args []string, stderr io.Writer) int {
 	dataDir := fs.String("data-dir", "./node-data", "对象存储目录")
 	totalBytes := fs.Int64("total-bytes", 100<<30, "声明容量（字节）")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
+	tlsCert := fs.String("tls-cert", "", "TLS 证书文件（配 -tls-key 后 node 走 https）")
+	tlsKey := fs.String("tls-key", "", "TLS 私钥文件")
+	tlsCA := fs.String("tls-ca", "", "校验 master/对等节点证书用的 CA")
+	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	outTLS, err := clientTLS(*tlsCA, *tlsSkip)
+	if err != nil {
+		fmt.Fprintf(stderr, "atoll node: %v\n", err)
+		return 1
 	}
 	adv := *advertise
 	if adv == "" {
@@ -171,6 +212,7 @@ func runNode(args []string, stderr io.Writer) int {
 	}
 	n := node.New(*dataDir, *masterURL, adv, *totalBytes)
 	n.SetToken(auth.Token(*token))
+	n.SetTLS(outTLS)
 	if err := n.InitUsedBytes(); err != nil {
 		fmt.Fprintf(stderr, "atoll node: %v\n", err)
 		return 1
@@ -192,8 +234,7 @@ func runNode(args []string, stderr io.Writer) int {
 		defer cancel()
 		httpSrv.Shutdown(shutdownCtx)
 	}()
-	log.Printf("atoll node listening on %s (data=%s)", *listen, *dataDir)
-	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
+	if err := serve(httpSrv, *tlsCert, *tlsKey, stderr, fmt.Sprintf("atoll node listening on %s (data=%s)", *listen, *dataDir)); err != nil {
 		fmt.Fprintf(stderr, "atoll node: %v\n", err)
 		return 1
 	}
@@ -210,6 +251,8 @@ func runMount(args []string, stderr io.Writer) int {
 	cacheDir := fset.String("cache", filepath.Join(os.TempDir(), "atoll-cache"), "写缓冲临时目录")
 	debug := fset.Bool("debug", false, "输出 FUSE 调试日志")
 	token := fset.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
+	tlsCA := fset.String("tls-ca", "", "校验服务端证书用的 CA（master 走 https 时）")
+	tlsSkip := fset.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
 	if err := fset.Parse(args); err != nil {
 		return 2
 	}
@@ -217,14 +260,19 @@ func runMount(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "用法: atoll mount [-cache 目录] <挂载点>")
 		return 2
 	}
+	tlsCfg, err := clientTLS(*tlsCA, *tlsSkip)
+	if err != nil {
+		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
+		return 1
+	}
 	mountPoint := fset.Arg(0)
 	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
 		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
 		return 1
 	}
 
-	c := client.NewWithToken(*masterURL, auth.Token(*token))
-	m, err := mount.NewWithToken(c, *cacheDir, *replicas, auth.Token(*token))
+	c := client.NewWithTLS(*masterURL, auth.Token(*token), tlsCfg)
+	m, err := mount.NewWithTLS(c, *cacheDir, *replicas, auth.Token(*token), tlsCfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
 		return 1
@@ -266,10 +314,17 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	minCopies := fs.Int("min-copies", 0, "put 提交前每块需落盘的副本数下限（0=仅主副本，最快；=replicas 则等全部副本，最稳）")
 	force := fs.Bool("f", false, "强制覆盖远程已存在的同名文件（仅 put 使用）")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
+	tlsCA := fs.String("tls-ca", "", "校验服务端证书用的 CA（master 走 https 时）")
+	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	c := client.NewWithToken(*masterURL, auth.Token(*token))
+	tlsCfg, err := clientTLS(*tlsCA, *tlsSkip)
+	if err != nil {
+		fmt.Fprintf(stderr, "atoll %s: %v\n", cmd, err)
+		return 1
+	}
+	c := client.NewWithTLS(*masterURL, auth.Token(*token), tlsCfg)
 
 	switch cmd {
 	case "put":
@@ -363,10 +418,23 @@ func runGC(args []string, stdout, stderr io.Writer) int {
 	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
 	execute := fs.Bool("execute", false, "执行删除（默认仅 dry-run）")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
+	adminToken := fs.String("admin-token", envDefault("ATOLL_ADMIN_TOKEN", ""), "破坏性操作专用 token（master 配了 admin token 时必需）")
+	tlsCA := fs.String("tls-ca", "", "校验服务端证书用的 CA（master 走 https 时）")
+	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	c := client.NewWithToken(*masterURL, auth.Token(*token))
+	tlsCfg, err := clientTLS(*tlsCA, *tlsSkip)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc: %v\n", err)
+		return 1
+	}
+	// gc 只打 /admin/gc（破坏性）：优先用 admin token，未设则回退集群 token。
+	tok := *adminToken
+	if tok == "" {
+		tok = *token
+	}
+	c := client.NewWithTLS(*masterURL, auth.Token(tok), tlsCfg)
 	reports, err := c.GC(*execute)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc 失败: %v\n", err)
@@ -374,21 +442,23 @@ func runGC(args []string, stdout, stderr io.Writer) int {
 	}
 	totalOrphans := 0
 	totalBytes := int64(0)
+	totalDeleted := 0
 	for _, r := range reports {
 		totalOrphans += r.OrphanCount
 		totalBytes += r.OrphanBytes
+		totalDeleted += r.Deleted
 		if r.OrphanCount > 0 {
 			fmt.Fprintf(stdout, "节点 %d (%s): %d 个孤儿, %d 字节\n", r.NodeID, r.NodeAddr, r.OrphanCount, r.OrphanBytes)
 		}
 	}
 	if totalOrphans == 0 {
 		fmt.Fprintln(stdout, "无孤儿对象")
+	} else if *execute {
+		// 打印真实删除数，而非孤儿总数。两轮确认下首轮删除 0（本轮登记、下轮才删），
+		// 此前直接把孤儿总数当"已删除"会误导。
+		fmt.Fprintf(stdout, "发现 %d 个孤儿（共 %d 字节），本轮已删除 %d 个\n", totalOrphans, totalBytes, totalDeleted)
 	} else {
-		action := "发现"
-		if *execute {
-			action = "已删除"
-		}
-		fmt.Fprintf(stdout, "%s %d 个孤儿, 共 %d 字节\n", action, totalOrphans, totalBytes)
+		fmt.Fprintf(stdout, "发现 %d 个孤儿, 共 %d 字节（dry-run 未删除）\n", totalOrphans, totalBytes)
 	}
 	return 0
 }
@@ -398,6 +468,14 @@ func envDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// clientTLS 从 -tls-ca/-tls-skip-verify 构建出站 TLS 配置；两者都空则返回 nil（普通 HTTP）。
+func clientTLS(caFile string, skipVerify bool) (*tls.Config, error) {
+	if caFile == "" && !skipVerify {
+		return nil, nil
+	}
+	return auth.ClientTLS(caFile, skipVerify)
 }
 
 // humanSize 人类可读的字节数（KiB/MiB/GiB）。
