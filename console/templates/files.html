@@ -19,7 +19,7 @@
         <div class="section-head"><h2>目录内容</h2><span class="count">{{len .Entries}} 项</span></div>
         <div class="panel">
           <table>
-            <thead><tr><th>名称</th><th>类型</th><th class="num">大小</th><th>冗余</th><th>状态</th></tr></thead>
+            <thead><tr><th>名称</th><th>类型</th><th class="num">大小</th><th>冗余</th><th>状态</th>{{if .IsAdmin}}<th></th>{{end}}</tr></thead>
             <tbody>
             {{range .Entries}}
               <tr>
@@ -35,9 +35,18 @@
                   {{else if .Degraded}}<span class="dot bad"></span><span class="status-txt bad">降级</span>
                   {{else}}<span class="dot ok"></span><span class="status-txt ok">健康</span>{{end}}
                 </td>
+                {{if $.IsAdmin}}<td class="num">
+                  {{if not .IsDir}}
+                  <form method="post" action="/files/delete" onsubmit="return confirm('确认删除 {{.Path}}？此操作不可撤销。');" style="margin:0">
+                    <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                    <input type="hidden" name="path" value="{{.Path}}">
+                    <button type="submit" class="btn-danger">删除</button>
+                  </form>
+                  {{end}}
+                </td>{{end}}
               </tr>
             {{else}}
-              <tr><td colspan="5" class="empty">空目录</td></tr>
+              <tr><td colspan="{{if .IsAdmin}}6{{else}}5{{end}}" class="empty">空目录</td></tr>
             {{end}}
             </tbody>
           </table>

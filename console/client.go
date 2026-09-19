@@ -165,3 +165,21 @@ func (c *masterClient) children(path string) ([]types.Inode, error) {
 	err := c.getJSON("/dirs/children?"+url.Values{"path": {path}}.Encode(), &kids)
 	return kids, err
 }
+
+// deleteEntry 删除文件/空目录（master DELETE /entry）。走 adminHTTP（破坏性）。
+func (c *masterClient) deleteEntry(path string) error {
+	req, err := http.NewRequest(http.MethodDelete, c.base+"/entry?"+url.Values{"path": {path}}.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.adminHTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("delete %s: %d %s", path, resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}

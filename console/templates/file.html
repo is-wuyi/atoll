@@ -12,8 +12,16 @@
   <div class="main">
     {{template "topbar" .}}
     <div class="content">
-      <div class="breadcrumb">
-        {{range .Crumbs}}<a href="/files?path={{.Path}}">{{.Name}}</a> / {{end}}<b>{{.Name}}</b>
+      <div class="breadcrumb" style="display:flex;align-items:center">
+        <span>{{range .Crumbs}}<a href="/files?path={{.Path}}">{{.Name}}</a> / {{end}}<b>{{.Name}}</b></span>
+        {{if .IsAdmin}}
+        <span style="flex:1"></span>
+        <form method="post" action="/files/delete" onsubmit="return confirm('确认删除 {{.FullPath}}？此操作不可撤销。');" style="margin:0">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <input type="hidden" name="path" value="{{.FullPath}}">
+          <button type="submit" class="btn-danger">删除文件</button>
+        </form>
+        {{end}}
       </div>
 
       <div class="section">

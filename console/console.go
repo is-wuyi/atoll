@@ -77,6 +77,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /nodes", s.requireAuth(s.handleNodes))
 	mux.HandleFunc("GET /files", s.requireAuth(s.handleFiles))
 	mux.HandleFunc("GET /file", s.requireAuth(s.handleFile))
+	mux.HandleFunc("POST /files/delete", s.requireAuth(s.handleFileDelete))
 	mux.HandleFunc("GET /integrity", s.requireAuth(s.handleIntegrity))
 	mux.HandleFunc("GET /gc", s.requireAuth(s.handleGC))
 	mux.HandleFunc("POST /gc/execute", s.requireAuth(s.handleGCExecute))

@@ -79,13 +79,17 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
-func (s *Server) renderError(w http.ResponseWriter, sess session, msg, detail string) {
+func (s *Server) renderError(w http.ResponseWriter, sess session, code int, msg, detail string) {
 	d := newPageBase("", "出错", sess)
-	s.render(w, "error", struct {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(code)
+	if err := s.tpl.ExecuteTemplate(w, "error", struct {
 		pageBase
 		Message string
 		Detail  string
-	}{d, msg, detail})
+	}{d, msg, detail}); err != nil {
+		http.Error(w, "template error", http.StatusInternalServerError)
+	}
 }
 
 // ---- 概览 ----
@@ -93,12 +97,12 @@ func (s *Server) renderError(w http.ResponseWriter, sess session, msg, detail st
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request, sess session) {
 	ov, err := s.mc.overview()
 	if err != nil {
-		s.renderError(w, sess, "无法连接 master", err.Error())
+		s.renderError(w, sess, http.StatusBadGateway, "无法连接 master", err.Error())
 		return
 	}
 	nodes, err := s.mc.nodes()
 	if err != nil {
-		s.renderError(w, sess, "无法读取节点列表", err.Error())
+		s.renderError(w, sess, http.StatusBadGateway, "无法读取节点列表", err.Error())
 		return
 	}
 	s.render(w, "overview", struct {
@@ -113,7 +117,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request, sess ses
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, sess session) {
 	nodes, err := s.mc.nodes()
 	if err != nil {
-		s.renderError(w, sess, "无法读取节点列表", err.Error())
+		s.renderError(w, sess, http.StatusBadGateway, "无法读取节点列表", err.Error())
 		return
 	}
 	s.render(w, "nodes", struct {
@@ -183,7 +187,7 @@ func (s *Server) handleSoon(topic string) func(http.ResponseWriter, *http.Reques
 func (s *Server) handleIntegrity(w http.ResponseWriter, r *http.Request, sess session) {
 	items, err := s.mc.integrity()
 	if err != nil {
-		s.renderError(w, sess, "无法读取完整性信息", err.Error())
+		s.renderError(w, sess, http.StatusBadGateway, "无法读取完整性信息", err.Error())
 		return
 	}
 	snap, _ := s.mc.repairs() // 修复退避概况（失败不致命，degraded 已够看）
@@ -199,7 +203,7 @@ func (s *Server) handleIntegrity(w http.ResponseWriter, r *http.Request, sess se
 func (s *Server) handleGC(w http.ResponseWriter, r *http.Request, sess session) {
 	reports, err := s.mc.gc(false) // dry-run
 	if err != nil {
-		s.renderError(w, sess, "无法读取 GC 报告", err.Error())
+		s.renderError(w, sess, http.StatusBadGateway, "无法读取 GC 报告", err.Error())
 		return
 	}
 	var totalOrphans int
@@ -221,7 +225,7 @@ func (s *Server) handleGC(w http.ResponseWriter, r *http.Request, sess session) 
 // handleGCExecute POST /gc/execute —— 执行删除。仅 admin，需 CSRF。
 func (s *Server) handleGCExecute(w http.ResponseWriter, r *http.Request, sess session) {
 	if sess.Role != RoleAdmin {
-		s.renderError(w, sess, "权限不足", "只有 admin 角色可以执行垃圾回收删除")
+		s.renderError(w, sess, http.StatusForbidden, "权限不足", "只有 admin 角色可以执行垃圾回收删除")
 		return
 	}
 	if r.FormValue("csrf") != sess.CSRF {
@@ -230,7 +234,7 @@ func (s *Server) handleGCExecute(w http.ResponseWriter, r *http.Request, sess se
 	}
 	reports, err := s.mc.gc(true)
 	if err != nil {
-		s.renderError(w, sess, "GC 执行失败", err.Error())
+		s.renderError(w, sess, http.StatusBadGateway, "GC 执行失败", err.Error())
 		return
 	}
 	var totalOrphans, deleted int
@@ -289,7 +293,7 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request, sess sessio
 	}
 	kids, err := s.mc.children(p)
 	if err != nil {
-		s.renderError(w, sess, "无法读取目录", err.Error())
+		s.renderError(w, sess, http.StatusBadGateway, "无法读取目录", err.Error())
 		return
 	}
 	nodes, _ := s.mc.nodes()
@@ -317,6 +321,29 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request, sess sessio
 	}{newPageBase("files", "文件", sess), crumbs(p), entries})
 }
 
+// handleFileDelete POST /files/delete —— 删除文件。仅 admin，需 CSRF。
+// 删完回到所在目录列表。
+func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request, sess session) {
+	if sess.Role != RoleAdmin {
+		s.renderError(w, sess, http.StatusForbidden, "权限不足", "只有 admin 角色可以删除文件")
+		return
+	}
+	if r.FormValue("csrf") != sess.CSRF {
+		http.Error(w, "csrf mismatch", http.StatusForbidden)
+		return
+	}
+	p := r.FormValue("path")
+	if p == "" {
+		s.renderError(w, sess, http.StatusBadRequest, "缺少路径", "未指定要删除的文件")
+		return
+	}
+	if err := s.mc.deleteEntry(p); err != nil {
+		s.renderError(w, sess, http.StatusBadGateway, "删除失败", err.Error())
+		return
+	}
+	http.Redirect(w, r, "/files?path="+parentPath(p), http.StatusSeeOther)
+}
+
 // ---- 文件详情（块 × 副本矩阵） ----
 
 type matrixCol struct {
@@ -340,7 +367,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request, sess session
 	p := r.URL.Query().Get("path")
 	in, reps, err := s.mc.lookup(p)
 	if err != nil {
-		s.renderError(w, sess, "无法读取文件", err.Error())
+		s.renderError(w, sess, http.StatusBadGateway, "无法读取文件", err.Error())
 		return
 	}
 	nodes, _ := s.mc.nodes()
@@ -351,6 +378,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request, sess session
 		pageBase
 		Crumbs   []crumb
 		Name     string
+		FullPath string
 		Inode    uint64
 		Size     int64
 		Chunked  bool
@@ -362,6 +390,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request, sess session
 		pageBase: newPageBase("files", "文件详情", sess),
 		Crumbs:   crumbs(parentPath(p)),
 		Name:     baseName(p),
+		FullPath: p,
 		Inode:    in.ID,
 		Size:     in.Size,
 		Chunked:  in.Chunked,
