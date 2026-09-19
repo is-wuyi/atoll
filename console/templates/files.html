@@ -1,0 +1,50 @@
+{{define "files"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 文件</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  {{template "sidebar" .}}
+  <div class="main">
+    {{template "topbar" .}}
+    <div class="content">
+      <div class="breadcrumb">
+        {{range .Crumbs}}<a href="/files?path={{.Path}}">{{.Name}}</a> / {{end}}
+      </div>
+      <div class="section">
+        <div class="section-head"><h2>目录内容</h2><span class="count">{{len .Entries}} 项</span></div>
+        <div class="panel">
+          <table>
+            <thead><tr><th>名称</th><th>类型</th><th class="num">大小</th><th>冗余</th><th>状态</th></tr></thead>
+            <tbody>
+            {{range .Entries}}
+              <tr>
+                <td>
+                  {{if .IsDir}}<a href="/files?path={{.Path}}">▸ {{.Name}}</a>
+                  {{else}}<a href="/file?path={{.Path}}">{{.Name}}</a>{{end}}
+                </td>
+                <td class="row-type">{{if .IsDir}}目录{{else if .Chunked}}分块文件{{else}}文件{{end}}</td>
+                <td class="num">{{if .IsDir}}—{{else}}{{bytes .Size}}{{end}}</td>
+                <td>{{if .IsDir}}—{{else}}<span class="badge">副本 ×{{.Replicas}}</span>{{end}}</td>
+                <td>
+                  {{if .IsDir}}—
+                  {{else if .Degraded}}<span class="dot bad"></span><span class="status-txt bad">降级</span>
+                  {{else}}<span class="dot ok"></span><span class="status-txt ok">健康</span>{{end}}
+                </td>
+              </tr>
+            {{else}}
+              <tr><td colspan="5" class="empty">空目录</td></tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>{{end}}

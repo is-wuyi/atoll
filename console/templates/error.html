@@ -1,0 +1,23 @@
+{{define "error"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 出错</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  {{template "sidebar" .}}
+  <div class="main">
+    {{template "topbar" .}}
+    <div class="content">
+      <div class="panel"><div class="empty">
+        <p style="color:var(--bad);font-size:15px">{{.Message}}</p>
+        <p class="hint">{{.Detail}}</p>
+      </div></div>
+    </div>
+  </div>
+</div>
+</body>
+</html>{{end}}

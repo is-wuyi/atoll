@@ -1,0 +1,80 @@
+{{define "file"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 文件详情</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  {{template "sidebar" .}}
+  <div class="main">
+    {{template "topbar" .}}
+    <div class="content">
+      <div class="breadcrumb">
+        {{range .Crumbs}}<a href="/files?path={{.Path}}">{{.Name}}</a> / {{end}}<b>{{.Name}}</b>
+      </div>
+
+      <div class="section">
+        <div class="panel">
+          <div class="meta-row">
+            <div class="item"><div class="k">大小</div><div class="v mono">{{bytes .Size}}</div></div>
+            <div class="item"><div class="k">存储模型</div><div class="v">{{if .Chunked}}<span class="badge blue">分块</span> {{len .Chunks}} 块{{else}}<span class="badge">整对象</span>{{end}}</div></div>
+            <div class="item"><div class="k">冗余策略</div><div class="v"><span class="badge">副本 ×{{.ReplicaN}}</span></div></div>
+            <div class="item"><div class="k">inode</div><div class="v mono">{{.Inode}}</div></div>
+            <div class="item"><div class="k">整体状态</div><div class="v">{{if .Degraded}}<span class="dot bad"></span><span class="status-txt bad">降级</span>{{else}}<span class="dot ok"></span><span class="status-txt ok">健康</span>{{end}}</div></div>
+          </div>
+        </div>
+      </div>
+
+      {{if .Chunked}}
+      <div class="section">
+        <div class="section-head"><h2>块 × 副本 放置健康</h2><span class="count">{{len .Chunks}} 块 · {{len .Cols}} 节点</span></div>
+        <div class="panel" style="padding:16px 18px">
+          <div class="matrix-wrap">
+            <table class="matrix">
+              <thead>
+                <tr><th class="rowh">块 \ 节点</th>{{range .Cols}}<th>node {{.ID}}{{if not .Alive}} ⚠{{end}}</th>{{end}}</tr>
+              </thead>
+              <tbody>
+              {{range .Chunks}}
+                <tr><th class="rowh">#{{.Index}}</th>
+                  {{range .Cells}}<td><div class="cell {{.Class}}">{{.Label}}</div></td>{{end}}
+                </tr>
+              {{end}}
+              </tbody>
+            </table>
+          </div>
+          <div class="legend">
+            <span><i style="background:#16a34a"></i> 主副本已落盘</span>
+            <span><i style="background:#6cc48f"></i> 从副本已落盘</span>
+            <span><i style="background:#d97706"></i> 同步中</span>
+            <span><i style="background:#dc2626"></i> 缺失（节点宕机）</span>
+            <span><i style="background:#eceef0"></i> 未分配到此节点</span>
+          </div>
+        </div>
+      </div>
+      {{else}}
+      <div class="section">
+        <div class="section-head"><h2>副本放置</h2></div>
+        <div class="panel">
+          <table>
+            <thead><tr><th>节点</th><th>地址</th><th>状态</th></tr></thead>
+            <tbody>
+            {{range .Cols}}
+              <tr>
+                <td class="mono">node {{.ID}}</td><td class="mono">{{.Addr}}</td>
+                <td>{{if .Done}}<span class="dot ok"></span>已落盘{{else if .Alive}}<span class="dot warn"></span>同步中{{else}}<span class="dot bad"></span>缺失{{end}}</td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {{end}}
+    </div>
+  </div>
+</div>
+</body>
+</html>{{end}}

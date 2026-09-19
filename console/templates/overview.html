@@ -1,0 +1,67 @@
+{{define "overview"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 概览</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  {{template "sidebar" .}}
+  <div class="main">
+    {{template "topbar" .}}
+    <div class="content">
+      <div class="cards">
+        <div class="card">
+          <div class="label">存储节点</div>
+          <div class="value">{{.O.NodesAlive}}<small> / {{.O.NodesTotal}}</small></div>
+          <div class="sub"><span class="dot ok"></span>{{.O.NodesAlive}} 存活 · <span class="dot bad"></span>{{sub .O.NodesTotal .O.NodesAlive}} 宕机</div>
+        </div>
+        <div class="card">
+          <div class="label">集群容量</div>
+          <div class="value">{{bytes .O.UsedBytes}}<small> / {{bytes .O.TotalBytes}}</small></div>
+          <div class="bar {{barClass (pct .O.UsedBytes .O.TotalBytes)}}"><span style="width:{{pct .O.UsedBytes .O.TotalBytes}}%"></span></div>
+        </div>
+        <div class="card">
+          <div class="label">文件 / 对象</div>
+          <div class="value">{{.O.Files}}</div>
+          <div class="sub">{{.O.Objects}} 个块对象 · {{.O.Staging}} 个上传中</div>
+        </div>
+        <div class="card {{if gt .O.DegradedFiles 0}}attn{{end}}">
+          <div class="label">降级文件</div>
+          <div class="value">{{.O.DegradedFiles}}</div>
+          <div class="sub">{{if gt .O.DegradedFiles 0}}存在副本不足的块，需关注{{else}}全部副本健康{{end}}</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-head">
+          <h2>存储节点</h2><span class="count">{{len .Nodes}} 个</span>
+          <span class="spacer"></span><a href="/nodes">查看全部 →</a>
+        </div>
+        <div class="panel">
+          <table>
+            <thead><tr><th>状态</th><th>ID</th><th>地址</th><th>容量使用</th><th class="num">空闲</th><th>最后心跳</th></tr></thead>
+            <tbody>
+            {{range .Nodes}}
+              <tr {{if not .Alive}}style="opacity:.6"{{end}}>
+                <td>{{if .Alive}}<span class="dot ok"></span><span class="status-txt ok">存活</span>{{else}}<span class="dot bad"></span><span class="status-txt bad">宕机</span>{{end}}</td>
+                <td class="mono">{{.ID}}</td>
+                <td class="mono">{{.Addr}}</td>
+                <td><span class="minibar"><span class="track"><span class="{{barClass .UsedPercent}}" style="width:{{printf "%.0f" .UsedPercent}}%"></span></span><span class="pct">{{printf "%.0f" .UsedPercent}}%</span></span></td>
+                <td class="num">{{bytes .FreeBytes}}</td>
+                <td>{{since .LastHeartbeat}}</td>
+              </tr>
+            {{else}}
+              <tr><td colspan="6" class="empty">暂无注册节点</td></tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>{{end}}

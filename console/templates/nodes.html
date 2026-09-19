@@ -1,0 +1,42 @@
+{{define "nodes"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 节点</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  {{template "sidebar" .}}
+  <div class="main">
+    {{template "topbar" .}}
+    <div class="content">
+      <div class="section">
+        <div class="section-head"><h2>存储节点</h2><span class="count">{{len .Nodes}} 个</span></div>
+        <div class="panel">
+          <table>
+            <thead><tr><th>状态</th><th>ID</th><th>地址</th><th>容量使用</th><th class="num">已用</th><th class="num">总量</th><th>最后心跳</th></tr></thead>
+            <tbody>
+            {{range .Nodes}}
+              <tr {{if not .Alive}}style="opacity:.6"{{end}}>
+                <td>{{if .Alive}}<span class="dot ok"></span><span class="status-txt ok">存活</span>{{else}}<span class="dot bad"></span><span class="status-txt bad">宕机</span>{{end}}</td>
+                <td class="mono">{{.ID}}</td>
+                <td class="mono">{{.Addr}}</td>
+                <td><span class="minibar"><span class="track"><span class="{{barClass .UsedPercent}}" style="width:{{printf "%.0f" .UsedPercent}}%"></span></span><span class="pct">{{printf "%.0f" .UsedPercent}}%</span></span></td>
+                <td class="num">{{bytes .UsedBytes}}</td>
+                <td class="num">{{bytes .TotalBytes}}</td>
+                <td>{{since .LastHeartbeat}}</td>
+              </tr>
+            {{else}}
+              <tr><td colspan="7" class="empty">暂无注册节点</td></tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>{{end}}

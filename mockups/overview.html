@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 概览</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">A</div>
+      <div class="name">Atoll<small>管理后台</small></div>
+    </div>
+    <nav class="nav">
+      <a class="active" href="overview.html"><span class="ico">◎</span> 概览</a>
+      <a href="#"><span class="ico">▤</span> 节点</a>
+      <a href="file-detail.html"><span class="ico">▧</span> 文件</a>
+      <a href="#"><span class="ico">✓</span> 完整性与修复</a>
+      <a href="#"><span class="ico">⌫</span> 垃圾回收</a>
+      <div class="nav-group-label">路线图</div>
+      <a class="soon"><span class="ico">◔</span> 用户与租户 <span class="tag-soon">Soon</span></a>
+      <a class="soon"><span class="ico">⇄</span> 协议网关 (SMB) <span class="tag-soon">Soon</span></a>
+      <a class="soon"><span class="ico">▚</span> 冗余策略 (EC) <span class="tag-soon">Soon</span></a>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <h1>概览</h1>
+      <div class="spacer"></div>
+      <div class="ns-switch">命名空间 <b>default</b> ▾</div>
+      <div class="user-menu"><span class="avatar">W</span> admin ▾</div>
+    </header>
+
+    <div class="content">
+      <div class="cards">
+        <div class="card">
+          <div class="label">存储节点</div>
+          <div class="value">3<small> / 4</small></div>
+          <div class="sub"><span class="dot ok"></span>3 存活 · <span class="dot bad"></span>1 宕机</div>
+        </div>
+        <div class="card">
+          <div class="label">集群容量</div>
+          <div class="value">1.9<small> / 3.0 TiB</small></div>
+          <div class="bar warn"><span style="width:63%"></span></div>
+        </div>
+        <div class="card">
+          <div class="label">文件 / 对象</div>
+          <div class="value">1,284</div>
+          <div class="sub">4,102 个块对象 · 2 个上传中</div>
+        </div>
+        <div class="card attn">
+          <div class="label">降级文件</div>
+          <div class="value">3</div>
+          <div class="sub">存在副本不足的块，需关注</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-head">
+          <h2>存储节点</h2>
+          <span class="count">4 个</span>
+          <span class="spacer"></span>
+          <a href="#">查看全部 →</a>
+        </div>
+        <div class="panel">
+          <table>
+            <thead>
+              <tr>
+                <th>状态</th><th>ID</th><th>地址</th><th>容量使用</th>
+                <th class="num">对象</th><th>最后心跳</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="dot ok"></span><span class="status-txt ok">存活</span></td>
+                <td class="mono">1</td><td class="mono">10.0.0.11:9421</td>
+                <td><span class="minibar"><span class="track"><span style="width:58%"></span></span><span class="pct">58%</span></span></td>
+                <td class="num">1,402</td><td>2 秒前</td>
+              </tr>
+              <tr>
+                <td><span class="dot ok"></span><span class="status-txt ok">存活</span></td>
+                <td class="mono">2</td><td class="mono">10.0.0.12:9421</td>
+                <td><span class="minibar"><span class="track"><span class="warn" style="width:79%"></span></span><span class="pct">79%</span></span></td>
+                <td class="num">1,377</td><td>1 秒前</td>
+              </tr>
+              <tr>
+                <td><span class="dot ok"></span><span class="status-txt ok">存活</span></td>
+                <td class="mono">3</td><td class="mono">10.0.0.13:9421</td>
+                <td><span class="minibar"><span class="track"><span style="width:51%"></span></span><span class="pct">51%</span></span></td>
+                <td class="num">1,323</td><td>4 秒前</td>
+              </tr>
+              <tr style="opacity:.6">
+                <td><span class="dot bad"></span><span class="status-txt bad">宕机</span></td>
+                <td class="mono">4</td><td class="mono">10.0.0.14:9421</td>
+                <td><span class="minibar"><span class="track"><span class="bad" style="width:44%"></span></span><span class="pct">44%</span></span></td>
+                <td class="num">1,190</td><td>3 分钟前</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-head">
+          <h2>降级块</h2>
+          <span class="count">2 处正在追踪</span>
+          <span class="spacer"></span>
+          <a href="#">完整性与修复 →</a>
+        </div>
+        <div class="panel">
+          <table>
+            <thead>
+              <tr><th>文件</th><th>块</th><th>健康副本</th><th>降级时长</th><th>状态</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono">/backups/db-2026.tar</td>
+                <td class="mono">#2</td>
+                <td><span class="status-txt bad">1 / 3</span></td>
+                <td>3 分 12 秒</td>
+                <td><span class="dot warn"></span>已触发修复，等待源</td>
+              </tr>
+              <tr>
+                <td class="mono">/media/raw/clip-88.mov</td>
+                <td class="mono">#17</td>
+                <td><span class="status-txt warn">2 / 3</span></td>
+                <td>48 秒</td>
+                <td><span class="dot warn"></span>后台复制中</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="hint">降级追踪来自修复扫描器：某块「已落盘且节点存活」的去重副本数 &lt; 目标副本数时在此列出——把"单副本裸奔"变成可见。</p>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

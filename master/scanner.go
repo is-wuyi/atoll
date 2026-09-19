@@ -93,6 +93,32 @@ func (s *Scanner) Start(ctx context.Context) {
 // runMaster 在关闭 store 前调用它，避免扫描器还在用 store 时库被关闭。
 func (s *Scanner) Wait() { s.wg.Wait() }
 
+// DegradedEntry 是一条降级块记录快照（供管理后台展示）。
+type DegradedEntry struct {
+	ChunkID uint64    `json:"chunk_id"`
+	Since   time.Time `json:"since"`
+	Warned  bool      `json:"warned"` // 是否已越过告警阈值
+}
+
+// RepairSnapshot 是扫描器内部状态的只读快照（管理后台 read-model）。
+type RepairSnapshot struct {
+	Degraded    []DegradedEntry `json:"degraded"`     // 当前处于降级窗口的块
+	FailStreaks int             `json:"fail_streaks"` // 正在退避重试的修复目标数
+}
+
+// Snapshot 返回扫描器内部状态的只读快照。加锁拷贝，不暴露内部 map。
+func (s *Scanner) Snapshot() RepairSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := RepairSnapshot{FailStreaks: len(s.failStreak)}
+	for id, since := range s.degradedSince {
+		out.Degraded = append(out.Degraded, DegradedEntry{
+			ChunkID: id, Since: since, Warned: s.degradedWarn[id],
+		})
+	}
+	return out
+}
+
 // runDeathMonitor 死亡判定：10s 周期。
 func (s *Scanner) runDeathMonitor(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)

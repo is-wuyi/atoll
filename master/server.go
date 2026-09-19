@@ -85,6 +85,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("POST /nodes/heartbeat", s.handleNodeHeartbeat)
 	mux.HandleFunc("POST /admin/gc", s.handleGC)
+	// 管理后台只读 read-model（普通集群 token 即可读；破坏性操作仍走 adminToken）。
+	mux.HandleFunc("GET /admin/overview", s.handleAdminOverview)
+	mux.HandleFunc("GET /admin/nodes", s.handleAdminNodes)
+	mux.HandleFunc("GET /admin/repairs", s.handleAdminRepairs)
 	return auth.WrapTokens(mux, s.token, s.adminToken, adminPaths)
 }
 

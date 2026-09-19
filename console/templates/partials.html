@@ -1,0 +1,34 @@
+{{define "sidebar"}}
+<aside class="sidebar">
+  <div class="brand">
+    <div class="logo">A</div>
+    <div class="name">Atoll<small>管理后台</small></div>
+  </div>
+  <nav class="nav">
+    <a class="{{if eq .Active "overview"}}active{{end}}" href="/"><span class="ico">◎</span> 概览</a>
+    <a class="{{if eq .Active "nodes"}}active{{end}}" href="/nodes"><span class="ico">▤</span> 节点</a>
+    <a class="{{if eq .Active "files"}}active{{end}}" href="/files"><span class="ico">▧</span> 文件</a>
+    <a class="{{if eq .Active "integrity"}}active{{end}}" href="/integrity"><span class="ico">✓</span> 完整性与修复</a>
+    <a class="{{if eq .Active "gc"}}active{{end}}" href="/gc"><span class="ico">⌫</span> 垃圾回收</a>
+    <div class="nav-group-label">路线图</div>
+    <a class="soon"><span class="ico">◔</span> 用户与租户 <span class="tag-soon">Soon</span></a>
+    <a class="soon"><span class="ico">⇄</span> 协议网关 (SMB) <span class="tag-soon">Soon</span></a>
+    <a class="soon"><span class="ico">▚</span> 冗余策略 (EC) <span class="tag-soon">Soon</span></a>
+  </nav>
+</aside>
+{{end}}
+
+{{define "topbar"}}
+<header class="topbar">
+  <h1>{{.Title}}</h1>
+  <div class="spacer"></div>
+  <div class="ns-switch">命名空间 <b>{{.Namespace}}</b></div>
+  <div class="user-menu">
+    <span class="avatar">{{.Initial}}</span> {{.Username}}
+    <form method="post" action="/logout">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit">退出</button>
+    </form>
+  </div>
+</header>
+{{end}}

@@ -1,0 +1,147 @@
+/* Atoll 管理后台样式（手写，无框架）。
+   审美：干净克制、浅底留白、状态靠小色点，不用渐变/霓虹/阴影堆叠。 */
+
+:root {
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --border: #e6e8eb;
+  --border-strong: #d6d9dd;
+  --text: #1c2024;
+  --muted: #6b7280;
+  --faint: #9aa1a9;
+  --accent: #2563eb;
+  --accent-soft: #eef3ff;
+  --ok: #16a34a;
+  --warn: #d97706;
+  --bad: #dc2626;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--sans); background: var(--bg); color: var(--text);
+  font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.mono { font-family: var(--mono); }
+
+.layout { display: flex; min-height: 100vh; }
+
+.sidebar {
+  width: 216px; flex: 0 0 216px; background: var(--surface);
+  border-right: 1px solid var(--border); display: flex; flex-direction: column;
+  position: sticky; top: 0; height: 100vh;
+}
+.brand { padding: 18px 20px 16px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--border); }
+.brand .logo { width: 22px; height: 22px; border-radius: 6px; background: var(--accent); display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 13px; }
+.brand .name { font-weight: 650; letter-spacing: .2px; }
+.brand .name small { display: block; font-weight: 400; color: var(--faint); font-size: 11px; letter-spacing: .3px; }
+
+.nav { padding: 10px; flex: 1; overflow-y: auto; }
+.nav-group-label { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--faint); padding: 14px 10px 6px; }
+.nav a { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 7px; color: var(--text); font-size: 13.5px; margin-bottom: 1px; }
+.nav a:hover { background: #f1f3f5; text-decoration: none; }
+.nav a.active { background: var(--accent-soft); color: var(--accent); font-weight: 550; }
+.nav a.soon { color: var(--faint); cursor: default; }
+.nav a.soon:hover { background: transparent; }
+.nav a .ico { width: 16px; text-align: center; opacity: .8; }
+.nav .tag-soon { margin-left: auto; font-size: 10px; color: var(--faint); border: 1px solid var(--border-strong); border-radius: 5px; padding: 0 5px; }
+
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.topbar { height: 56px; flex: 0 0 56px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 16px; padding: 0 24px; }
+.topbar h1 { font-size: 16px; font-weight: 600; margin: 0; }
+.topbar .spacer { flex: 1; }
+.ns-switch, .user-menu { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 5px 11px; background: var(--surface); }
+.ns-switch b { color: var(--text); font-weight: 550; }
+.user-menu .avatar { width: 20px; height: 20px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; font-size: 11px; font-weight: 600; }
+.user-menu form { margin: 0; }
+.user-menu button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 13px; padding: 0; }
+.user-menu button:hover { color: var(--accent); }
+
+.content { padding: 24px; max-width: 1180px; }
+
+.cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 22px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 11px; padding: 16px 17px; }
+.card .label { font-size: 12.5px; color: var(--muted); margin-bottom: 8px; }
+.card .value { font-size: 26px; font-weight: 650; letter-spacing: -.4px; }
+.card .value small { font-size: 15px; font-weight: 500; color: var(--faint); }
+.card .sub { font-size: 12px; color: var(--faint); margin-top: 5px; }
+.card.attn .value { color: var(--bad); }
+
+.bar { height: 7px; border-radius: 4px; background: #eceef0; overflow: hidden; margin-top: 10px; }
+.bar > span { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.bar.warn > span { background: var(--warn); }
+.bar.bad > span { background: var(--bad); }
+
+.section { margin-bottom: 26px; }
+.section-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.section-head h2 { font-size: 14.5px; font-weight: 600; margin: 0; }
+.section-head .count { font-size: 12px; color: var(--faint); }
+.section-head .spacer { flex: 1; }
+
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 11px; overflow: hidden; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead th { text-align: left; font-weight: 550; color: var(--muted); font-size: 12px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: #fafbfc; text-transform: uppercase; letter-spacing: .4px; }
+tbody td { padding: 11px 14px; border-bottom: 1px solid var(--border); }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: #fafbfc; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; vertical-align: 1px; }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.bad { background: var(--bad); }
+.dot.idle { background: var(--faint); }
+.status-txt.ok { color: var(--ok); }
+.status-txt.bad { color: var(--bad); }
+.status-txt.warn { color: var(--warn); }
+
+.minibar { display: inline-flex; align-items: center; gap: 8px; }
+.minibar .track { width: 90px; height: 6px; border-radius: 3px; background: #eceef0; overflow: hidden; }
+.minibar .track > span { display: block; height: 100%; background: var(--accent); }
+.minibar .track > span.warn { background: var(--warn); }
+.minibar .track > span.bad { background: var(--bad); }
+.minibar .pct { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 34px; }
+
+.badge { display: inline-block; font-size: 11.5px; padding: 1px 8px; border-radius: 6px; border: 1px solid var(--border-strong); color: var(--muted); background: #fbfcfd; }
+.badge.blue { color: var(--accent); border-color: #c9dbff; background: var(--accent-soft); }
+
+.matrix-wrap { overflow-x: auto; }
+.matrix { border-collapse: separate; border-spacing: 3px; font-size: 12px; }
+.matrix th { background: transparent; border: none; text-transform: none; letter-spacing: 0; color: var(--muted); font-weight: 550; padding: 4px 8px; white-space: nowrap; }
+.matrix th.rowh { text-align: right; color: var(--text); }
+.matrix td { border: none; padding: 0; }
+.cell { width: 62px; height: 30px; border-radius: 6px; display: grid; place-items: center; font-family: var(--mono); font-size: 11px; color: #fff; }
+.cell.primary { background: var(--ok); }
+.cell.replica { background: #6cc48f; }
+.cell.syncing { background: var(--warn); }
+.cell.missing { background: var(--bad); }
+.cell.none { background: #eceef0; color: var(--faint); }
+.legend { display: flex; gap: 16px; margin-top: 14px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+
+.meta-row { display: flex; flex-wrap: wrap; gap: 26px; padding: 16px 18px; }
+.meta-row .item .k { font-size: 11.5px; color: var(--faint); text-transform: uppercase; letter-spacing: .4px; }
+.meta-row .item .v { font-size: 14px; margin-top: 3px; }
+.breadcrumb { font-size: 13px; color: var(--muted); margin-bottom: 14px; }
+.breadcrumb a { color: var(--muted); }
+.breadcrumb b { color: var(--text); }
+.hint { font-size: 12px; color: var(--faint); margin-top: 6px; }
+.empty { padding: 40px; text-align: center; color: var(--faint); }
+
+/* 登录页 */
+.login-wrap { min-height: 100vh; display: grid; place-items: center; background: var(--bg); }
+.login-box { width: 340px; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 30px 28px; }
+.login-box .brand { border: none; padding: 0 0 20px; justify-content: center; }
+.login-box label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 5px; }
+.login-box input { width: 100%; padding: 9px 12px; border: 1px solid var(--border-strong); border-radius: 8px; font-size: 14px; }
+.login-box input:focus { outline: none; border-color: var(--accent); }
+.login-box button { width: 100%; margin-top: 20px; padding: 10px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 550; cursor: pointer; }
+.login-box button:hover { background: #1d4ed8; }
+.login-box .err { margin-top: 14px; padding: 8px 12px; background: #fef2f2; border: 1px solid #fecaca; color: var(--bad); border-radius: 8px; font-size: 13px; }
+
+.row-type { color: var(--faint); font-size: 12px; }

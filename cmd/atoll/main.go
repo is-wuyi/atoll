@@ -22,6 +22,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"atoll/client"
+	"atoll/console"
 	"atoll/master"
 	"atoll/master/meta"
 	"atoll/mount"
@@ -71,6 +72,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runClientCmd(cmd, rest, stdout, stderr)
 	case "gc":
 		return runGC(rest, stdout, stderr)
+	case "console":
+		return runConsole(rest, stdout, stderr)
 	case "auth":
 		return runAuth(rest, stdout, stderr)
 	case "help", "-h", "--help":
@@ -407,6 +410,94 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "已删除 %s\n", fs.Arg(0))
 	}
+	return 0
+}
+
+// ---- 管理后台 console ----
+
+func runConsole(args []string, stdout, stderr io.Writer) int {
+	// 子子命令：atoll console useradd <user> — 引导控制台账号。
+	if len(args) > 0 && args[0] == "useradd" {
+		return runConsoleUserAdd(args[1:], stdout, stderr)
+	}
+	fs := flag.NewFlagSet("console", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	listen := fs.String("listen", ":9430", "监听地址")
+	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
+	dataDir := fs.String("data-dir", "./console-data", "控制台用户/会话状态目录")
+	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
+	adminToken := fs.String("admin-token", envDefault("ATOLL_ADMIN_TOKEN", ""), "破坏性操作专用 token（空则回退集群 token）")
+	tlsCert := fs.String("tls-cert", "", "TLS 证书文件（配 -tls-key 后 console 走 https）")
+	tlsKey := fs.String("tls-key", "", "TLS 私钥文件")
+	tlsCA := fs.String("tls-ca", "", "校验 master 证书用的 CA（master 走 https 时）")
+	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过 master 证书校验（自签名内网）")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	outTLS, err := clientTLS(*tlsCA, *tlsSkip)
+	if err != nil {
+		fmt.Fprintf(stderr, "atoll console: %v\n", err)
+		return 1
+	}
+	srv, err := console.New(console.Config{
+		MasterURL:  *masterURL,
+		Token:      auth.Token(*token),
+		AdminToken: auth.Token(*adminToken),
+		TLS:        outTLS,
+		DataDir:    *dataDir,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "atoll console: %v\n", err)
+		return 1
+	}
+	if srv.Users().Count() == 0 {
+		fmt.Fprintln(stderr, "提示：还没有控制台账号，先运行 `atoll console useradd <用户名> -data-dir "+*dataDir+"` 创建管理员。")
+	}
+	httpSrv := &http.Server{Addr: *listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		httpSrv.Shutdown(shutdownCtx)
+	}()
+	if err := serve(httpSrv, *tlsCert, *tlsKey, stderr, fmt.Sprintf("atoll console listening on %s (master=%s)", *listen, *masterURL)); err != nil {
+		fmt.Fprintf(stderr, "atoll console: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// runConsoleUserAdd 创建/引导一个控制台账号。密码从 ATOLL_CONSOLE_PASSWORD 读，
+// 避免明文进 shell 历史。默认角色 admin（首个账号通常是管理员）。
+func runConsoleUserAdd(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("console useradd", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dataDir := fs.String("data-dir", "./console-data", "控制台状态目录")
+	role := fs.String("role", "admin", "角色：admin | readonly")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "用法: atoll console useradd <用户名> [-role admin|readonly]（密码经 ATOLL_CONSOLE_PASSWORD 传入）")
+		return 2
+	}
+	pw := os.Getenv("ATOLL_CONSOLE_PASSWORD")
+	if pw == "" {
+		fmt.Fprintln(stderr, "请通过环境变量 ATOLL_CONSOLE_PASSWORD 提供密码")
+		return 2
+	}
+	srv, err := console.New(console.Config{DataDir: *dataDir})
+	if err != nil {
+		fmt.Fprintf(stderr, "atoll console useradd: %v\n", err)
+		return 1
+	}
+	if err := srv.Users().Add(fs.Arg(0), pw, console.Role(*role)); err != nil {
+		fmt.Fprintf(stderr, "atoll console useradd: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "已创建控制台账号 %s（角色 %s）\n", fs.Arg(0), *role)
 	return 0
 }
 

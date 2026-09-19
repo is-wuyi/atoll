@@ -1,0 +1,26 @@
+{{define "login"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 登录</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="login-wrap">
+  <form class="login-box" method="post" action="/login">
+    <div class="brand">
+      <div class="logo">A</div>
+      <div class="name">Atoll<small>管理后台</small></div>
+    </div>
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>用户名</label>
+    <input name="username" autocomplete="username" autofocus>
+    <label>密码</label>
+    <input name="password" type="password" autocomplete="current-password">
+    <button type="submit">登录</button>
+    {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
+  </form>
+</div>
+</body>
+</html>{{end}}
