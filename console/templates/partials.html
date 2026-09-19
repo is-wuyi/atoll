@@ -22,6 +22,7 @@
 <header class="topbar">
   <h1>{{.Title}}</h1>
   <div class="spacer"></div>
+  <span id="refresh-ind" class="refresh-ind"></span>
   <div class="ns-switch">命名空间 <b>{{.Namespace}}</b></div>
   <div class="user-menu">
     <span class="avatar">{{.Initial}}</span> {{.Username}}
@@ -31,4 +32,5 @@
     </form>
   </div>
 </header>
+<script src="/static/refresh.js"></script>
 {{end}}
