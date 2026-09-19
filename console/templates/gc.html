@@ -1,0 +1,75 @@
+{{define "gc"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 垃圾回收</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  {{template "sidebar" .}}
+  <div class="main">
+    {{template "topbar" .}}
+    <div class="content">
+      <div class="cards">
+        <div class="card">
+          <div class="label">孤儿对象</div>
+          <div class="value">{{.TotalOrphans}}</div>
+          <div class="sub">元数据中已无归属、磁盘上残留</div>
+        </div>
+        <div class="card">
+          <div class="label">占用空间</div>
+          <div class="value">{{bytes .TotalBytes}}</div>
+          <div class="sub">回收后可释放</div>
+        </div>
+      </div>
+
+      {{if .Executed}}
+      <div class="section">
+        <div class="panel"><div class="meta-row">
+          <div class="item"><div class="k">本轮已删除</div><div class="v"><span class="status-txt ok">{{.Deleted}} 个孤儿</span></div></div>
+          <div class="item"><div class="k">说明</div><div class="v hint" style="margin:0">两轮确认机制：只删连续两轮都判为孤儿的对象，故首轮删除数可能为 0，再执行一次即清。</div></div>
+        </div></div>
+      </div>
+      {{end}}
+
+      <div class="section">
+        <div class="section-head">
+          <h2>孤儿明细（dry-run）</h2><span class="count">{{.TotalOrphans}} 个</span>
+          <span class="spacer"></span>
+          {{if .IsAdmin}}
+            {{if gt .TotalOrphans 0}}
+            <form method="post" action="/gc/execute" onsubmit="return confirm('确认删除这些孤儿对象？两轮确认机制下只会删除已连续两轮判定为孤儿的对象。');">
+              <input type="hidden" name="csrf" value="{{.CSRF}}">
+              <button type="submit" style="background:var(--bad);color:#fff;border:none;border-radius:8px;padding:7px 14px;font-size:13px;cursor:pointer">执行删除</button>
+            </form>
+            {{end}}
+          {{else}}
+            <span class="badge">只读账号无法执行删除</span>
+          {{end}}
+        </div>
+        <div class="panel">
+          <table>
+            <thead><tr><th>节点</th><th>地址</th><th class="num">孤儿数</th><th class="num">占用</th></tr></thead>
+            <tbody>
+            {{range .Reports}}
+              <tr>
+                <td class="mono">node {{.NodeID}}</td>
+                <td class="mono">{{.NodeAddr}}</td>
+                <td class="num">{{len .Orphans}}</td>
+                <td class="num">{{bytes .OrphanBytes}}</td>
+              </tr>
+            {{else}}
+              <tr><td colspan="4" class="empty">无孤儿对象——磁盘干净</td></tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+        <p class="hint">孤儿 = 存储节点磁盘上存在、但元数据里已无归属的对象（删除未回收、上传中断残留、覆盖写旧版本等）。dry-run 只列不删。</p>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>{{end}}

@@ -89,6 +89,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/overview", s.handleAdminOverview)
 	mux.HandleFunc("GET /admin/nodes", s.handleAdminNodes)
 	mux.HandleFunc("GET /admin/repairs", s.handleAdminRepairs)
+	mux.HandleFunc("GET /admin/integrity", s.handleAdminIntegrity)
 	return auth.WrapTokens(mux, s.token, s.adminToken, adminPaths)
 }
 

@@ -18,6 +18,7 @@ type pageBase struct {
 	Username  string
 	Initial   string
 	CSRF      string
+	IsAdmin   bool
 }
 
 func newPageBase(active, title string, sess session) pageBase {
@@ -28,6 +29,7 @@ func newPageBase(active, title string, sess session) pageBase {
 	return pageBase{
 		Active: active, Title: title, Namespace: "default",
 		Username: sess.Username, Initial: initial, CSRF: sess.CSRF,
+		IsAdmin: sess.Role == RoleAdmin,
 	}
 }
 
@@ -118,6 +120,78 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, sess sessio
 		pageBase
 		Nodes []NodeView
 	}{newPageBase("nodes", "节点", sess), nodes})
+}
+
+// ---- 完整性与修复 ----
+
+func (s *Server) handleIntegrity(w http.ResponseWriter, r *http.Request, sess session) {
+	items, err := s.mc.integrity()
+	if err != nil {
+		s.renderError(w, sess, "无法读取完整性信息", err.Error())
+		return
+	}
+	snap, _ := s.mc.repairs() // 修复退避概况（失败不致命，degraded 已够看）
+	s.render(w, "integrity", struct {
+		pageBase
+		Items       []DegradedItem
+		FailStreaks int
+	}{newPageBase("integrity", "完整性与修复", sess), items, snap.FailStreaks})
+}
+
+// ---- 垃圾回收 ----
+
+func (s *Server) handleGC(w http.ResponseWriter, r *http.Request, sess session) {
+	reports, err := s.mc.gc(false) // dry-run
+	if err != nil {
+		s.renderError(w, sess, "无法读取 GC 报告", err.Error())
+		return
+	}
+	var totalOrphans int
+	var totalBytes int64
+	for _, rp := range reports {
+		totalOrphans += len(rp.Orphans)
+		totalBytes += rp.OrphanBytes
+	}
+	s.render(w, "gc", struct {
+		pageBase
+		Reports      []GCNodeReport
+		TotalOrphans int
+		TotalBytes   int64
+		Executed     bool
+		Deleted      int
+	}{newPageBase("gc", "垃圾回收", sess), reports, totalOrphans, totalBytes, false, 0})
+}
+
+// handleGCExecute POST /gc/execute —— 执行删除。仅 admin，需 CSRF。
+func (s *Server) handleGCExecute(w http.ResponseWriter, r *http.Request, sess session) {
+	if sess.Role != RoleAdmin {
+		s.renderError(w, sess, "权限不足", "只有 admin 角色可以执行垃圾回收删除")
+		return
+	}
+	if r.FormValue("csrf") != sess.CSRF {
+		http.Error(w, "csrf mismatch", http.StatusForbidden)
+		return
+	}
+	reports, err := s.mc.gc(true)
+	if err != nil {
+		s.renderError(w, sess, "GC 执行失败", err.Error())
+		return
+	}
+	var totalOrphans, deleted int
+	var totalBytes int64
+	for _, rp := range reports {
+		totalOrphans += len(rp.Orphans)
+		totalBytes += rp.OrphanBytes
+		deleted += rp.Deleted
+	}
+	s.render(w, "gc", struct {
+		pageBase
+		Reports      []GCNodeReport
+		TotalOrphans int
+		TotalBytes   int64
+		Executed     bool
+		Deleted      int
+	}{newPageBase("gc", "垃圾回收", sess), reports, totalOrphans, totalBytes, true, deleted})
 }
 
 // ---- 文件浏览 ----

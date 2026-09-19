@@ -1,0 +1,60 @@
+{{define "integrity"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 完整性与修复</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  {{template "sidebar" .}}
+  <div class="main">
+    {{template "topbar" .}}
+    <div class="content">
+      <div class="cards">
+        <div class="card {{if gt (len .Items) 0}}attn{{end}}">
+          <div class="label">副本不足的块 / 文件</div>
+          <div class="value">{{len .Items}}</div>
+          <div class="sub">{{if gt (len .Items) 0}}再丢节点可能丢数据{{else}}全部满副本{{end}}</div>
+        </div>
+        <div class="card">
+          <div class="label">修复退避中</div>
+          <div class="value">{{.FailStreaks}}</div>
+          <div class="sub">连续未收敛、正在指数退避的修复目标</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-head"><h2>降级明细</h2><span class="count">{{len .Items}} 项</span></div>
+        <div class="panel">
+          <table>
+            <thead><tr><th>文件</th><th>块</th><th>健康副本</th><th>降级时长</th><th>状态</th></tr></thead>
+            <tbody>
+            {{range .Items}}
+              <tr>
+                <td><a href="/file?path={{.Path}}" class="mono">{{.Path}}</a></td>
+                <td class="mono">{{if lt .Index 0}}—{{else}}#{{.Index}}{{end}}</td>
+                <td>
+                  {{if le .Healthy 1}}<span class="status-txt bad">{{.Healthy}} / {{.Target}}</span>
+                  {{else}}<span class="status-txt warn">{{.Healthy}} / {{.Target}}</span>{{end}}
+                </td>
+                <td>{{if gt .SinceSec 0}}{{dur .SinceSec}}{{else}}刚发现{{end}}</td>
+                <td>
+                  {{if .Warned}}<span class="dot bad"></span>已告警
+                  {{else}}<span class="dot warn"></span>修复中{{end}}
+                </td>
+              </tr>
+            {{else}}
+              <tr><td colspan="5" class="empty">没有降级的块——所有文件副本充足</td></tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+        <p class="hint">降级 = 某块「已落盘且节点存活」的去重副本数 &lt; 目标副本数。修复扫描器会自动在存活节点补副本；此处实时反映当前缺口。</p>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>{{end}}

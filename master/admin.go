@@ -2,8 +2,10 @@ package master
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
+	"atoll/master/meta"
 	"atoll/pkg/types"
 )
 
@@ -160,4 +162,100 @@ func (s *Server) handleAdminRepairs(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.scanner.Snapshot())
+}
+
+// degradedItem 是完整性页的一行：某文件（或其某块）副本不足。
+type degradedItem struct {
+	Path     string `json:"path"`
+	Inode    uint64 `json:"inode"`
+	Chunked  bool   `json:"chunked"`
+	Index    int    `json:"index"`   // 分块文件的块下标；legacy 为 -1
+	Healthy  int    `json:"healthy"` // 去重的"已落盘且节点存活"副本数
+	Target   int    `json:"target"`  // 目标副本数
+	SinceSec int64  `json:"since_sec"` // 已降级秒数（来自 scanner 追踪，未追踪为 0）
+	Warned   bool   `json:"warned"`
+}
+
+// handleAdminIntegrity GET /admin/integrity —— 实时扫描所有文件，列出副本不足的块/文件。
+// 现扫现算（不依赖 scanner 是否已追踪），再叠加 scanner 的降级时长/告警状态。
+func (s *Server) handleAdminIntegrity(w http.ResponseWriter, _ *http.Request) {
+	views, err := s.nodeViews()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	aliveSet := make(map[uint64]bool, len(views))
+	for _, n := range views {
+		if n.Alive {
+			aliveSet[n.ID] = true
+		}
+	}
+	snap := map[uint64]DegradedEntry{} // chunkID/inodeID → since+warned；scanner 未初始化则空
+	if s.scanner != nil {
+		for _, d := range s.scanner.Snapshot().Degraded {
+			snap[d.ChunkID] = d
+		}
+	}
+	pathCache := map[uint64]string{}
+	var items []degradedItem
+	if err := s.store.ForEachFile(func(in types.Inode) error {
+		if in.Staging {
+			return nil // staging 降级是上传中的正常态
+		}
+		if in.Chunked {
+			for _, c := range in.Chunks {
+				h := healthyReplicaCount(c.Done, c.Replicas, aliveSet)
+				if h < len(c.Replicas) {
+					items = append(items, buildDegraded(s, in, c.Index, h, len(c.Replicas),
+						types.ChunkID(in.ID, c.Index), snap, pathCache))
+				}
+			}
+		} else if len(in.Replicas) > 0 {
+			h := healthyReplicaCount(in.DoneReplicas, in.Replicas, aliveSet)
+			if h < len(in.Replicas) {
+				items = append(items, buildDegraded(s, in, -1, h, len(in.Replicas), in.ID, snap, pathCache))
+			}
+		}
+		return nil
+	}); err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func buildDegraded(s *Server, in types.Inode, index, healthy, target int, trackID uint64,
+	snap map[uint64]DegradedEntry, cache map[uint64]string) degradedItem {
+	it := degradedItem{
+		Path: s.resolveInodePath(in, cache), Inode: in.ID, Chunked: in.Chunked,
+		Index: index, Healthy: healthy, Target: target,
+	}
+	if d, ok := snap[trackID]; ok {
+		it.SinceSec = int64(time.Since(d.Since).Seconds())
+		it.Warned = d.Warned
+	}
+	return it
+}
+
+// resolveInodePath 沿 ParentID 向上回溯拼出绝对路径（带缓存）。
+func (s *Server) resolveInodePath(in types.Inode, cache map[uint64]string) string {
+	if p, ok := cache[in.ID]; ok {
+		return p
+	}
+	if in.ID == meta.RootID || in.ParentID == 0 {
+		return "/"
+	}
+	segs := []string{in.Name}
+	pid := in.ParentID
+	for pid != 0 && pid != meta.RootID {
+		p, err := s.store.GetInode(pid)
+		if err != nil {
+			break
+		}
+		segs = append([]string{p.Name}, segs...)
+		pid = p.ParentID
+	}
+	path := "/" + strings.Join(segs, "/")
+	cache[in.ID] = path
+	return path
 }

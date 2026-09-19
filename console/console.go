@@ -52,7 +52,7 @@ func New(cfg Config) (*Server, error) {
 	}
 	return &Server{
 		cfg:      cfg,
-		mc:       newMasterClient(cfg.MasterURL, cfg.Token, cfg.TLS),
+		mc:       newMasterClient(cfg.MasterURL, cfg.Token, cfg.AdminToken, cfg.TLS),
 		users:    users,
 		sessions: newSessionStore(cfg.SessionTTL),
 		tpl:      tpl,
@@ -77,6 +77,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /nodes", s.requireAuth(s.handleNodes))
 	mux.HandleFunc("GET /files", s.requireAuth(s.handleFiles))
 	mux.HandleFunc("GET /file", s.requireAuth(s.handleFile))
+	mux.HandleFunc("GET /integrity", s.requireAuth(s.handleIntegrity))
+	mux.HandleFunc("GET /gc", s.requireAuth(s.handleGC))
+	mux.HandleFunc("POST /gc/execute", s.requireAuth(s.handleGCExecute))
 
 	return securityHeaders(mux)
 }
@@ -120,6 +123,19 @@ func tplFuncs() template.FuncMap {
 		"pct":      pctFloat,
 		"sub":      func(a, b int) int { return a - b },
 		"barClass": barClass,
+		"dur":      humanDur,
+	}
+}
+
+// humanDur 把秒数转成中文时长（降级时长展示用）。
+func humanDur(sec int64) string {
+	switch {
+	case sec < 60:
+		return fmt.Sprintf("%d 秒", sec)
+	case sec < 3600:
+		return fmt.Sprintf("%d 分 %d 秒", sec/60, sec%60)
+	default:
+		return fmt.Sprintf("%d 小时 %d 分", sec/3600, (sec%3600)/60)
 	}
 }
 

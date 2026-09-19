@@ -3,6 +3,7 @@
 package console
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -18,15 +19,21 @@ import (
 )
 
 // masterClient 调用 master 的 read-model API。
+// http 用集群 token（只读）；adminHTTP 用 admin token（破坏性操作如 GC 执行）。
 type masterClient struct {
-	base string
-	http *http.Client
+	base      string
+	http      *http.Client
+	adminHTTP *http.Client
 }
 
-func newMasterClient(masterURL string, token auth.Token, tlsCfg *tls.Config) *masterClient {
+func newMasterClient(masterURL string, token, adminToken auth.Token, tlsCfg *tls.Config) *masterClient {
+	if adminToken == "" {
+		adminToken = token // 未单设 admin token 时回退用集群 token
+	}
 	return &masterClient{
-		base: strings.TrimRight(masterURL, "/"),
-		http: &http.Client{Timeout: 15 * time.Second, Transport: auth.HTTPTransport(token, tlsCfg, nil)},
+		base:      strings.TrimRight(masterURL, "/"),
+		http:      &http.Client{Timeout: 15 * time.Second, Transport: auth.HTTPTransport(token, tlsCfg, nil)},
+		adminHTTP: &http.Client{Timeout: 30 * time.Second, Transport: auth.HTTPTransport(adminToken, tlsCfg, nil)},
 	}
 }
 
@@ -87,6 +94,61 @@ func (c *masterClient) nodes() ([]NodeView, error) {
 func (c *masterClient) repairs() (master.RepairSnapshot, error) {
 	var r master.RepairSnapshot
 	return r, c.getJSON("/admin/repairs", &r)
+}
+
+// DegradedItem 镜像 master degradedItem。
+type DegradedItem struct {
+	Path     string `json:"path"`
+	Inode    uint64 `json:"inode"`
+	Chunked  bool   `json:"chunked"`
+	Index    int    `json:"index"`
+	Healthy  int    `json:"healthy"`
+	Target   int    `json:"target"`
+	SinceSec int64  `json:"since_sec"`
+	Warned   bool   `json:"warned"`
+}
+
+func (c *masterClient) integrity() ([]DegradedItem, error) {
+	var items []DegradedItem
+	return items, c.getJSON("/admin/integrity", &items)
+}
+
+// GCNodeReport 镜像 master.GCNodeReport（避免 UI 直接依赖 scanner 内部类型）。
+type GCNodeReport struct {
+	NodeID      uint64 `json:"node_id"`
+	NodeAddr    string `json:"node_addr"`
+	OrphanBytes int64  `json:"orphan_bytes"`
+	Deleted     int    `json:"deleted"`
+	Orphans     []struct {
+		ID   uint64 `json:"id"`
+		Size int64  `json:"size"`
+	} `json:"orphans"`
+}
+
+// gc 调用 master POST /admin/gc。execute=true 需 adminToken（master 侧路径鉴权）。
+// dry-run 用集群 token 即可；执行删除时 token 由 postGC 用 adminToken 注入。
+func (c *masterClient) gc(execute bool) ([]GCNodeReport, error) {
+	body, _ := json.Marshal(map[string]bool{"execute": execute})
+	req, err := http.NewRequest(http.MethodPost, c.base+"/admin/gc", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	cl := c.http
+	if execute {
+		cl = c.adminHTTP // 破坏性操作用 adminToken
+	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("gc: %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var reports []GCNodeReport
+	return reports, json.NewDecoder(resp.Body).Decode(&reports)
 }
 
 func (c *masterClient) lookup(path string) (types.Inode, []replicaEntry, error) {
