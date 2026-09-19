@@ -43,7 +43,18 @@ var (
 	ErrNotDir     = errors.New("not a directory")
 	ErrNotFile    = errors.New("not a file")
 	ErrBadPath    = errors.New("invalid path")
+	ErrBadName    = errors.New("invalid name")
 )
+
+// validateName 校验单个目录项名字：非空、非 "."/".."、不含 "/"。
+// 元数据层的最后一道防线——无论哪条 HTTP 路径进来，非法名一律挡在落库前
+// （commit 曾可写入 "../../etc/passwd"、"a/b" 等污染 children bucket）。
+func validateName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, '/') {
+		return fmt.Errorf("%w: %q", ErrBadName, name)
+	}
+	return nil
+}
 
 // Store 封装 bbolt 数据库。
 type Store struct {
@@ -148,6 +159,9 @@ func (s *Store) ResolvePath(p string) (types.Inode, error) {
 
 // CreateDir 在 parentID 下创建子目录。
 func (s *Store) CreateDir(parentID uint64, name string) (types.Inode, error) {
+	if err := validateName(name); err != nil {
+		return types.Inode{}, err
+	}
 	var in types.Inode
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		parent, err := getInodeTx(tx, parentID)
@@ -178,6 +192,9 @@ func (s *Store) CreateDir(parentID uint64, name string) (types.Inode, error) {
 
 // CreateFile 在 parentID 下创建文件记录（数据尚未写入，size 初始为 0）。
 func (s *Store) CreateFile(parentID uint64, name string, replicas []uint64) (types.Inode, error) {
+	if err := validateName(name); err != nil {
+		return types.Inode{}, err
+	}
 	var in types.Inode
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		parent, err := getInodeTx(tx, parentID)
@@ -281,6 +298,9 @@ func (s *Store) DeleteDir(id uint64) error {
 
 // Rename 在同一目录内改名。
 func (s *Store) Rename(id uint64, newName string) error {
+	if err := validateName(newName); err != nil {
+		return err
+	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		in, err := getInodeTx(tx, id)
 		if err != nil {
@@ -397,6 +417,9 @@ var ErrChunkNotExist = errors.New("chunk not found")
 
 // ErrCommitFailed commit 校验失败（块缺失/主副本未落盘/大小不符）。
 var ErrCommitFailed = errors.New("commit validation failed")
+
+// ErrReplicaDup 副本替换会造成同一节点在副本集内重复（修复扫描去重用）。
+var ErrReplicaDup = errors.New("replica already present")
 
 // CreateStagingFile 在 parentID 下分配一个写入中的隐藏文件 inode。
 // Staging=true, Chunked=true，不挂 children——路径解析天然看不见它。
@@ -551,6 +574,10 @@ func (s *Store) ReplaceChunkReplica(inodeID uint64, index int, oldNodeID, newNod
 			if in.Chunks[i].Index != index {
 				continue
 			}
+			// 查重：newNodeID 已在该块副本集则拒绝（同 ReplaceReplica，防并发修复造重复）。
+			if containsUint64(in.Chunks[i].Replicas, newNodeID) {
+				return fmt.Errorf("%w: node %d already a replica of chunk %d", ErrReplicaDup, newNodeID, index)
+			}
 			found := false
 			for j, rid := range in.Chunks[i].Replicas {
 				if rid == oldNodeID {
@@ -580,6 +607,9 @@ func (s *Store) ReplaceChunkReplica(inodeID uint64, index int, oldNodeID, newNod
 // 事务前读者看到旧版本，事务后看到新版本——不存在中间态（审计 #1）。
 // 返回提交后的 inode 与被替换的旧 inode（ok=false 表示无旧版本）。
 func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (types.Inode, types.Inode, bool, error) {
+	if err := validateName(name); err != nil {
+		return types.Inode{}, types.Inode{}, false, err
+	}
 	var out, old types.Inode
 	var hadOld bool
 	err := s.db.Update(func(tx *bolt.Tx) error {
@@ -593,8 +623,14 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 		if len(in.Chunks) == 0 {
 			return fmt.Errorf("%w: no chunks assigned", ErrCommitFailed)
 		}
+		// 块表必须恰好是 {0,1,…,n-1} 且升序无缺口——否则读路径按顺序累加偏移会
+		// 把后一块的字节当成缺失块的内容返回（静默内容错乱，无校验和可发现）。
+		// AssignChunk 已保证升序，这里断言"无跳号、无重复"补齐连续性。
 		var sum int64
-		for _, c := range in.Chunks {
+		for i, c := range in.Chunks {
+			if c.Index != i {
+				return fmt.Errorf("%w: chunk index gap at position %d (got index %d)", ErrCommitFailed, i, c.Index)
+			}
 			if len(c.Replicas) == 0 || !containsUint64(c.Done, c.Replicas[0]) {
 				return fmt.Errorf("%w: chunk %d primary not done", ErrCommitFailed, c.Index)
 			}
@@ -869,6 +905,12 @@ func (s *Store) ReplaceReplica(inodeID, oldNodeID, newNodeID uint64) error {
 		in, err := getInodeTx(tx, inodeID)
 		if err != nil {
 			return err
+		}
+		// 查重：newNodeID 已在副本集则拒绝——两轮修复并发可能各自选中同一新节点，
+		// 落库后变成 [5,5,x]，物理副本数虚高，扫描器会把降级文件误判为满健康。
+		// 拒绝后由下一轮修复重新选一个不重复的候选（ErrReplicaDup 幂等可重试）。
+		if containsUint64(in.Replicas, newNodeID) {
+			return fmt.Errorf("%w: node %d already a replica of inode %d", ErrReplicaDup, newNodeID, inodeID)
 		}
 		found := false
 		for i, rid := range in.Replicas {

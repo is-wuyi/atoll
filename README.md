@@ -33,6 +33,12 @@ go build -o atoll ./cmd/atoll
 ./atoll mount -master http://<master-ip>:9420 /mnt/atoll
 ```
 
+## 限制
+
+- **单文件上限 16 GiB**：分块模型固定 64 MiB/块、每文件最多 256 块（`ChunkSize × MaxChunksPerFile`）。超过上限的 `put` 会直接报错。
+- **传输明文**：组件间为静态 Bearer Token 认证，无 TLS——仅适用于可信内网。
+- **master 单点**：单个 bbolt 文件，无 HA/自动备份；请自行定期备份该 db 文件。
+
 ## 节点重加入行为
 
 节点重启后的恢复机制：

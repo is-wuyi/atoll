@@ -322,6 +322,16 @@ func (n *Node) storeObject(id uint64, r io.Reader) (int64, error) {
 		os.Remove(tmpName)
 		return 0, err
 	}
+	// fsync 父目录：POSIX 下 rename 的持久性依赖目录项落盘，否则掉电后
+	// "已 fsync 的新对象 + 已改名"仍可能整个消失。这是本系统唯一还缺的持久性缺口
+	// （数据本身已在上面 tmp.Sync()）。best-effort：目录 fsync 失败只记日志不失败，
+	// 数据文件已安全，残留风险仅是这一次 rename 未落盘。
+	if dir, err := os.Open(filepath.Dir(objPath)); err == nil {
+		if serr := dir.Sync(); serr != nil {
+			log.Printf("fsync dir %s: %v", filepath.Dir(objPath), serr)
+		}
+		dir.Close()
+	}
 	n.used.Add(size - oldSize)
 	return size, nil
 }
@@ -434,8 +444,9 @@ func parseRange(h string, size int64) (start, end int64, ok bool) {
 	left, right := spec[:dash], spec[dash+1:]
 	if left == "" {
 		// 后缀长度：bytes=-N，取最后 N 字节（N 超过文件大小则整个文件）。
-		var n int64
-		if _, err := fmt.Sscanf(right, "%d", &n); err != nil || n <= 0 {
+		// 用 ParseInt 而非 Sscanf：Sscanf 会接受 "10zz" 这类尾部带垃圾的输入。
+		n, err := strconv.ParseInt(right, 10, 64)
+		if err != nil || n <= 0 {
 			return 0, 0, false
 		}
 		start = size - n
@@ -444,13 +455,16 @@ func parseRange(h string, size int64) (start, end int64, ok bool) {
 		}
 		return start, size - 1, true
 	}
-	if _, err := fmt.Sscanf(left, "%d", &start); err != nil {
+	start, err := strconv.ParseInt(left, 10, 64)
+	if err != nil {
 		return 0, 0, false
 	}
 	if right == "" {
 		end = size - 1
-	} else if _, err := fmt.Sscanf(right, "%d", &end); err != nil {
+	} else if e, err := strconv.ParseInt(right, 10, 64); err != nil {
 		return 0, 0, false
+	} else {
+		end = e
 	}
 	if start < 0 || end < start || start >= size {
 		return 0, 0, false

@@ -58,8 +58,6 @@ type ChunkInfo struct {
 //   - 块对象 ID：stagingInodeID << 8 | index ≥ 2^40
 
 const (
-	// ChunkSize 是分块文件的固定块大小：64MB。
-	ChunkSize int64 = 64 << 20
 	// MaxChunksPerFile 单文件块数上限（index 编码位宽 8bit）。
 	MaxChunksPerFile = 1 << 8
 	// StagingInodeBase 是 staging inode ID 的起始基数（独立于 legacy 计数器）。
@@ -67,6 +65,11 @@ const (
 	// chunkIndexBits 是 index 在 ChunkID 中占的低位位数。
 	chunkIndexBits = 8
 )
+
+// ChunkSize 是分块文件的固定块大小：64MB。
+// 声明为 var（而非 const）以便测试注入更小的块尺寸，构造真实的多块链路——
+// 生产运行时不修改。单文件容量上限 = ChunkSize × MaxChunksPerFile（默认 16 GiB）。
+var ChunkSize int64 = 64 << 20
 
 // ChunkID 把 staging inode ID 与块下标编码为 node 侧的对象 ID。
 func ChunkID(inodeID uint64, index int) uint64 {

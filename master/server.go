@@ -497,6 +497,16 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 			httpError(w, http.StatusBadRequest, "inode_id, name and size required")
 			return
 		}
+		// chunk_count 一致性：客户端声明的块数必须与块表实际长度相符。
+		// 此前 chunk_count 只用来选"走分块路径"、从不参与校验——客户端声称 9 块、
+		// 表里实际 1 块也照收。连同 meta 层的下标连续性断言一起堵住块表残缺。
+		if st, err := s.store.GetInode(req.InodeID); err == nil && st.Staging {
+			if len(st.Chunks) != req.ChunkCount {
+				httpError(w, http.StatusConflict, fmt.Sprintf(
+					"chunk_count=%d != assigned chunks %d", req.ChunkCount, len(st.Chunks)))
+				return
+			}
+		}
 		// 主副本 Done 兜底：客户端 PUT 成功与 node 查询推送目标（顺带标记 Done）
 		// 之间有竞态窗口——commit 前对每块主副本做一次同步探测，确认落盘即标记。
 		// 探测失败的块由 ErrCommitFailed 拒绝（客户端应重试或 reassign）。
@@ -640,7 +650,10 @@ func (s *Server) probeObject(nodeAddr string, objectID uint64) bool {
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode != http.StatusNotFound
+	// 只有 200/206 才算"对象确实存在"。此前 `!= 404` 会把 401（token 不匹配）、
+	// 500、503 等一律当存在——commit 前的落盘确认形同虚设，极端下主副本上没有
+	// 对象也能 commit 成功。严格化后：非 200/206 一律保守判不存在，让 commit 校验拒绝。
+	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent
 }
 
 // countCommitReadyChunks 统计满足 minCopies 的块数（Done 且节点心跳未超时）。
@@ -791,7 +804,8 @@ func httpErrorFromMeta(w http.ResponseWriter, err error) {
 	case errors.Is(err, meta.ErrExist), errors.Is(err, meta.ErrCommitFailed):
 		httpError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, meta.ErrNotEmpty), errors.Is(err, meta.ErrNotDir), errors.Is(err, meta.ErrNotFile),
-		errors.Is(err, meta.ErrNotStaging), errors.Is(err, meta.ErrChunkBadIndex), errors.Is(err, meta.ErrChunkBadSize):
+		errors.Is(err, meta.ErrNotStaging), errors.Is(err, meta.ErrChunkBadIndex), errors.Is(err, meta.ErrChunkBadSize),
+		errors.Is(err, meta.ErrBadName):
 		httpError(w, http.StatusBadRequest, err.Error())
 	default:
 		httpError(w, http.StatusInternalServerError, err.Error())

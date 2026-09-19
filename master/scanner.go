@@ -199,29 +199,37 @@ func planRepairs(inode types.Inode, nodes []types.NodeInfo, maxAge time.Duration
 		}
 	}
 
-	// 健康副本 = Replicas 中 Done ∧ alive
+	// 健康副本 = Replicas 中 Done ∧ alive，且按节点 ID 去重计数。
+	// 关键修复：healthyCount 必须数"不同的物理节点"。此前逐个槽位计数，
+	// [5,5,1] Done=[5,1] 会把 node 5 数两次 → 判定 3 副本满健康，但实际只有
+	// 2 个物理副本。一个降级/单副本文件会被持续误判为健康，修复与告警双双沉默
+	// （27472 "单副本裸奔无人知晓" 的元数据侧根因）。
 	doneSet := make(map[uint64]bool, len(inode.DoneReplicas))
 	for _, id := range inode.DoneReplicas {
 		doneSet[id] = true
 	}
-	healthyCount := 0
-	var aliveDoneAddrs []string // 可用源地址
+	healthySeen := make(map[uint64]bool, len(inode.Replicas)) // 已计入健康的去重节点集
+	var aliveDoneAddrs []string                               // 可用源地址（去重）
 	for _, id := range inode.Replicas {
-		if aliveSet[id] && doneSet[id] {
-			healthyCount++
+		if aliveSet[id] && doneSet[id] && !healthySeen[id] {
+			healthySeen[id] = true
 			if n, ok := nodeByID[id]; ok {
 				aliveDoneAddrs = append(aliveDoneAddrs, n.Addr)
 			}
 		}
 	}
-	if healthyCount >= len(inode.Replicas) {
-		return nil // 全部健康，无需修复
+	if len(healthySeen) >= len(inode.Replicas) {
+		return nil // 去重后健康副本已满，无需修复
 	}
 
 	var tasks []repairTask
+	slotHealthy := make(map[uint64]bool, len(inode.Replicas)) // 逐槽消费：每个健康节点只认一个槽
 	for i, id := range inode.Replicas {
-		// 跳过健康的槽位。
-		if aliveSet[id] && doneSet[id] {
+		// 健康且未被前序槽位占用的节点：跳过。重复节点（同一 ID 占多个槽）的
+		// 第 2 个及以后落到 dupe 分支，当作"需换成不同物理节点"修，恢复冗余度。
+		dupe := aliveSet[id] && doneSet[id] && slotHealthy[id]
+		if aliveSet[id] && doneSet[id] && !slotHealthy[id] {
+			slotHealthy[id] = true
 			continue
 		}
 
@@ -232,7 +240,7 @@ func planRepairs(inode types.Inode, nodes []types.NodeInfo, maxAge time.Duration
 		}
 		srcIdx := rand.Intn(len(aliveDoneAddrs))
 
-		if aliveSet[id] {
+		if aliveSet[id] && !dupe {
 			// alive 但未 Done：直接对该槽节点触发 pull。
 			var targetAddr string
 			if n, ok := nodeByID[id]; ok {
@@ -245,7 +253,7 @@ func planRepairs(inode types.Inode, nodes []types.NodeInfo, maxAge time.Duration
 				SourceAddr: aliveDoneAddrs[srcIdx],
 			})
 		} else {
-			// dead：需要选新目标替换。
+			// dead 或 重复槽：选一个不在 Replicas 中的新目标替换。
 			// 候选：alive ∧ 不在 Replicas ∧ 剩余容量 ≥ 文件大小。
 			replicaSet := make(map[uint64]bool, len(inode.Replicas))
 			for _, rid := range inode.Replicas {
@@ -315,6 +323,12 @@ func (s *Scanner) repairScanOnce() {
 
 // repairLegacyInode 修复一个 legacy 整文件 inode（原 per-inode 路径）。
 func (s *Scanner) repairLegacyInode(in types.Inode, nodes []types.NodeInfo, now time.Time) {
+	// legacy 文件也纳入降级告警：此前只有分块路径有可见性，legacy 文件单副本
+	// 裸奔完全静默（healthyCount 重复计数 bug 修复后，这里的 healthy 也已去重）。
+	if !in.Staging && len(in.Replicas) > 0 {
+		healthy := countHealthy(in.DoneReplicas, in.Replicas, nodes, s.nodeMaxAge, now)
+		s.trackDegraded(in.ID, healthy, len(in.Replicas), now, fmt.Sprintf("inode %d (legacy)", in.ID))
+	}
 	tasks := planRepairs(in, nodes, s.nodeMaxAge)
 	if len(tasks) == 0 {
 		s.mu.Lock()
@@ -382,36 +396,56 @@ func (s *Scanner) trackDegradedChunk(in types.Inode, c types.ChunkInfo, chunkID 
 	if in.Staging {
 		return // staging 文件降级是正常态（从副本还在路上），不告警
 	}
+	healthy := countHealthy(c.Done, c.Replicas, nodes, s.nodeMaxAge, now)
+	s.trackDegraded(chunkID, healthy, len(c.Replicas), now,
+		fmt.Sprintf("inode %d chunk %d", in.ID, c.Index))
+}
+
+// countHealthy 统计 done 集合里"节点仍 alive"且去重后的副本数（不超过 want）。
+func countHealthy(done, replicas []uint64, nodes []types.NodeInfo, maxAge time.Duration, now time.Time) int {
 	alive := make(map[uint64]bool, len(nodes))
 	for _, n := range nodes {
-		if now.Sub(n.LastHeartbeat) <= s.nodeMaxAge {
+		if now.Sub(n.LastHeartbeat) <= maxAge {
 			alive[n.ID] = true
 		}
 	}
+	replicaSet := make(map[uint64]bool, len(replicas))
+	for _, id := range replicas {
+		replicaSet[id] = true
+	}
+	seen := make(map[uint64]bool, len(done))
 	healthy := 0
-	for _, id := range c.Done {
-		if alive[id] {
+	for _, id := range done {
+		if alive[id] && replicaSet[id] && !seen[id] {
+			seen[id] = true
 			healthy++
 		}
 	}
+	return healthy
+}
+
+// trackDegraded 通用降级窗口告警（分块块 / legacy 文件共用）：
+// healthy < want 持续超 degradedWarnDur → WARN 一次；恢复 → 清记录 + INFO。
+// id 用 chunkID 或 legacy inode ID——两者数值空间不重叠，同一组 map 不会串。
+func (s *Scanner) trackDegraded(id uint64, healthy, want int, now time.Time, desc string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if healthy >= len(c.Replicas) {
-		if since, ok := s.degradedSince[chunkID]; ok {
-			delete(s.degradedSince, chunkID)
-			delete(s.degradedWarn, chunkID)
-			log.Printf("WARN-解除: inode %d chunk %d 恢复满副本（降级时长 %s）", in.ID, c.Index, now.Sub(since).Round(time.Second))
+	if healthy >= want {
+		if since, ok := s.degradedSince[id]; ok {
+			delete(s.degradedSince, id)
+			delete(s.degradedWarn, id)
+			log.Printf("WARN-解除: %s 恢复满副本（降级时长 %s）", desc, now.Sub(since).Round(time.Second))
 		}
 		return
 	}
-	if _, ok := s.degradedSince[chunkID]; !ok {
-		s.degradedSince[chunkID] = now
+	if _, ok := s.degradedSince[id]; !ok {
+		s.degradedSince[id] = now
 		return
 	}
-	if !s.degradedWarn[chunkID] && now.Sub(s.degradedSince[chunkID]) >= s.degradedWarnDur {
-		s.degradedWarn[chunkID] = true
-		log.Printf("WARN: inode %d chunk %d 单副本/降级已持续 %s（healthy=%d/%d）——再丢一节点该块数据可能丢失",
-			in.ID, c.Index, now.Sub(s.degradedSince[chunkID]).Round(time.Second), healthy, len(c.Replicas))
+	if !s.degradedWarn[id] && now.Sub(s.degradedSince[id]) >= s.degradedWarnDur {
+		s.degradedWarn[id] = true
+		log.Printf("WARN: %s 单副本/降级已持续 %s（healthy=%d/%d）——再丢一节点数据可能丢失",
+			desc, now.Sub(s.degradedSince[id]).Round(time.Second), healthy, want)
 	}
 }
 
@@ -429,8 +463,8 @@ func (s *Scanner) executeChunkRepair(inodeID uint64, index int, t repairTask) {
 			return
 		}
 		if err := s.store.ReplaceChunkReplica(inodeID, index, t.OldNodeID, t.NewNodeID); err != nil {
-			if errors.Is(err, meta.ErrNotExist) || errors.Is(err, meta.ErrChunkNotExist) {
-				return // 文件/块被并发删除，静默跳过
+			if errors.Is(err, meta.ErrNotExist) || errors.Is(err, meta.ErrChunkNotExist) || errors.Is(err, meta.ErrReplicaDup) {
+				return // 文件/块被并发删除 / 候选已是副本（下轮换一个），静默跳过
 			}
 			log.Printf("inode %d chunk %d: ReplaceChunkReplica 失败: %v", inodeID, index, err)
 			return
@@ -477,8 +511,8 @@ func (s *Scanner) executeRepair(inodeID uint64, t repairTask) {
 			return
 		}
 		if err := s.store.ReplaceReplica(inodeID, t.OldNodeID, t.NewNodeID); err != nil {
-			if errors.Is(err, meta.ErrNotExist) {
-				return // 文件被并发删除，静默跳过
+			if errors.Is(err, meta.ErrNotExist) || errors.Is(err, meta.ErrReplicaDup) {
+				return // 文件被并发删除 / 候选已是副本（下轮换一个），静默跳过
 			}
 			log.Printf("inode %d slot %d: ReplaceReplica 失败: %v", inodeID, t.SlotIdx, err)
 			return

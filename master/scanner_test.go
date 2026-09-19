@@ -470,7 +470,8 @@ func TestSweepStagingExpiredTTL(t *testing.T) {
 	old, _ := store.CreateStagingFile(1)
 	store.AssignChunk(old.ID, 0, 10, []uint64{7})
 	// 把 mtime 改老：meta 层没有 API，用直接改 TTL 的方式 —— 等待 TTL 过期。
-	time.Sleep(150 * time.Millisecond)
+	// 留足余量（TTL 的数倍）：-race + 并行满载下 50ms 边距会偶发不足。
+	time.Sleep(400 * time.Millisecond)
 
 	// fresh：刚建的 staging。
 	fresh, _ := store.CreateStagingFile(1)

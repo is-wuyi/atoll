@@ -188,17 +188,25 @@ func (n *node) Mkdir(ctx context.Context, name string, _ uint32, out *fuse.Entry
 }
 
 func (n *node) Unlink(_ context.Context, name string) syscall.Errno {
-	// 删除写入中的文件：同时清掉本地缓冲。
 	remote := n.remotePath(name)
 	n.m.mu.Lock()
 	w := n.m.writes[remote]
-	delete(n.m.writes, remote)
+	n.m.mu.Unlock()
+	// 先删远端，成功后再丢本地缓冲——顺序不能反：此前先 discard 再 Rm，
+	// 删一个"刚 create 尚未 close"（远端还不存在）的文件时 Rm 返回 ENOENT，
+	// 但本地缓冲已经没了——数据丢失且报错不对。现在只有 Rm 真正成功、或该文件
+	// 本就只存在于本地缓冲（远端 ENOENT 但有活跃写句柄）时才清缓冲。
+	errno := mapErrno(n.m.client.Rm(remote))
+	if errno != 0 && !(errno == syscall.ENOENT && w != nil) {
+		return errno
+	}
+	n.m.mu.Lock()
+	if cur, ok := n.m.writes[remote]; ok && cur == w {
+		delete(n.m.writes, remote)
+	}
 	n.m.mu.Unlock()
 	if w != nil {
 		w.discard()
-	}
-	if err := n.m.client.Rm(remote); err != nil {
-		return mapErrno(err)
 	}
 	return 0
 }
@@ -420,6 +428,13 @@ func (rh *readHandle) readRange(start, end int64) ([]byte, syscall.Errno) {
 		resp.Body.Close()
 		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 			lastErr = err
+			continue
+		}
+		// 长度校验：请求区间 [start,end] 完全落在文件大小内（调用方已按 size 收口），
+		// 所以短读 = 该副本内容被截断/不完整。此前 legacy 路径直接 return buf[:n]，
+		// 会把截断数据当完整内容返回（cat 正常退出、文件却短了）。改为轮换下一个副本。
+		if int64(n) != want {
+			lastErr = fmt.Errorf("node %s: 短读 %d != %d", addr, n, want)
 			continue
 		}
 		rh.next = (rh.next + i + 1) % len(rh.addrs) // 记住可用地址

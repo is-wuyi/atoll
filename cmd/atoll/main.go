@@ -37,6 +37,7 @@ const usageText = `usage: atoll <command> [args]
 客户端命令 (可用 -master 或环境变量 ATOLL_MASTER 指定 master 地址):
   atoll put <本地文件> <远程路径>    上传文件 [-replicas N] [-min-copies N] [-f]
                                     大于零字节默认走分块上传（64MB 块，覆盖写原子）
+                                    单文件上限 16 GiB（256 × 64MB 块）
   atoll get <远程路径> <本地文件>    下载文件（自动兼容分块/整文件格式）
   atoll ls  <远程路径>              列目录
   atoll mkdir <远程路径>            建目录

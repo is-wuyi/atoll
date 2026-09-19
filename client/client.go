@@ -182,7 +182,11 @@ func (c *Client) Get(remotePath, localPath string) error {
 	// done 节点内部打乱实现随机负载均衡（保持 done 整体在前），依次尝试：宕机节点自动跳过。
 	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Done && !candidates[j].Done })
+	return c.getFromReplicas(in, candidates, localPath)
+}
 
+// getFromReplicas 依次尝试候选副本下载整对象到 localPath，带长度校验与故障转移。
+func (c *Client) getFromReplicas(in types.Inode, candidates []Replica, localPath string) error {
 	var lastErr error
 	for _, n := range candidates {
 		resp, err := c.HTTP.Get(fmt.Sprintf("http://%s/objects/%d", n.Addr, in.ID))
@@ -200,11 +204,18 @@ func (c *Client) Get(remotePath, localPath string) error {
 			resp.Body.Close()
 			return err
 		}
-		_, copyErr := io.Copy(out, resp.Body)
+		written, copyErr := io.Copy(out, resp.Body)
 		closeErr := out.Close()
 		resp.Body.Close()
 		if copyErr != nil || closeErr != nil {
 			return fmt.Errorf("写本地文件: %v / %v", copyErr, closeErr)
+		}
+		// 长度校验：读到的字节数必须等于元数据记录的大小。此前不校验，
+		// 从内容较短/较慢的副本读到截断数据会被当成功返回（静默截断）。
+		// 短读 → 换下一个副本重试（os.Create 会截断，重试覆盖不残留半份）。
+		if written != in.Size {
+			lastErr = fmt.Errorf("节点 %s: 短读 %d != 声明大小 %d", n.Addr, written, in.Size)
+			continue
 		}
 		return nil
 	}
@@ -294,7 +305,7 @@ func (c *Client) putChunkedCore(remotePath string, size int64, r io.Reader, repl
 
 	// 2. 流水线：读块（串行）→ 上传（并发 ≤2，错误经 channel 汇聚）。
 	errCh := make(chan error, chunkCount) // 每块最多报一个错
-	sem := make(chan struct{}, 2)         // 并发信号量：内存上界 2×64MB
+	sem := make(chan struct{}, 2)         // 并发信号量：内存上界 ~2×64MB
 	var wg sync.WaitGroup
 
 	buf := make([]byte, types.ChunkSize)
@@ -302,6 +313,7 @@ func (c *Client) putChunkedCore(remotePath string, size int64, r io.Reader, repl
 	for index := 0; written < size; index++ {
 		n, err := io.ReadFull(r, buf[:min(int64(len(buf)), size-written)])
 		if n == 0 && err != nil {
+			wg.Wait()
 			return fail(fmt.Errorf("读本地文件: %w", err))
 		}
 		if n == 0 {
@@ -310,10 +322,13 @@ func (c *Client) putChunkedCore(remotePath string, size int64, r io.Reader, repl
 		written += int64(n)
 		data := make([]byte, n)
 		copy(data, buf[:n])
+		// 信号量前移到生产者循环：读下一块前先占槽位，主循环因此被阻塞，
+		// 在途 data 缓冲恒 ≤ 并发深度。此前 sem 写在 goroutine 内部，主循环不等待，
+		// 会一次性读入 chunkCount×64MB（16GB 文件驻留 16GB 内存 → OOM）。
+		sem <- struct{}{}
 		wg.Add(1)
 		go func(idx int, data []byte) {
 			defer wg.Done()
-			sem <- struct{}{} // 拿到槽位才开始上传；Release 后读下一块
 			defer func() { <-sem }()
 			if err := c.uploadChunkOnce(stagingID, idx, data, replicas); err != nil {
 				errCh <- fmt.Errorf("chunk %d: %w", idx, err)
