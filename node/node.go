@@ -124,6 +124,11 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("PUT /replicate/{id}", n.handleReplicate)
 	mux.HandleFunc("POST /pull", n.handlePull)
 	mux.HandleFunc("GET /admin/objects", n.handleAdminObjects)
+	// 元数据备份 blob（master HA 灾备后端）：独立目录、字符串 key，与 objects/ 物理隔离。
+	mux.HandleFunc("PUT /meta-backup/{key}", n.handleMetaPut)
+	mux.HandleFunc("GET /meta-backup/{key}", n.handleMetaGet)
+	mux.HandleFunc("DELETE /meta-backup/{key}", n.handleMetaDelete)
+	mux.HandleFunc("GET /meta-backup", n.handleMetaList)
 	return auth.Wrap(mux, n.token)
 }
 
