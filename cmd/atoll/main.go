@@ -120,6 +120,7 @@ func runMaster(args []string, stderr io.Writer) int {
 	recoverFrom := fs.String("recover-from", "auto", "元数据恢复模式：auto|local|cluster（歧义时 auto 硬停等人工裁决）")
 	backupIntv := fs.Duration("meta-backup-interval", 10*time.Minute, "元数据全量快照备份周期")
 	backupReplicas := fs.Int("meta-backup-replicas", 3, "元数据快照/WAL 每块副本数上限 K")
+	backupRetention := fs.Int("meta-backup-retention", 3, "保留最近 N 个元数据快照版本")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -132,7 +133,7 @@ func runMaster(args []string, stderr io.Writer) int {
 
 	// 元数据备份器：既做恢复决策，也跑后台备份循环。
 	backup := master.NewMetaBackup(nil, *nodeMaxAge, master.MetaBackupConfig{
-		Replicas: *backupReplicas, Interval: *backupIntv,
+		Replicas: *backupReplicas, Retention: *backupRetention, Interval: *backupIntv,
 	})
 	backup.SetToken(auth.Token(*token))
 	backup.SetTLS(outTLS)

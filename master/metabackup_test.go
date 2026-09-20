@@ -143,6 +143,62 @@ func TestBackupNoNodesFails(t *testing.T) {
 	}
 }
 
+// parseBlobVersion 各种 key 形态。
+func TestParseBlobVersion(t *testing.T) {
+	cases := []struct {
+		key string
+		ver uint64
+		ok  bool
+	}{
+		{"snapshot-1-0", 1, true},
+		{"snapshot-42-7", 42, true},
+		{"wal-3-10-20", 3, true},
+		{"manifest", 0, false},
+		{"snapshot-", 0, false},
+		{"snapshot-abc-0", 0, false},
+		{"random", 0, false},
+	}
+	for _, c := range cases {
+		ver, ok := parseBlobVersion(c.key)
+		if ok != c.ok || (ok && ver != c.ver) {
+			t.Errorf("parseBlobVersion(%q) = (%d,%v), 期望 (%d,%v)", c.key, ver, ok, c.ver, c.ok)
+		}
+	}
+}
+
+// 保留数 N：连续备份 N+2 次后，只剩最近 N 个版本的快照 blob，老版本被清。
+func TestPruneOldVersions(t *testing.T) {
+	store, b, addrs := newBackupCluster(t, 3)
+	b.cfg.Retention = 2
+
+	// 备份 4 次（版本 1..4），每次改点东西。
+	for i := 0; i < 4; i++ {
+		store.CreateDir(meta.RootID, fmt.Sprintf("d%d", i))
+		if _, err := b.BackupOnce(); err != nil {
+			t.Fatalf("BackupOnce#%d: %v", i+1, err)
+		}
+	}
+	// 当前版本 4，保留 2 → 只应剩版本 3、4 的快照 blob，1、2 被清。
+	seen := map[uint64]bool{}
+	for _, addr := range addrs {
+		blobs, err := b.listBlobs(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, bl := range blobs {
+			if ver, ok := parseBlobVersion(bl.Key); ok {
+				seen[ver] = true
+			}
+		}
+	}
+	if seen[1] || seen[2] {
+		t.Fatalf("版本 1/2 应已清理，实际存在: %v", seen)
+	}
+	if !seen[3] || !seen[4] {
+		t.Fatalf("版本 3/4 应保留，实际: %v", seen)
+	}
+}
+
 // manifest JSON 编解码往返。
 func TestManifestRoundTrip(t *testing.T) {
 	m := Manifest{

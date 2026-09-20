@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -82,13 +84,14 @@ func (m *Manifest) LatestSeq() uint64 {
 
 // MetaBackupConfig 备份策略参数（控制台可调，见 HA 设计决策点 1/2）。
 type MetaBackupConfig struct {
-	Replicas int // K：快照/WAL 每块副本数上限（默认 3，实际取 min(K, 存活节点数)）
-	Interval time.Duration
+	Replicas  int // K：快照/WAL 每块副本数上限（默认 3，实际取 min(K, 存活节点数)）
+	Retention int // 保留最近 N 个快照版本（默认 3；防"最新快照固化坏状态"无回退）
+	Interval  time.Duration
 }
 
 // DefaultMetaBackupConfig 默认策略。
 func DefaultMetaBackupConfig() MetaBackupConfig {
-	return MetaBackupConfig{Replicas: 3, Interval: 10 * time.Minute}
+	return MetaBackupConfig{Replicas: 3, Retention: 3, Interval: 10 * time.Minute}
 }
 
 // MetaBackup 执行元数据备份进集群。
@@ -107,6 +110,9 @@ type MetaBackup struct {
 func NewMetaBackup(store *meta.Store, nodeMaxAge time.Duration, cfg MetaBackupConfig) *MetaBackup {
 	if cfg.Replicas <= 0 {
 		cfg.Replicas = 3
+	}
+	if cfg.Retention <= 0 {
+		cfg.Retention = 3
 	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = 10 * time.Minute
@@ -183,6 +189,50 @@ func (b *MetaBackup) getBlob(addr, key string) (data []byte, found bool, err err
 		return nil, false, err
 	}
 	return data, true, nil
+}
+
+// deleteBlob 从某节点删除一个 blob（幂等，404 也算成功）。
+func (b *MetaBackup) deleteBlob(addr, key string) error {
+	url := fmt.Sprintf("%s://%s/meta-backup/%s", b.scheme, addr, key)
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("delete blob %s → %s: 状态 %d", key, addr, resp.StatusCode)
+	}
+	return nil
+}
+
+// blobEntry 是节点 LIST /meta-backup 返回的单条。
+type blobEntry struct {
+	Key  string `json:"key"`
+	Size int64  `json:"size"`
+}
+
+// listBlobs 列出某节点上的全部元数据 blob。
+func (b *MetaBackup) listBlobs(addr string) ([]blobEntry, error) {
+	url := fmt.Sprintf("%s://%s/meta-backup", b.scheme, addr)
+	resp, err := b.httpClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("list blobs → %s: 状态 %d", addr, resp.StatusCode)
+	}
+	var out []blobEntry
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ---- K 个负载最低节点选择 ----
@@ -309,7 +359,75 @@ func (b *MetaBackup) BackupOnce() (Manifest, error) {
 	// 截断失败只记录不致命——多留些旧帧只是占点空间，不影响正确性。
 	b.lastManifest = m
 	_ = b.store.TruncateWALThrough(snapSeq)
+
+	// 独立元数据 GC：清理超保留数 N 的老快照版本（失败不致命，下次再清）。
+	if err := b.PruneOldVersions(); err != nil {
+		log.Printf("元数据备份: 清理老版本失败（不致命）: %v", err)
+	}
 	return m, nil
+}
+
+// parseBlobVersion 从 blob key 解析版本号：snapshot-<ver>-<idx> / wal-<ver>-<from>-<to>。
+// 返回 ok=false 表示不是带版本的快照/WAL blob（如 manifest），不参与版本清理。
+func parseBlobVersion(key string) (ver uint64, ok bool) {
+	var prefix string
+	switch {
+	case strings.HasPrefix(key, "snapshot-"):
+		prefix = "snapshot-"
+	case strings.HasPrefix(key, "wal-"):
+		prefix = "wal-"
+	default:
+		return 0, false
+	}
+	rest := key[len(prefix):]
+	// 版本号是 prefix 之后到第一个 '-' 之间。
+	dash := strings.IndexByte(rest, '-')
+	if dash < 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(rest[:dash], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// PruneOldVersions 删除所有版本 < (当前版本 - Retention + 1) 的快照/WAL blob。
+// 自纠错：不依赖记忆历史 manifest，直接 LIST 每个节点、按 key 版本号判定——
+// 即使中途崩溃/漏删，下次备份会再扫一遍补上。manifest 本身（单 key、每次覆盖）不动。
+func (b *MetaBackup) PruneOldVersions() error {
+	if b.version == 0 || b.cfg.Retention <= 0 {
+		return nil
+	}
+	// 保留 [cutoff, 当前] 的版本；cutoff 之前的删。
+	var cutoff uint64 = 1
+	if b.version > uint64(b.cfg.Retention) {
+		cutoff = b.version - uint64(b.cfg.Retention) + 1
+	}
+	alive, err := b.store.ListAliveNodes(b.nodeMaxAge)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, n := range alive {
+		blobs, err := b.listBlobs(n.Addr)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, bl := range blobs {
+			ver, ok := parseBlobVersion(bl.Key)
+			if !ok || ver >= cutoff {
+				continue
+			}
+			if err := b.deleteBlob(n.Addr, bl.Key); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 // ShipWAL 增量同步：把上次快照/同步之后的新 WAL 帧打包成一个段复制进集群，并更新
