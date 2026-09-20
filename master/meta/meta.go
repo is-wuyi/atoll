@@ -79,7 +79,7 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) init() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketInodes, bucketChildren, bucketNodes, bucketMeta} {
+		for _, b := range [][]byte{bucketInodes, bucketChildren, bucketNodes, bucketMeta, bucketWAL} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -163,26 +163,26 @@ func (s *Store) CreateDir(parentID uint64, name string) (types.Inode, error) {
 		return types.Inode{}, err
 	}
 	var in types.Inode
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		parent, err := getInodeTx(tx, parentID)
+	err := s.write(func(w *txw) error {
+		parent, err := getInodeTx(w.tx, parentID)
 		if err != nil {
 			return err
 		}
 		if parent.Type != types.TypeDir {
 			return ErrNotDir
 		}
-		if hasChild(tx, parentID, name) {
+		if hasChild(w.tx, parentID, name) {
 			return ErrExist
 		}
-		id, err := nextID(tx, keyNextInode)
+		id, err := w.nextID(keyNextInode)
 		if err != nil {
 			return err
 		}
 		in = types.Inode{ID: id, ParentID: parentID, Name: name, Type: types.TypeDir, Mtime: time.Now()}
-		if err := putInode(tx, &in); err != nil {
+		if err := w.putInode(&in); err != nil {
 			return err
 		}
-		return tx.Bucket(bucketChildren).Put(childKey(parentID, name), u64be(id))
+		return w.putChild(parentID, name, id)
 	})
 	if err != nil {
 		return types.Inode{}, err
@@ -196,26 +196,26 @@ func (s *Store) CreateFile(parentID uint64, name string, replicas []uint64) (typ
 		return types.Inode{}, err
 	}
 	var in types.Inode
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		parent, err := getInodeTx(tx, parentID)
+	err := s.write(func(w *txw) error {
+		parent, err := getInodeTx(w.tx, parentID)
 		if err != nil {
 			return err
 		}
 		if parent.Type != types.TypeDir {
 			return ErrNotDir
 		}
-		if hasChild(tx, parentID, name) {
+		if hasChild(w.tx, parentID, name) {
 			return ErrExist
 		}
-		id, err := nextID(tx, keyNextInode)
+		id, err := w.nextID(keyNextInode)
 		if err != nil {
 			return err
 		}
 		in = types.Inode{ID: id, ParentID: parentID, Name: name, Type: types.TypeFile, Mtime: time.Now(), Replicas: replicas}
-		if err := putInode(tx, &in); err != nil {
+		if err := w.putInode(&in); err != nil {
 			return err
 		}
-		return tx.Bucket(bucketChildren).Put(childKey(parentID, name), u64be(id))
+		return w.putChild(parentID, name, id)
 	})
 	if err != nil {
 		return types.Inode{}, err
@@ -258,25 +258,25 @@ func (s *Store) ListChildren(dirID uint64) ([]types.Inode, error) {
 
 // DeleteFile 删除一个文件记录。
 func (s *Store) DeleteFile(id uint64) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, id)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, id)
 		if err != nil {
 			return err
 		}
 		if in.Type != types.TypeFile {
 			return ErrNotFile
 		}
-		if err := tx.Bucket(bucketInodes).Delete(u64be(id)); err != nil {
+		if err := w.delInode(id); err != nil {
 			return err
 		}
-		return tx.Bucket(bucketChildren).Delete(childKey(in.ParentID, in.Name))
+		return w.delChild(in.ParentID, in.Name)
 	})
 }
 
 // DeleteDir 删除一个空目录。
 func (s *Store) DeleteDir(id uint64) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, id)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, id)
 		if err != nil {
 			return err
 		}
@@ -286,13 +286,13 @@ func (s *Store) DeleteDir(id uint64) error {
 		if id == RootID {
 			return errors.New("cannot delete root")
 		}
-		if hasAnyChild(tx, id) {
+		if hasAnyChild(w.tx, id) {
 			return ErrNotEmpty
 		}
-		if err := tx.Bucket(bucketInodes).Delete(u64be(id)); err != nil {
+		if err := w.delInode(id); err != nil {
 			return err
 		}
-		return tx.Bucket(bucketChildren).Delete(childKey(in.ParentID, in.Name))
+		return w.delChild(in.ParentID, in.Name)
 	})
 }
 
@@ -301,34 +301,34 @@ func (s *Store) Rename(id uint64, newName string) error {
 	if err := validateName(newName); err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, id)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, id)
 		if err != nil {
 			return err
 		}
 		if in.ID == RootID {
 			return errors.New("cannot rename root")
 		}
-		if hasChild(tx, in.ParentID, newName) {
+		if hasChild(w.tx, in.ParentID, newName) {
 			return ErrExist
 		}
-		if err := tx.Bucket(bucketChildren).Delete(childKey(in.ParentID, in.Name)); err != nil {
+		if err := w.delChild(in.ParentID, in.Name); err != nil {
 			return err
 		}
 		in.Name = newName
 		in.Mtime = time.Now()
-		if err := putInode(tx, &in); err != nil {
+		if err := w.putInode(&in); err != nil {
 			return err
 		}
-		return tx.Bucket(bucketChildren).Put(childKey(in.ParentID, newName), u64be(id))
+		return w.putChild(in.ParentID, newName, id)
 	})
 }
 
 // UpdateFileSize 更新文件大小，并把主副本（Replicas[0]）标记为已同步。
 // 客户端直连主副本写完数据后 commit 时调用。
 func (s *Store) UpdateFileSize(id uint64, size int64, checksum uint32) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, id)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, id)
 		if err != nil {
 			return err
 		}
@@ -341,14 +341,14 @@ func (s *Store) UpdateFileSize(id uint64, size int64, checksum uint32) error {
 		if len(in.Replicas) > 0 {
 			in.DoneReplicas = appendUnique(in.DoneReplicas, in.Replicas[0])
 		}
-		return putInode(tx, &in)
+		return w.putInode(&in)
 	})
 }
 
 // AddReplicaDone 把某节点加入文件的已完成副本列表（从副本同步完成后上报）。
 func (s *Store) AddReplicaDone(id, nodeID uint64) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, id)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, id)
 		if err != nil {
 			return err
 		}
@@ -360,7 +360,7 @@ func (s *Store) AddReplicaDone(id, nodeID uint64) error {
 			return nil
 		}
 		in.DoneReplicas = appendUnique(in.DoneReplicas, nodeID)
-		return putInode(tx, &in)
+		return w.putInode(&in)
 	})
 }
 
@@ -376,8 +376,8 @@ func appendUnique(list []uint64, v uint64) []uint64 {
 
 // UpdateFile 更新文件大小与副本位置（写完成后调用）。
 func (s *Store) UpdateFile(id uint64, size int64, replicas []uint64) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, id)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, id)
 		if err != nil {
 			return err
 		}
@@ -387,7 +387,7 @@ func (s *Store) UpdateFile(id uint64, size int64, replicas []uint64) error {
 		in.Size = size
 		in.Replicas = replicas
 		in.Mtime = time.Now()
-		return putInode(tx, &in)
+		return w.putInode(&in)
 	})
 }
 
@@ -430,15 +430,15 @@ var ErrReplicaDup = errors.New("replica already present")
 // Staging=true, Chunked=true，不挂 children——路径解析天然看不见它。
 func (s *Store) CreateStagingFile(parentID uint64) (types.Inode, error) {
 	var in types.Inode
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		parent, err := getInodeTx(tx, parentID)
+	err := s.write(func(w *txw) error {
+		parent, err := getInodeTx(w.tx, parentID)
 		if err != nil {
 			return err
 		}
 		if parent.Type != types.TypeDir {
 			return ErrNotDir
 		}
-		id, err := nextStagingID(tx)
+		id, err := w.nextStagingID()
 		if err != nil {
 			return err
 		}
@@ -450,7 +450,7 @@ func (s *Store) CreateStagingFile(parentID uint64) (types.Inode, error) {
 			Staging:  true,
 			Chunked:  true,
 		}
-		return putInode(tx, &in)
+		return w.putInode(&in)
 	})
 	if err != nil {
 		return types.Inode{}, err
@@ -458,25 +458,12 @@ func (s *Store) CreateStagingFile(parentID uint64) (types.Inode, error) {
 	return in, nil
 }
 
-// nextStagingID 读取并自增 staging 计数器，从 StagingInodeBase 起。
-func nextStagingID(tx *bolt.Tx) (uint64, error) {
-	b := tx.Bucket(bucketMeta)
-	cur := types.StagingInodeBase
-	if v := b.Get(keyNextStagingInode); v != nil {
-		cur = beU64(v)
-	}
-	if err := b.Put(keyNextStagingInode, u64be(cur+1)); err != nil {
-		return 0, err
-	}
-	return cur, nil
-}
-
 // AssignChunk 为 staging 文件的第 index 块分配副本节点。
 // 幂等：该块已分配则原样返回既有分配（重试安全）。
 func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []uint64, checksum uint32) (types.ChunkInfo, error) {
 	var chunk types.ChunkInfo
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, inodeID)
+	err := s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, inodeID)
 		if err != nil {
 			return err
 		}
@@ -501,7 +488,7 @@ func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []ui
 		// 刷新 Mtime：staging TTL 据此判"多久没活动"。此前锚定创建时间，
 		// 上传 >24h 的合法大文件会被连数据一起清掉——改为按活跃度续期。
 		in.Mtime = time.Now()
-		if err := putInode(tx, &in); err != nil {
+		if err := w.putInode(&in); err != nil {
 			return err
 		}
 		for _, c := range in.Chunks {
@@ -521,8 +508,8 @@ func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []ui
 // 返回新分配。块 Done 集合重置。
 func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64, checksum uint32) (types.ChunkInfo, error) {
 	var chunk types.ChunkInfo
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, inodeID)
+	err := s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, inodeID)
 		if err != nil {
 			return err
 		}
@@ -538,7 +525,7 @@ func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64, chec
 				}
 				chunk = in.Chunks[i]
 				in.Mtime = time.Now() // 换节点重试也是活跃上传，刷新 TTL
-				return putInode(tx, &in)
+				return w.putInode(&in)
 			}
 		}
 		return ErrChunkNotExist
@@ -553,8 +540,8 @@ func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64, chec
 // chunkID 由 types.ChunkID 编码；commit 前后调用均合法。
 func (s *Store) MarkChunkDone(chunkID, nodeID uint64) error {
 	inodeID, index := types.ParseChunkID(chunkID)
-	return s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, inodeID)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, inodeID)
 		if err != nil {
 			return err
 		}
@@ -570,7 +557,7 @@ func (s *Store) MarkChunkDone(chunkID, nodeID uint64) error {
 					return nil
 				}
 				in.Chunks[i].Done = appendUnique(in.Chunks[i].Done, nodeID)
-				return putInode(tx, &in)
+				return w.putInode(&in)
 			}
 		}
 		return ErrChunkNotExist
@@ -580,8 +567,8 @@ func (s *Store) MarkChunkDone(chunkID, nodeID uint64) error {
 // ReplaceChunkReplica 块级槽位替换（修复扫描）：Replicas 中 oldNodeID → newNodeID，
 // 同时从 Done 中移除 oldNodeID。staging 与已提交的分块文件均适用。
 func (s *Store) ReplaceChunkReplica(inodeID uint64, index int, oldNodeID, newNodeID uint64) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, inodeID)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, inodeID)
 		if err != nil {
 			return err
 		}
@@ -614,7 +601,7 @@ func (s *Store) ReplaceChunkReplica(inodeID uint64, index int, oldNodeID, newNod
 				}
 			}
 			in.Chunks[i].Done = filtered
-			return putInode(tx, &in)
+			return w.putInode(&in)
 		}
 		return ErrChunkNotExist
 	})
@@ -630,8 +617,8 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 	}
 	var out, old types.Inode
 	var hadOld bool
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, inodeID)
+	err := s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, inodeID)
 		if err != nil {
 			return err
 		}
@@ -657,7 +644,7 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 		if sum != size {
 			return fmt.Errorf("%w: chunk size sum %d != %d", ErrCommitFailed, sum, size)
 		}
-		parent, err := getInodeTx(tx, in.ParentID)
+		parent, err := getInodeTx(w.tx, in.ParentID)
 		if err != nil {
 			return err
 		}
@@ -665,15 +652,15 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 			return ErrNotDir
 		}
 		// 同名旧 inode：目录则拒绝覆盖，文件则同事务删除（原子替换）。
-		if oldID := tx.Bucket(bucketChildren).Get(childKey(in.ParentID, name)); oldID != nil {
-			old, err = getInodeTx(tx, beU64(oldID))
+		if oldID := w.tx.Bucket(bucketChildren).Get(childKey(in.ParentID, name)); oldID != nil {
+			old, err = getInodeTx(w.tx, beU64(oldID))
 			if err != nil {
 				return err
 			}
 			if old.Type == types.TypeDir {
 				return ErrExist
 			}
-			if err := tx.Bucket(bucketInodes).Delete(u64be(old.ID)); err != nil {
+			if err := w.delInode(old.ID); err != nil {
 				return err
 			}
 			hadOld = true
@@ -682,10 +669,10 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 		in.Size = size
 		in.Staging = false
 		in.Mtime = time.Now()
-		if err := putInode(tx, &in); err != nil {
+		if err := w.putInode(&in); err != nil {
 			return err
 		}
-		if err := tx.Bucket(bucketChildren).Put(childKey(in.ParentID, name), u64be(in.ID)); err != nil {
+		if err := w.putChild(in.ParentID, name, in.ID); err != nil {
 			return err
 		}
 		out = in
@@ -699,8 +686,8 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 
 // AbortStaging 删除 staging inode（幂等）。已落盘块对象的回收由调用方负责。
 func (s *Store) AbortStaging(inodeID uint64) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, inodeID)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, inodeID)
 		if err != nil {
 			if errors.Is(err, ErrNotExist) {
 				return nil
@@ -710,7 +697,7 @@ func (s *Store) AbortStaging(inodeID uint64) error {
 		if !in.Staging {
 			return ErrNotStaging
 		}
-		return tx.Bucket(bucketInodes).Delete(u64be(inodeID))
+		return w.delInode(inodeID)
 	})
 }
 
@@ -749,8 +736,8 @@ func (s *Store) NodeInfos(ids []uint64) ([]types.NodeInfo, error) {
 // 幂等：同一 addr 重复注册（如节点重启）复用原 ID，避免同一物理节点多 ID 并存。
 func (s *Store) RegisterNode(addr string, totalBytes int64) (types.NodeInfo, error) {
 	var n types.NodeInfo
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketNodes)
+	err := s.write(func(w *txw) error {
+		b := w.tx.Bucket(bucketNodes)
 		// 按 addr 找已有记录。
 		var existing *types.NodeInfo
 		err := b.ForEach(func(k, v []byte) error {
@@ -768,22 +755,28 @@ func (s *Store) RegisterNode(addr string, totalBytes int64) (types.NodeInfo, err
 			return err
 		}
 		if existing != nil {
-			// 复用 ID，刷新容量与心跳。
+			// 复用 ID，刷新容量与心跳。这是 liveness 刷新（节点重启后重注册），
+			// 不记 WAL——走底层 tx，保持 w.rec 为空，s.write 不追加帧（同心跳）。
 			existing.TotalBytes = totalBytes
 			existing.LastHeartbeat = time.Now()
 			n = *existing
-		} else {
-			id, err := nextID(tx, keyNextNode)
+			raw, err := json.Marshal(n)
 			if err != nil {
 				return err
 			}
-			n = types.NodeInfo{ID: id, Addr: addr, TotalBytes: totalBytes, LastHeartbeat: time.Now()}
+			return b.Put(u64be(n.ID), raw)
 		}
+		// 首次注册：分配新 ID 是持久变更，记 WAL。
+		id, err := w.nextID(keyNextNode)
+		if err != nil {
+			return err
+		}
+		n = types.NodeInfo{ID: id, Addr: addr, TotalBytes: totalBytes, LastHeartbeat: time.Now()}
 		raw, err := json.Marshal(n)
 		if err != nil {
 			return err
 		}
-		return b.Put(u64be(n.ID), raw)
+		return w.putNode(raw, n.ID)
 	})
 	if err != nil {
 		return types.NodeInfo{}, err
@@ -909,8 +902,8 @@ func (s *Store) ForEachFile(fn func(types.Inode) error) error {
 // 在 Replicas 中找到 oldNodeID 并替换为 newNodeID，同时从 DoneReplicas 中移除 oldNodeID。
 // inode 不存在返回 ErrNotExist，oldNodeID 不在 Replicas 中返回错误。
 func (s *Store) ReplaceReplica(inodeID, oldNodeID, newNodeID uint64) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		in, err := getInodeTx(tx, inodeID)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, inodeID)
 		if err != nil {
 			return err
 		}
@@ -939,7 +932,7 @@ func (s *Store) ReplaceReplica(inodeID, oldNodeID, newNodeID uint64) error {
 			}
 		}
 		in.DoneReplicas = filtered
-		return putInode(tx, &in)
+		return w.putInode(&in)
 	})
 }
 
@@ -981,19 +974,6 @@ func hasAnyChild(tx *bolt.Tx, parentID uint64) bool {
 	prefix := u64be(parentID)
 	k, _ := tx.Bucket(bucketChildren).Cursor().Seek(prefix)
 	return k != nil && bytes.HasPrefix(k, prefix)
-}
-
-// nextID 读取并自增计数器。
-func nextID(tx *bolt.Tx, key []byte) (uint64, error) {
-	b := tx.Bucket(bucketMeta)
-	cur := uint64(2)
-	if v := b.Get(key); v != nil {
-		cur = beU64(v)
-	}
-	if err := b.Put(key, u64be(cur+1)); err != nil {
-		return 0, err
-	}
-	return cur, nil
 }
 
 func u64be(v uint64) []byte {
