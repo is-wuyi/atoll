@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"atoll/master"
 	"atoll/pkg/types"
 )
 
@@ -335,6 +336,39 @@ func (s *Server) handleAccountRole(w http.ResponseWriter, r *http.Request, sess 
 		return
 	}
 	s.renderAccounts(w, sess, "已将 "+username+" 的角色改为 "+string(role), "")
+}
+
+// ---- 元数据备份 ----
+
+// handleMetaBackup GET /metabackup —— 元数据备份状态（快照版本/块/持有节点/WAL段/时间）。
+func (s *Server) handleMetaBackup(w http.ResponseWriter, r *http.Request, sess session) {
+	st, err := s.mc.metaBackup()
+	if err != nil {
+		s.renderError(w, sess, http.StatusBadGateway, "无法读取元数据备份状态", err.Error())
+		return
+	}
+	s.render(w, "metabackup", struct {
+		pageBase
+		S      master.BackupStatus
+		Notice string
+	}{newPageBase("metabackup", "元数据备份", sess), st, r.URL.Query().Get("notice")})
+}
+
+// handleMetaBackupTrigger POST /metabackup/trigger —— 手动触发一次备份。仅 admin，需 CSRF。
+func (s *Server) handleMetaBackupTrigger(w http.ResponseWriter, r *http.Request, sess session) {
+	if sess.Role != RoleAdmin {
+		s.renderError(w, sess, http.StatusForbidden, "权限不足", "只有 admin 角色可以触发元数据备份")
+		return
+	}
+	if r.FormValue("csrf") != sess.CSRF {
+		http.Error(w, "csrf mismatch", http.StatusForbidden)
+		return
+	}
+	if err := s.mc.triggerBackup(); err != nil {
+		s.renderError(w, sess, http.StatusBadGateway, "触发备份失败", err.Error())
+		return
+	}
+	http.Redirect(w, r, "/metabackup?notice="+"已触发一次全量备份", http.StatusSeeOther)
 }
 
 // ---- 完整性与修复 ----

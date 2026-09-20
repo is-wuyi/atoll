@@ -99,11 +99,19 @@ type MetaBackup struct {
 	store      *meta.Store
 	nodeMaxAge time.Duration
 	cfg        MetaBackupConfig
-	httpClient   *http.Client
-	scheme       string
-	version      uint64   // 最近一次备份的版本号（进程内递增；恢复后由 manifest 校准）
-	lastManifest Manifest // 最近一次备份的 manifest（供 ShipWAL 增量追加）
-	wg           sync.WaitGroup
+	httpClient *http.Client
+	scheme     string
+	wg         sync.WaitGroup
+
+	// opMu 序列化备份操作（BackupOnce/ShipWAL/手动触发互斥，不重叠）。
+	opMu sync.Mutex
+
+	// mu 保护下列状态字段（后台循环写、HTTP 状态查询读，短暂持有）。
+	mu           sync.Mutex
+	version      uint64    // 最近一次备份的版本号（进程内递增；恢复后由 manifest 校准）
+	lastManifest Manifest  // 最近一次备份的 manifest（供 ShipWAL 增量追加）
+	lastBackupAt time.Time // 最近一次成功全量备份时刻
+	lastErr      string    // 最近一次备份错误（成功则空）
 }
 
 // NewMetaBackup 创建备份器。token/TLS 经 SetToken/SetTLS 生效（同 Scanner）。
@@ -289,6 +297,26 @@ var (
 // 返回本次写出的 manifest。任一快照块或 manifest 一个节点都没落上 → 报错（本次备份失败，
 // 不推进版本、不截断 WAL；下次重试）。
 func (b *MetaBackup) BackupOnce() (Manifest, error) {
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	m, err := b.backupOnceLocked()
+	b.recordResult(err)
+	return m, err
+}
+
+// recordResult 记录最近一次操作的错误（成功则清空），供状态页展示。
+func (b *MetaBackup) recordResult(err error) {
+	b.mu.Lock()
+	if err != nil {
+		b.lastErr = err.Error()
+	} else {
+		b.lastErr = ""
+	}
+	b.mu.Unlock()
+}
+
+// backupOnceLocked 是 BackupOnce 的实体（调用方已持 opMu）。
+func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
 	// 选负载最低的 K 个节点放快照/WAL；manifest 稍后宽复制到全部存活节点。
 	targets, err := b.pickLeastLoaded(b.cfg.Replicas)
 	if err != nil {
@@ -309,8 +337,10 @@ func (b *MetaBackup) BackupOnce() (Manifest, error) {
 		return Manifest{}, err
 	}
 
+	b.mu.Lock()
 	b.version++
 	ver := b.version
+	b.mu.Unlock()
 	m := Manifest{
 		Version:       ver,
 		CreatedAt:     time.Now().UTC(),
@@ -357,7 +387,10 @@ func (b *MetaBackup) BackupOnce() (Manifest, error) {
 
 	// 备份成功：记住当前 manifest（供 ShipWAL 增量追加），截断已固化的 WAL（<= snapSeq）。
 	// 截断失败只记录不致命——多留些旧帧只是占点空间，不影响正确性。
+	b.mu.Lock()
 	b.lastManifest = m
+	b.lastBackupAt = time.Now()
+	b.mu.Unlock()
 	_ = b.store.TruncateWALThrough(snapSeq)
 
 	// 独立元数据 GC：清理超保留数 N 的老快照版本（失败不致命，下次再清）。
@@ -396,13 +429,16 @@ func parseBlobVersion(key string) (ver uint64, ok bool) {
 // 自纠错：不依赖记忆历史 manifest，直接 LIST 每个节点、按 key 版本号判定——
 // 即使中途崩溃/漏删，下次备份会再扫一遍补上。manifest 本身（单 key、每次覆盖）不动。
 func (b *MetaBackup) PruneOldVersions() error {
-	if b.version == 0 || b.cfg.Retention <= 0 {
+	b.mu.Lock()
+	ver := b.version
+	b.mu.Unlock()
+	if ver == 0 || b.cfg.Retention <= 0 {
 		return nil
 	}
 	// 保留 [cutoff, 当前] 的版本；cutoff 之前的删。
 	var cutoff uint64 = 1
-	if b.version > uint64(b.cfg.Retention) {
-		cutoff = b.version - uint64(b.cfg.Retention) + 1
+	if ver > uint64(b.cfg.Retention) {
+		cutoff = ver - uint64(b.cfg.Retention) + 1
 	}
 	alive, err := b.store.ListAliveNodes(b.nodeMaxAge)
 	if err != nil {
@@ -437,20 +473,26 @@ func (b *MetaBackup) PruneOldVersions() error {
 // 无 manifest（还没做过 BackupOnce）或无新帧则直接返回。段 blob 也不截断本地 WAL——
 // 截断只在 BackupOnce 落新快照后做（否则重放起点会丢）。
 func (b *MetaBackup) ShipWAL() (Manifest, bool, error) {
-	if b.lastManifest.Version == 0 {
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+
+	b.mu.Lock()
+	base := b.lastManifest
+	b.mu.Unlock()
+	if base.Version == 0 {
 		return Manifest{}, false, nil // 尚无基准快照
 	}
-	from := b.lastManifest.LatestSeq()
+	from := base.LatestSeq()
 	frames, err := b.store.FramesSince(from)
 	if err != nil {
 		return Manifest{}, false, err
 	}
 	if len(frames) == 0 {
-		return b.lastManifest, false, nil // 无新增量
+		return base, false, nil // 无新增量
 	}
 	toSeq := frames[len(frames)-1].Seq
 	seg := meta.EncodeWALSegment(frames)
-	key := fmt.Sprintf("wal-%d-%d-%d", b.lastManifest.Version, from+1, toSeq)
+	key := fmt.Sprintf("wal-%d-%d-%d", base.Version, from+1, toSeq)
 
 	targets, err := b.pickLeastLoaded(b.cfg.Replicas)
 	if err != nil {
@@ -465,8 +507,8 @@ func (b *MetaBackup) ShipWAL() (Manifest, bool, error) {
 	}
 
 	// 追加 WAL 段到 manifest，重新宽复制。
-	m := b.lastManifest
-	m.WALSegs = append(m.WALSegs, WALSegRef{
+	m := base
+	m.WALSegs = append(append([]WALSegRef(nil), base.WALSegs...), WALSegRef{
 		Key: key, FromSeq: from + 1, ToSeq: toSeq,
 		Size: int64(len(seg)), CRC32C: types.CRC32C(seg), Holders: holders,
 	})
@@ -481,7 +523,9 @@ func (b *MetaBackup) ShipWAL() (Manifest, bool, error) {
 	if len(b.shipBlob(allAlive, ManifestKey, mfJSON)) == 0 {
 		return Manifest{}, false, fmt.Errorf("%w: manifest", ErrShipIncomplete)
 	}
+	b.mu.Lock()
 	b.lastManifest = m
+	b.mu.Unlock()
 	return m, true, nil
 }
 
@@ -525,3 +569,41 @@ func (b *MetaBackup) StartLoop(ctx context.Context, walIntv time.Duration) {
 
 // Wait 等待后台循环退出（优雅关闭，先于 store.Close）。
 func (b *MetaBackup) Wait() { b.wg.Wait() }
+
+// BackupStatus 是元数据备份的可观测状态（控制台展示用）。
+type BackupStatus struct {
+	Enabled      bool      `json:"enabled"`       // 是否配了种子、跑着备份循环
+	Version      uint64    `json:"version"`       // 当前 manifest 版本
+	SnapshotSeq  uint64    `json:"snapshot_seq"`  // 快照锚点 WAL seq
+	LatestSeq    uint64    `json:"latest_seq"`    // 含 WAL 段的最新 seq
+	SnapshotSize int64     `json:"snapshot_size"` // 快照总字节
+	Chunks       []ChunkRef  `json:"chunks"`
+	WALSegs      []WALSegRef `json:"wal_segs"`
+	LastBackupAt time.Time `json:"last_backup_at"`
+	LastError    string    `json:"last_error"`
+	Retention    int       `json:"retention"`
+	Replicas     int       `json:"replicas"`
+}
+
+// Status 返回当前备份状态快照（线程安全）。
+func (b *MetaBackup) Status() BackupStatus {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	m := b.lastManifest
+	return BackupStatus{
+		Enabled:      b.version > 0 || m.Version > 0,
+		Version:      m.Version,
+		SnapshotSeq:  m.SnapshotSeq,
+		LatestSeq:    m.LatestSeq(),
+		SnapshotSize: m.SnapshotBytes,
+		Chunks:       m.Chunks,
+		WALSegs:      m.WALSegs,
+		LastBackupAt: b.lastBackupAt,
+		LastError:    b.lastErr,
+		Retention:    b.cfg.Retention,
+		Replicas:     b.cfg.Replicas,
+	}
+}
+
+// TriggerBackup 手动触发一次全量备份（控制台按钮；与后台循环互斥）。
+func (b *MetaBackup) TriggerBackup() (Manifest, error) { return b.BackupOnce() }

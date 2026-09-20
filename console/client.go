@@ -151,6 +151,31 @@ func (c *masterClient) gc(execute bool) ([]GCNodeReport, error) {
 	return reports, json.NewDecoder(resp.Body).Decode(&reports)
 }
 
+// metaBackup 读元数据备份状态（master GET /admin/metabackup）。
+func (c *masterClient) metaBackup() (master.BackupStatus, error) {
+	var st master.BackupStatus
+	return st, c.getJSON("/admin/metabackup", &st)
+}
+
+// triggerBackup 手动触发一次元数据全量备份（master POST /admin/metabackup/trigger）。
+// 走 adminHTTP（破坏性/有副作用，master 侧 adminToken 鉴权）。
+func (c *masterClient) triggerBackup() error {
+	req, err := http.NewRequest(http.MethodPost, c.base+"/admin/metabackup/trigger", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.adminHTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("触发备份: %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
 func (c *masterClient) lookup(path string) (types.Inode, []replicaEntry, error) {
 	var out struct {
 		Inode types.Inode    `json:"inode"`

@@ -24,6 +24,7 @@ type Server struct {
 	store      *meta.Store
 	nodeMaxAge time.Duration // 节点心跳超时阈值
 	scanner    *Scanner      // GC 需要调用
+	backup     *MetaBackup   // 元数据备份状态查询/手动触发（可为 nil：未启用备份）
 	token      auth.Token    // 集群认证；空 = 兼容模式
 	adminToken auth.Token    // 破坏性操作（/admin/gc）专用；空 = 回退用 token
 	scheme     string        // 出站访问节点的 scheme：http（默认）/https
@@ -58,12 +59,15 @@ func (s *Server) nodeScheme() string {
 }
 
 // adminPaths 需要 adminToken 的破坏性路径。/admin/objects 是只读清单、不在内。
-var adminPaths = map[string]bool{"/admin/gc": true}
+var adminPaths = map[string]bool{"/admin/gc": true, "/admin/metabackup/trigger": true}
 
 // SetScanner 绑定扫描器，供 /admin/gc 等接口使用。
 func (s *Server) SetScanner(scanner *Scanner) {
 	s.scanner = scanner
 }
+
+// SetMetaBackup 绑定元数据备份器，供 /admin/metabackup 状态查询与手动触发。
+func (s *Server) SetMetaBackup(b *MetaBackup) { s.backup = b }
 
 // Handler 返回全部路由（整体经 auth 包装，healthz 豁免）。
 func (s *Server) Handler() http.Handler {
@@ -90,6 +94,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/nodes", s.handleAdminNodes)
 	mux.HandleFunc("GET /admin/repairs", s.handleAdminRepairs)
 	mux.HandleFunc("GET /admin/integrity", s.handleAdminIntegrity)
+	mux.HandleFunc("GET /admin/metabackup", s.handleAdminMetaBackup)
+	mux.HandleFunc("POST /admin/metabackup/trigger", s.handleAdminMetaBackupTrigger)
 	return auth.WrapTokens(mux, s.token, s.adminToken, adminPaths)
 }
 

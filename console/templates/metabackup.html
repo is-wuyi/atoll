@@ -1,0 +1,112 @@
+{{define "metabackup"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoll · 元数据备份</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  {{template "sidebar" .}}
+  <div class="main">
+    {{template "topbar" .}}
+    <div class="content">
+      {{if .Notice}}<div class="flash ok">{{.Notice}}</div>{{end}}
+
+      {{if not .S.Enabled}}
+      <div class="section">
+        <div class="panel">
+          <div class="soon-hero">
+            <div class="soon-ico">⛁</div>
+            <h2>元数据备份未启用</h2>
+            <p class="soon-lead">master 未配置灾备种子（<code>-seeds</code>），元数据仅存于 master 本机 bbolt。
+            配置种子节点后，master 会周期性把元数据快照 + WAL 复制进集群，本机盘损坏时可从集群重建。</p>
+            <ul class="soon-list">
+              <li>启动 master 时加 <code>-seeds host:port,host:port</code>（至少一个已知存储节点）</li>
+              <li>可调：<code>-meta-backup-interval</code> 快照周期、<code>-meta-backup-replicas</code> 副本数 K、<code>-meta-backup-retention</code> 保留版本数</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      {{else}}
+
+      <div class="cards">
+        <div class="card">
+          <div class="label">当前版本</div>
+          <div class="value">v{{.S.Version}}</div>
+          <div class="sub">保留最近 {{.S.Retention}} 个版本</div>
+        </div>
+        <div class="card">
+          <div class="label">快照大小</div>
+          <div class="value">{{bytes .S.SnapshotSize}}</div>
+          <div class="sub">{{len .S.Chunks}} 块 · 副本 ×{{.S.Replicas}}</div>
+        </div>
+        <div class="card">
+          <div class="label">WAL 增量</div>
+          <div class="value">{{len .S.WALSegs}} <small>段</small></div>
+          <div class="sub">快照 seq {{.S.SnapshotSeq}} → 最新 {{.S.LatestSeq}}</div>
+        </div>
+        <div class="card{{if .S.LastError}} attn{{end}}">
+          <div class="label">上次备份</div>
+          <div class="value" style="font-size:16px">{{since .S.LastBackupAt}}</div>
+          {{if .S.LastError}}<div class="sub bad">{{.S.LastError}}</div>{{else}}<div class="sub">正常</div>{{end}}
+        </div>
+      </div>
+
+      {{if .IsAdmin}}
+      <div class="section">
+        <form method="post" action="/metabackup/trigger" style="margin:0">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <button type="submit" class="btn-primary">立即备份一次</button>
+        </form>
+      </div>
+      {{end}}
+
+      <div class="section">
+        <div class="section-head"><h2>快照块</h2><span class="count">{{len .S.Chunks}} 块</span></div>
+        <div class="panel">
+          <table>
+            <thead><tr><th>块 Key</th><th class="num">大小</th><th>持有节点</th></tr></thead>
+            <tbody>
+            {{range .S.Chunks}}
+              <tr>
+                <td class="mono">{{.Key}}</td>
+                <td class="num">{{bytes .Size}}</td>
+                <td>{{range .Holders}}<span class="badge">node {{.}}</span> {{end}}</td>
+              </tr>
+            {{else}}
+              <tr><td colspan="3" class="empty">暂无快照块</td></tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {{if .S.WALSegs}}
+      <div class="section">
+        <div class="section-head"><h2>WAL 增量段</h2><span class="count">{{len .S.WALSegs}} 段</span></div>
+        <div class="panel">
+          <table>
+            <thead><tr><th>段 Key</th><th class="num">seq 范围</th><th class="num">大小</th><th>持有节点</th></tr></thead>
+            <tbody>
+            {{range .S.WALSegs}}
+              <tr>
+                <td class="mono">{{.Key}}</td>
+                <td class="num">{{.FromSeq}}–{{.ToSeq}}</td>
+                <td class="num">{{bytes .Size}}</td>
+                <td>{{range .Holders}}<span class="badge">node {{.}}</span> {{end}}</td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {{end}}
+
+      {{end}}
+    </div>
+  </div>
+</div>
+</body>
+</html>{{end}}

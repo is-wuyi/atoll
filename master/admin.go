@@ -164,6 +164,31 @@ func (s *Server) handleAdminRepairs(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.scanner.Snapshot())
 }
 
+// handleAdminMetaBackup GET /admin/metabackup —— 元数据备份状态（版本/块/持有节点/时间）。
+func (s *Server) handleAdminMetaBackup(w http.ResponseWriter, _ *http.Request) {
+	if s.backup == nil {
+		// 未启用备份（没配种子）：返回 enabled=false，控制台据此显示"未启用"。
+		writeJSON(w, http.StatusOK, BackupStatus{Enabled: false})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.backup.Status())
+}
+
+// handleAdminMetaBackupTrigger POST /admin/metabackup/trigger —— 手动触发一次全量备份。
+// 走 adminToken（破坏性/有副作用操作）。
+func (s *Server) handleAdminMetaBackupTrigger(w http.ResponseWriter, _ *http.Request) {
+	if s.backup == nil {
+		httpError(w, http.StatusServiceUnavailable, "元数据备份未启用（master 未配置 -seeds）")
+		return
+	}
+	m, err := s.backup.TriggerBackup()
+	if err != nil {
+		httpError(w, http.StatusBadGateway, "备份失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
 // degradedItem 是完整性页的一行：某文件（或其某块）副本不足。
 type degradedItem struct {
 	Path     string `json:"path"`
