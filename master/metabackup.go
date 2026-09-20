@@ -2,12 +2,15 @@ package master
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	"atoll/master/meta"
@@ -93,9 +96,11 @@ type MetaBackup struct {
 	store      *meta.Store
 	nodeMaxAge time.Duration
 	cfg        MetaBackupConfig
-	httpClient *http.Client
-	scheme     string
-	version    uint64 // 最近一次备份的版本号（进程内递增；恢复后由 manifest 校准）
+	httpClient   *http.Client
+	scheme       string
+	version      uint64   // 最近一次备份的版本号（进程内递增；恢复后由 manifest 校准）
+	lastManifest Manifest // 最近一次备份的 manifest（供 ShipWAL 增量追加）
+	wg           sync.WaitGroup
 }
 
 // NewMetaBackup 创建备份器。token/TLS 经 SetToken/SetTLS 生效（同 Scanner）。
@@ -114,6 +119,9 @@ func NewMetaBackup(store *meta.Store, nodeMaxAge time.Duration, cfg MetaBackupCo
 		scheme:     "http",
 	}
 }
+
+// SetStore 设置元数据库（NewMetaBackup 可传 nil，恢复决策产出 store 后再注入）。
+func (b *MetaBackup) SetStore(s *meta.Store) { b.store = s }
 
 // SetToken / SetTLS 同 Scanner：配置出站认证与 TLS。
 func (b *MetaBackup) SetToken(t auth.Token) {
@@ -152,6 +160,29 @@ func (b *MetaBackup) putBlob(addr, key string, data []byte, crc uint32) error {
 		return fmt.Errorf("put blob %s → %s: 状态 %d", key, addr, resp.StatusCode)
 	}
 	return nil
+}
+
+// getBlob 从某节点 GET 一个 blob。found=false 表示 404（该节点没有）。
+func (b *MetaBackup) getBlob(addr, key string) (data []byte, found bool, err error) {
+	url := fmt.Sprintf("%s://%s/meta-backup/%s", b.scheme, addr, key)
+	resp, err := b.httpClient.Get(url)
+	if err != nil {
+		return nil, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		io.Copy(io.Discard, resp.Body)
+		return nil, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return nil, false, fmt.Errorf("get blob %s → %s: 状态 %d", key, addr, resp.StatusCode)
+	}
+	data, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false, err
+	}
+	return data, true, nil
 }
 
 // ---- K 个负载最低节点选择 ----
@@ -274,8 +305,105 @@ func (b *MetaBackup) BackupOnce() (Manifest, error) {
 		return Manifest{}, fmt.Errorf("%w: manifest", ErrShipIncomplete)
 	}
 
-	// 备份成功：截断已固化的 WAL（<= snapSeq）。截断失败只记录不致命——
-	// 多留些旧帧只是占点空间，不影响正确性。
+	// 备份成功：记住当前 manifest（供 ShipWAL 增量追加），截断已固化的 WAL（<= snapSeq）。
+	// 截断失败只记录不致命——多留些旧帧只是占点空间，不影响正确性。
+	b.lastManifest = m
 	_ = b.store.TruncateWALThrough(snapSeq)
 	return m, nil
 }
+
+// ShipWAL 增量同步：把上次快照/同步之后的新 WAL 帧打包成一个段复制进集群，并更新
+// manifest（追加 WAL 段 + 宽复制）。这是 WAL 相对全量快照的价值——用小代价把"丢数据
+// 窗口"从"一个快照间隔"收窄到"一个 WAL 同步间隔"。
+//
+// 无 manifest（还没做过 BackupOnce）或无新帧则直接返回。段 blob 也不截断本地 WAL——
+// 截断只在 BackupOnce 落新快照后做（否则重放起点会丢）。
+func (b *MetaBackup) ShipWAL() (Manifest, bool, error) {
+	if b.lastManifest.Version == 0 {
+		return Manifest{}, false, nil // 尚无基准快照
+	}
+	from := b.lastManifest.LatestSeq()
+	frames, err := b.store.FramesSince(from)
+	if err != nil {
+		return Manifest{}, false, err
+	}
+	if len(frames) == 0 {
+		return b.lastManifest, false, nil // 无新增量
+	}
+	toSeq := frames[len(frames)-1].Seq
+	seg := meta.EncodeWALSegment(frames)
+	key := fmt.Sprintf("wal-%d-%d-%d", b.lastManifest.Version, from+1, toSeq)
+
+	targets, err := b.pickLeastLoaded(b.cfg.Replicas)
+	if err != nil {
+		return Manifest{}, false, err
+	}
+	if len(targets) == 0 {
+		return Manifest{}, false, ErrNoAliveNodes
+	}
+	holders := b.shipBlob(targets, key, seg)
+	if len(holders) == 0 {
+		return Manifest{}, false, fmt.Errorf("%w: %s", ErrShipIncomplete, key)
+	}
+
+	// 追加 WAL 段到 manifest，重新宽复制。
+	m := b.lastManifest
+	m.WALSegs = append(m.WALSegs, WALSegRef{
+		Key: key, FromSeq: from + 1, ToSeq: toSeq,
+		Size: int64(len(seg)), CRC32C: types.CRC32C(seg), Holders: holders,
+	})
+	allAlive, err := b.store.ListAliveNodes(b.nodeMaxAge)
+	if err != nil {
+		return Manifest{}, false, err
+	}
+	mfJSON, err := marshalManifest(&m)
+	if err != nil {
+		return Manifest{}, false, err
+	}
+	if len(b.shipBlob(allAlive, ManifestKey, mfJSON)) == 0 {
+		return Manifest{}, false, fmt.Errorf("%w: manifest", ErrShipIncomplete)
+	}
+	b.lastManifest = m
+	return m, true, nil
+}
+
+// StartLoop 启动后台备份循环：每 walIntv 增量 ShipWAL 一次，每 cfg.Interval 落一次
+// 全量 BackupOnce。ctx 取消时退出。首次立即做一次 BackupOnce 建立基准快照。
+func (b *MetaBackup) StartLoop(ctx context.Context, walIntv time.Duration) {
+	if walIntv <= 0 || walIntv > b.cfg.Interval {
+		walIntv = b.cfg.Interval / 5
+	}
+	if walIntv <= 0 {
+		walIntv = time.Minute
+	}
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		// 首次建立基准快照（失败只记录，下个周期重试——可能暂时无存活节点）。
+		if _, err := b.BackupOnce(); err != nil {
+			log.Printf("元数据备份: 首次快照失败（将重试）: %v", err)
+		}
+		lastSnap := time.Now()
+		wal := time.NewTicker(walIntv)
+		defer wal.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-wal.C:
+				if time.Since(lastSnap) >= b.cfg.Interval {
+					if _, err := b.BackupOnce(); err != nil {
+						log.Printf("元数据备份: 快照失败: %v", err)
+					} else {
+						lastSnap = time.Now()
+					}
+				} else if _, _, err := b.ShipWAL(); err != nil {
+					log.Printf("元数据备份: WAL 增量同步失败: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+// Wait 等待后台循环退出（优雅关闭，先于 store.Close）。
+func (b *MetaBackup) Wait() { b.wg.Wait() }

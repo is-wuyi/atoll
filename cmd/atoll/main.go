@@ -24,7 +24,6 @@ import (
 	"atoll/client"
 	"atoll/console"
 	"atoll/master"
-	"atoll/master/meta"
 	"atoll/mount"
 	"atoll/node"
 	"atoll/pkg/auth"
@@ -117,6 +116,10 @@ func runMaster(args []string, stderr io.Writer) int {
 	tlsKey := fs.String("tls-key", "", "TLS 私钥文件")
 	tlsCA := fs.String("tls-ca", "", "校验节点证书用的 CA（出站到节点走 https 时）")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过节点证书校验（自签名内网）")
+	seedsFlag := fs.String("seeds", "", "元数据灾备种子节点地址（逗号分隔 host:port；配置后启用元数据备份进集群）")
+	recoverFrom := fs.String("recover-from", "auto", "元数据恢复模式：auto|local|cluster（歧义时 auto 硬停等人工裁决）")
+	backupIntv := fs.Duration("meta-backup-interval", 10*time.Minute, "元数据全量快照备份周期")
+	backupReplicas := fs.Int("meta-backup-replicas", 3, "元数据快照/WAL 每块副本数上限 K")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -125,11 +128,22 @@ func runMaster(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "atoll master: %v\n", err)
 		return 1
 	}
-	store, err := meta.Open(*dbPath)
+	seeds := splitSeeds(*seedsFlag)
+
+	// 元数据备份器：既做恢复决策，也跑后台备份循环。
+	backup := master.NewMetaBackup(nil, *nodeMaxAge, master.MetaBackupConfig{
+		Replicas: *backupReplicas, Interval: *backupIntv,
+	})
+	backup.SetToken(auth.Token(*token))
+	backup.SetTLS(outTLS)
+
+	// 恢复决策（fail-stop）：本地 vs 集群，歧义硬停。未配种子则退化为直接打开本地库。
+	store, err := backup.Recover(*dbPath, seeds, master.RecoverMode(*recoverFrom))
 	if err != nil {
 		fmt.Fprintf(stderr, "atoll master: %v\n", err)
 		return 1
 	}
+	backup.SetStore(store)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -138,8 +152,13 @@ func runMaster(args []string, stderr io.Writer) int {
 	scanner.SetToken(auth.Token(*token))
 	scanner.SetTLS(outTLS)
 	scanner.Start(ctx) // 内部为三个循环各起 goroutine
-	// 关闭顺序：等扫描器 goroutine 全部退出后再关 store，避免关库时扫描器仍在读写。
-	defer func() { scanner.Wait(); store.Close() }()
+	// 配了种子才跑备份循环（否则退化为纯本地，无灾备）。
+	if len(seeds) > 0 {
+		backup.StartLoop(ctx, 0) // walIntv=0 → 内部取 Interval/5
+		log.Printf("元数据备份进集群已启用：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
+	}
+	// 关闭顺序：等扫描器 + 备份 goroutine 全部退出后再关 store，避免关库时仍在读写。
+	defer func() { scanner.Wait(); backup.Wait(); store.Close() }()
 
 	srv := master.NewServer(store, *nodeMaxAge)
 	srv.SetScanner(scanner)
@@ -567,6 +586,20 @@ func clientTLS(caFile string, skipVerify bool) (*tls.Config, error) {
 		return nil, nil
 	}
 	return auth.ClientTLS(caFile, skipVerify)
+}
+
+// splitSeeds 解析逗号分隔的种子节点地址，去空白与空项。
+func splitSeeds(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // humanSize 人类可读的字节数（KiB/MiB/GiB）。

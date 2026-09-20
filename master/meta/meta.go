@@ -77,6 +77,9 @@ func Open(dbPath string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// DBPath 返回底层 bbolt 文件路径（恢复流程判断本地库位置、诊断用）。
+func (s *Store) DBPath() string { return s.db.Path() }
+
 func (s *Store) init() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		for _, b := range [][]byte{bucketInodes, bucketChildren, bucketNodes, bucketMeta, bucketWAL} {

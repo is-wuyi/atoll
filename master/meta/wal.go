@@ -244,6 +244,50 @@ func decodeFrame(seq uint64, b []byte) (Frame, error) {
 	return f, nil
 }
 
+// ---- WAL 段编解码（复制进集群用）----
+//
+// 一个 WAL 段 = 若干帧打包成一个 blob。段字节布局(全大端)：
+//   每帧: uint64 seq | uint32 frameLen | frameBytes(encodeFrame 的输出)
+// 帧之间首尾相接。DecodeWALSegment 还原成带 seq 的帧序列，喂给 ApplyFrames。
+
+// EncodeWALSegment 把一批帧打包成一个段 blob。
+func EncodeWALSegment(frames []Frame) []byte {
+	var buf []byte
+	var hdr [12]byte
+	for _, f := range frames {
+		body := encodeFrame(f.Muts)
+		binary.BigEndian.PutUint64(hdr[0:], f.Seq)
+		binary.BigEndian.PutUint32(hdr[8:], uint32(len(body)))
+		buf = append(buf, hdr[:]...)
+		buf = append(buf, body...)
+	}
+	return buf
+}
+
+// DecodeWALSegment 还原一个段 blob 为帧序列（按出现顺序，即 seq 升序）。
+func DecodeWALSegment(b []byte) ([]Frame, error) {
+	var frames []Frame
+	off := 0
+	for off < len(b) {
+		if off+12 > len(b) {
+			return nil, fmt.Errorf("wal 段: 帧头越界 @%d", off)
+		}
+		seq := binary.BigEndian.Uint64(b[off:])
+		fl := int(binary.BigEndian.Uint32(b[off+8:]))
+		off += 12
+		if off+fl > len(b) {
+			return nil, fmt.Errorf("wal 段: 帧体越界 @%d len=%d", off, fl)
+		}
+		f, err := decodeFrame(seq, b[off:off+fl])
+		if err != nil {
+			return nil, err
+		}
+		frames = append(frames, f)
+		off += fl
+	}
+	return frames, nil
+}
+
 // ---- 读取与重放 ----
 
 // WALSeq 返回当前最后一帧的 seq(0 = 尚无帧)。
