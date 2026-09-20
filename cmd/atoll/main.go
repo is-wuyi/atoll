@@ -163,6 +163,7 @@ func runMaster(args []string, stderr io.Writer) int {
 
 	srv := master.NewServer(store, *nodeMaxAge)
 	srv.SetScanner(scanner)
+	srv.SetMetaBackup(backup)
 	srv.SetToken(auth.Token(*token))
 	srv.SetAdminToken(auth.Token(*adminToken))
 	srv.SetTLS(outTLS)
