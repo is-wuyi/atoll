@@ -256,23 +256,37 @@ func (b *MetaBackup) Recover(dbPath string, seeds []string, mode RecoverMode) (*
 	action, reason := decideRecovery(in)
 	log.Printf("元数据恢复决策: %s（%s）", action, reason)
 
-	// 版本号播种：b.version 是进程内计数器，重启后从 0 起。若集群里已有更高版本，
-	// 必须续着它往上走——否则新备份版本号倒退，且 prune 的 cutoff 变成极小值，
-	// 永远删不掉那些高版本号的旧 blob（元数据备份无限泄漏）。
-	if in.ClusterFound && clusterMF.Version > 0 {
-		b.mu.Lock()
-		if clusterMF.Version > b.version {
-			b.version = clusterMF.Version
-		}
-		b.mu.Unlock()
-	}
-
+	var store *meta.Store
+	var err error
 	switch action {
 	case ActionUseLocal, ActionFreshStart:
-		return meta.Open(dbPath) // 本地在则打开，不在则新建空库
+		store, err = meta.Open(dbPath) // 本地在则打开，不在则新建空库
 	case ActionRebuild:
-		return b.rebuildFromCluster(dbPath, clusterMF, seeds)
+		store, err = b.rebuildFromCluster(dbPath, clusterMF, seeds)
 	default: // ActionFailStop
 		return nil, &ErrFailStop{Reason: reason}
 	}
+	if err != nil {
+		return nil, err
+	}
+
+	// 版本号权威在本地 bbolt（NextBackupVersion 持久自增）。这里只做防御性对账：
+	// 若集群 manifest 的版本号比本地持久值还高（例如从集群重建、或本地曾回退），
+	// 把本地抬到不低于它，确保后续 NextBackupVersion 续增时不会倒退、prune cutoff 正确。
+	if in.ClusterFound && clusterMF.Version > 0 {
+		if err := store.SetBackupVersionAtLeast(clusterMF.Version); err != nil {
+			store.Close()
+			return nil, err
+		}
+	}
+	// 把持久版本号载入内存缓存（Status/prune 快速读，避免每次读盘）。
+	pv, err := store.BackupVersion()
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	b.mu.Lock()
+	b.version = pv
+	b.mu.Unlock()
+	return store, nil
 }

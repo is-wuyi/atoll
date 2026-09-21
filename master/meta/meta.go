@@ -30,6 +30,9 @@ var (
 
 	keyNextInode = []byte("next_inode")
 	keyNextNode  = []byte("next_node")
+	// keyBackupVersion 持久化元数据备份的版本计数器。它是 master 自己的权威状态
+	// （不是内存临时值），随快照一起进 bbolt，重启后直接读回、单调续增，不依赖集群可达。
+	keyBackupVersion = []byte("backup_version")
 )
 
 // RootID 是根目录的固定 inode ID。

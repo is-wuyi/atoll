@@ -302,6 +302,50 @@ func (s *Store) WALSeq() (uint64, error) {
 	return seq, err
 }
 
+// BackupVersion 返回持久化的备份版本计数器(0 = 从未备份)。
+func (s *Store) BackupVersion() (uint64, error) {
+	var v uint64
+	err := s.db.View(func(tx *bolt.Tx) error {
+		if raw := tx.Bucket(bucketMeta).Get(keyBackupVersion); raw != nil {
+			v = beU64(raw)
+		}
+		return nil
+	})
+	return v, err
+}
+
+// NextBackupVersion 原子自增并返回新的备份版本号。这是 master 的权威计数器：
+// 存进本地 bbolt(随快照进集群)，重启后从本地读回续增，不依赖集群可达。
+func (s *Store) NextBackupVersion() (uint64, error) {
+	var next uint64
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketMeta)
+		cur := uint64(0)
+		if raw := b.Get(keyBackupVersion); raw != nil {
+			cur = beU64(raw)
+		}
+		next = cur + 1
+		return b.Put(keyBackupVersion, u64be(next))
+	})
+	return next, err
+}
+
+// SetBackupVersionAtLeast 把持久版本抬高到 at 少(若当前已 >= at 则不动)。
+// 从集群重建后用：确保本地计数器不低于集群已有的最高版本，避免续增时版本号倒退。
+func (s *Store) SetBackupVersionAtLeast(at uint64) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketMeta)
+		cur := uint64(0)
+		if raw := b.Get(keyBackupVersion); raw != nil {
+			cur = beU64(raw)
+		}
+		if at <= cur {
+			return nil
+		}
+		return b.Put(keyBackupVersion, u64be(at))
+	})
+}
+
 // FramesSince 返回 seq > since 的所有帧(升序)，供恢复重放或复制进集群。
 func (s *Store) FramesSince(since uint64) ([]Frame, error) {
 	var out []Frame

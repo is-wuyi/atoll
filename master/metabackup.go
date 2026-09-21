@@ -326,6 +326,16 @@ func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
 		return Manifest{}, ErrNoAliveNodes
 	}
 
+	// 先持久自增版本号，再取快照——这样快照的 meta 桶里就带着这个新版本号，
+	// 将来从该快照重建时读回的持久版本 = manifest 版本，两者天然一致。
+	ver, err := b.store.NextBackupVersion()
+	if err != nil {
+		return Manifest{}, err
+	}
+	b.mu.Lock()
+	b.version = ver
+	b.mu.Unlock()
+
 	// 快照锚点：此刻的 WAL seq。快照本身包含到此 seq 的全部状态。
 	snapSeq, err := b.store.WALSeq()
 	if err != nil {
@@ -337,10 +347,6 @@ func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
 		return Manifest{}, err
 	}
 
-	b.mu.Lock()
-	b.version++
-	ver := b.version
-	b.mu.Unlock()
 	m := Manifest{
 		Version:       ver,
 		CreatedAt:     time.Now().UTC(),
