@@ -435,7 +435,11 @@ func (b *MetaBackup) PruneOldVersions() error {
 	if ver == 0 || b.cfg.Retention <= 0 {
 		return nil
 	}
-	// 保留 [cutoff, 当前] 的版本；cutoff 之前的删。
+	// 合法版本窗口是 [cutoff, 当前]。窗口外两头都删：
+	//   - ver < cutoff：正常老化出局的旧版本。
+	//   - ver > 当前：上一轮 master（版本号更高的"纪元"）遗留的孤儿。单 master 下不
+	//     可能有比当前更新的合法版本，所以更高号一定是陈旧孤儿——旧逻辑只删 <cutoff，
+	//     这类高号孤儿会永生（本次 bug）。
 	var cutoff uint64 = 1
 	if ver > uint64(b.cfg.Retention) {
 		cutoff = ver - uint64(b.cfg.Retention) + 1
@@ -454,9 +458,12 @@ func (b *MetaBackup) PruneOldVersions() error {
 			continue
 		}
 		for _, bl := range blobs {
-			ver, ok := parseBlobVersion(bl.Key)
-			if !ok || ver >= cutoff {
-				continue
+			bver, ok := parseBlobVersion(bl.Key)
+			if !ok {
+				continue // manifest 等非版本化 blob 不动
+			}
+			if bver >= cutoff && bver <= ver {
+				continue // 在合法保留窗口内，保留
 			}
 			if err := b.deleteBlob(n.Addr, bl.Key); err != nil && firstErr == nil {
 				firstErr = err

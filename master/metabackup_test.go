@@ -11,6 +11,7 @@ import (
 
 	"atoll/master/meta"
 	"atoll/node"
+	"atoll/pkg/types"
 )
 
 // 起 n 个真实 httptest 存储节点并注册进 store，返回 store、备份器、节点地址表。
@@ -196,6 +197,35 @@ func TestPruneOldVersions(t *testing.T) {
 	}
 	if !seen[3] || !seen[4] {
 		t.Fatalf("版本 3/4 应保留，实际: %v", seen)
+	}
+}
+
+// prune 必须清掉"版本号比当前更高"的上一轮遗留孤儿（本次实机 bug）。
+func TestPruneRemovesHigherEpochOrphans(t *testing.T) {
+	store, b, addrs := newBackupCluster(t, 2)
+	b.cfg.Retention = 3
+
+	// 手动往节点塞一个"更高纪元"的孤儿快照（模拟上一轮 master 版本号 2860 的遗留）。
+	orphan := []byte("stale-epoch-orphan")
+	for _, addr := range addrs {
+		if err := b.putBlob(addr, "snapshot-2860-0", orphan, types.CRC32C(orphan)); err != nil {
+			t.Fatalf("塞孤儿失败: %v", err)
+		}
+	}
+
+	// 正常备份一次（当前版本会是 1）。prune 应删掉 v2860 孤儿。
+	store.CreateDir(meta.RootID, "x")
+	if _, err := b.BackupOnce(); err != nil {
+		t.Fatalf("BackupOnce: %v", err)
+	}
+
+	for _, addr := range addrs {
+		blobs, _ := b.listBlobs(addr)
+		for _, bl := range blobs {
+			if v, ok := parseBlobVersion(bl.Key); ok && v == 2860 {
+				t.Fatalf("更高纪元孤儿 v2860 未被清理（节点 %s）", addr)
+			}
+		}
 	}
 }
 
