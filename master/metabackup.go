@@ -583,6 +583,7 @@ type BackupStatus struct {
 	LastError    string    `json:"last_error"`
 	Retention    int       `json:"retention"`
 	Replicas     int       `json:"replicas"`
+	Versions     []VersionInfo `json:"versions"` // 集群实际留存的各代版本（保留策略可视化）
 }
 
 // Status 返回当前备份状态快照（线程安全）。
@@ -603,6 +604,75 @@ func (b *MetaBackup) Status() BackupStatus {
 		Retention:    b.cfg.Retention,
 		Replicas:     b.cfg.Replicas,
 	}
+}
+
+// VersionInfo 是集群里留存的一代快照版本概况（保留策略可视化）。
+type VersionInfo struct {
+	Version uint64   `json:"version"`
+	Chunks  int      `json:"chunks"`  // 该版本的快照块数
+	Size    int64    `json:"size"`    // 该版本快照总字节
+	Nodes   []uint64 `json:"nodes"`   // 持有该版本任意块的节点 ID（去重升序）
+	Current bool     `json:"current"` // 是否为当前最新版本
+}
+
+// ClusterVersions 扫描集群，聚合出实际留存的所有快照版本（按版本降序，最新在前）。
+// 向存活节点 LIST /meta-backup，按 key 里的版本号归并。有网络 IO，仅状态页调用。
+func (b *MetaBackup) ClusterVersions() ([]VersionInfo, error) {
+	alive, err := b.store.ListAliveNodes(b.nodeMaxAge)
+	if err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	cur := b.lastManifest.Version
+	b.mu.Unlock()
+
+	type agg struct {
+		size  int64
+		chunk map[string]int64 // 块 key → size（跨节点去重同一块）
+		nodes map[uint64]bool
+	}
+	byVer := map[uint64]*agg{}
+	for _, n := range alive {
+		blobs, err := b.listBlobs(n.Addr)
+		if err != nil {
+			continue // 单节点不可达跳过，聚合仍尽力而为
+		}
+		for _, bl := range blobs {
+			// 只统计快照块（snapshot-<ver>-<idx>）；WAL 段与 manifest 不计入版本。
+			if !strings.HasPrefix(bl.Key, "snapshot-") {
+				continue
+			}
+			ver, ok := parseBlobVersion(bl.Key)
+			if !ok {
+				continue
+			}
+			a := byVer[ver]
+			if a == nil {
+				a = &agg{chunk: map[string]int64{}, nodes: map[uint64]bool{}}
+				byVer[ver] = a
+			}
+			a.chunk[bl.Key] = bl.Size
+			a.nodes[n.ID] = true
+		}
+	}
+
+	out := make([]VersionInfo, 0, len(byVer))
+	for ver, a := range byVer {
+		var size int64
+		for _, s := range a.chunk {
+			size += s
+		}
+		nodes := make([]uint64, 0, len(a.nodes))
+		for id := range a.nodes {
+			nodes = append(nodes, id)
+		}
+		sort.Slice(nodes, func(i, j int) bool { return nodes[i] < nodes[j] })
+		out = append(out, VersionInfo{
+			Version: ver, Chunks: len(a.chunk), Size: size, Nodes: nodes, Current: ver == cur,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Version > out[j].Version })
+	return out, nil
 }
 
 // TriggerBackup 手动触发一次全量备份（控制台按钮；与后台循环互斥）。

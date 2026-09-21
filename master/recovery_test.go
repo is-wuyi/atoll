@@ -104,6 +104,42 @@ func TestRecoverAutoUsesFreshLocal(t *testing.T) {
 	}
 }
 
+// 版本号播种：重启后 b.version 从集群 manifest 续增，不倒退（否则 prune 失效泄漏）。
+func TestRecoverSeedsVersionFromCluster(t *testing.T) {
+	st, b, addrs := newBackupCluster(t, 2)
+	var seeds []string
+	for id := range addrs {
+		seeds = append(seeds, addrs[id])
+	}
+	// 备份几次把版本推到 3。
+	for i := 0; i < 3; i++ {
+		st.CreateDir(meta.RootID, fmt.Sprintf("d%d", i))
+		if _, err := b.BackupOnce(); err != nil {
+			t.Fatalf("BackupOnce: %v", err)
+		}
+	}
+	dbPath := st.DBPath()
+	st.Close()
+
+	// 新起一个 backup 实例（模拟进程重启：version 归 0）指向同一集群。
+	fresh := NewMetaBackup(nil, time.Minute, DefaultMetaBackupConfig())
+	rs, err := fresh.Recover(dbPath, seeds, RecoverAuto)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	defer rs.Close()
+	fresh.SetStore(rs)
+
+	// 播种后 version 应 >= 3；再备份一次版本应是 4，不是 1。
+	m, err := fresh.BackupOnce()
+	if err != nil {
+		t.Fatalf("BackupOnce after recover: %v", err)
+	}
+	if m.Version <= 3 {
+		t.Fatalf("重启后版本应续增到 >3，got %d（版本倒退 bug）", m.Version)
+	}
+}
+
 // auto 模式下本地没了但集群有备份 → 硬停（不自动重建）。
 func TestRecoverAutoFailStopOnMissingLocal(t *testing.T) {
 	store, b, _ := newBackupCluster(t, 2)

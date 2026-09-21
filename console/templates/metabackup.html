@@ -64,7 +64,30 @@
       {{end}}
 
       <div class="section">
-        <div class="section-head"><h2>快照块</h2><span class="count">{{len .S.Chunks}} 块</span></div>
+        <div class="section-head"><h2>保留的版本</h2><span class="count">{{len .S.Versions}} 代 · 保留策略 {{.S.Retention}}</span></div>
+        <p class="hint">集群里实际留存的历代快照。最新版用于恢复，旧版用于回退（防最新快照固化坏状态）。超出保留数的更早版本已被清理。</p>
+        <div class="panel">
+          <table>
+            <thead><tr><th>版本</th><th class="num">块数</th><th class="num">大小</th><th>持有节点</th><th></th></tr></thead>
+            <tbody>
+            {{range .S.Versions}}
+              <tr>
+                <td class="mono">v{{.Version}}</td>
+                <td class="num">{{.Chunks}}</td>
+                <td class="num">{{bytes .Size}}</td>
+                <td>{{range .Nodes}}<span class="badge">node {{.}}</span> {{end}}</td>
+                <td>{{if .Current}}<span class="dot ok"></span><span class="status-txt ok">当前</span>{{else}}<span class="row-type">回退保留</span>{{end}}</td>
+              </tr>
+            {{else}}
+              <tr><td colspan="5" class="empty">暂无留存版本</td></tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-head"><h2>当前版本 (v{{.S.Version}}) 的快照块</h2><span class="count">{{len .S.Chunks}} 块</span></div>
         <div class="panel">
           <table>
             <thead><tr><th>块 Key</th><th class="num">大小</th><th>持有节点</th></tr></thead>

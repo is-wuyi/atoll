@@ -171,7 +171,12 @@ func (s *Server) handleAdminMetaBackup(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, BackupStatus{Enabled: false})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.backup.Status())
+	st := s.backup.Status()
+	// 附上集群实际留存的各代版本（有网络 IO，故在此聚合而非 Status() 内）。
+	if versions, err := s.backup.ClusterVersions(); err == nil {
+		st.Versions = versions
+	}
+	writeJSON(w, http.StatusOK, st)
 }
 
 // handleAdminMetaBackupTrigger POST /admin/metabackup/trigger —— 手动触发一次全量备份。

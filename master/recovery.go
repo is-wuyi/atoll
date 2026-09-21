@@ -256,6 +256,17 @@ func (b *MetaBackup) Recover(dbPath string, seeds []string, mode RecoverMode) (*
 	action, reason := decideRecovery(in)
 	log.Printf("元数据恢复决策: %s（%s）", action, reason)
 
+	// 版本号播种：b.version 是进程内计数器，重启后从 0 起。若集群里已有更高版本，
+	// 必须续着它往上走——否则新备份版本号倒退，且 prune 的 cutoff 变成极小值，
+	// 永远删不掉那些高版本号的旧 blob（元数据备份无限泄漏）。
+	if in.ClusterFound && clusterMF.Version > 0 {
+		b.mu.Lock()
+		if clusterMF.Version > b.version {
+			b.version = clusterMF.Version
+		}
+		b.mu.Unlock()
+	}
+
 	switch action {
 	case ActionUseLocal, ActionFreshStart:
 		return meta.Open(dbPath) // 本地在则打开，不在则新建空库
