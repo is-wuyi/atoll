@@ -194,6 +194,36 @@ func (s *Server) handleAdminMetaBackupTrigger(w http.ResponseWriter, _ *http.Req
 	writeJSON(w, http.StatusOK, m)
 }
 
+// handleAdminMetaBackupConfig POST /admin/metabackup/config —— 热更新备份配置。
+// 走 adminToken。body: {interval_sec, replicas, retention, sync_before_ack, sync_min_copies}。
+func (s *Server) handleAdminMetaBackupConfig(w http.ResponseWriter, r *http.Request) {
+	if s.backup == nil {
+		httpError(w, http.StatusServiceUnavailable, "元数据备份未启用（master 未配置 -seeds）")
+		return
+	}
+	var req struct {
+		IntervalSec   int  `json:"interval_sec"`
+		Replicas      int  `json:"replicas"`
+		Retention     int  `json:"retention"`
+		SyncBeforeAck bool `json:"sync_before_ack"`
+		SyncMinCopies int  `json:"sync_min_copies"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	cfg := MetaBackupConfig{
+		Replicas:      req.Replicas,
+		Retention:     req.Retention,
+		Interval:      time.Duration(req.IntervalSec) * time.Second,
+		SyncBeforeAck: req.SyncBeforeAck,
+		SyncMinCopies: req.SyncMinCopies,
+	}
+	s.backup.SetConfig(cfg)
+	// 回读规范化后的实际生效值。
+	writeJSON(w, http.StatusOK, s.backup.Config())
+}
+
 // degradedItem 是完整性页的一行：某文件（或其某块）副本不足。
 type degradedItem struct {
 	Path     string `json:"path"`

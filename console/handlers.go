@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -369,6 +370,31 @@ func (s *Server) handleMetaBackupTrigger(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	http.Redirect(w, r, "/metabackup?notice="+"已触发一次全量备份", http.StatusSeeOther)
+}
+
+// handleMetaBackupConfig POST /metabackup/config —— 热更新备份配置。仅 admin，需 CSRF。
+func (s *Server) handleMetaBackupConfig(w http.ResponseWriter, r *http.Request, sess session) {
+	if sess.Role != RoleAdmin {
+		s.renderError(w, sess, http.StatusForbidden, "权限不足", "只有 admin 角色可以修改备份配置")
+		return
+	}
+	if r.FormValue("csrf") != sess.CSRF {
+		http.Error(w, "csrf mismatch", http.StatusForbidden)
+		return
+	}
+	atoi := func(name string) int { n, _ := strconv.Atoi(r.FormValue(name)); return n }
+	cfg := backupConfigReq{
+		IntervalSec:   atoi("interval_sec"),
+		Replicas:      atoi("replicas"),
+		Retention:     atoi("retention"),
+		SyncBeforeAck: r.FormValue("sync_before_ack") == "on",
+		SyncMinCopies: atoi("sync_min_copies"),
+	}
+	if err := s.mc.updateBackupConfig(cfg); err != nil {
+		s.renderError(w, sess, http.StatusBadGateway, "更新配置失败", err.Error())
+		return
+	}
+	http.Redirect(w, r, "/metabackup?notice="+"配置已更新并生效", http.StatusSeeOther)
 }
 
 // ---- 完整性与修复 ----

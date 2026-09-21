@@ -82,16 +82,38 @@ func (m *Manifest) LatestSeq() uint64 {
 	return seq
 }
 
-// MetaBackupConfig 备份策略参数（控制台可调，见 HA 设计决策点 1/2）。
+// MetaBackupConfig 备份策略参数（控制台可热更新，见 HA 设计决策点 1/2）。
 type MetaBackupConfig struct {
 	Replicas  int // K：快照/WAL 每块副本数上限（默认 3，实际取 min(K, 存活节点数)）
 	Retention int // 保留最近 N 个快照版本（默认 3；防"最新快照固化坏状态"无回退）
 	Interval  time.Duration
+	// SyncBeforeAck 开启同步旋钮：写元数据 ack 前先把该帧同步复制到集群（零丢窗口，
+	// 但写延迟绑集群）。默认关（异步备份）。真逻辑第二轮实现；本轮仅承载开关状态。
+	SyncBeforeAck bool
+	// SyncMinCopies 同步模式下每笔写要求确认的节点数（默认 = Replicas；调低=更高可用/弱耐久）。
+	SyncMinCopies int
 }
 
 // DefaultMetaBackupConfig 默认策略。
 func DefaultMetaBackupConfig() MetaBackupConfig {
 	return MetaBackupConfig{Replicas: 3, Retention: 3, Interval: 10 * time.Minute}
+}
+
+// normalize 补齐非法/缺省值（构造与热更新共用）。
+func (c MetaBackupConfig) normalize() MetaBackupConfig {
+	if c.Replicas <= 0 {
+		c.Replicas = 3
+	}
+	if c.Retention <= 0 {
+		c.Retention = 3
+	}
+	if c.Interval <= 0 {
+		c.Interval = 10 * time.Minute
+	}
+	if c.SyncMinCopies <= 0 || c.SyncMinCopies > c.Replicas {
+		c.SyncMinCopies = c.Replicas // 默认要求全部副本确认
+	}
+	return c
 }
 
 // MetaBackup 执行元数据备份进集群。
@@ -119,16 +141,10 @@ func NewMetaBackup(store *meta.Store, nodeMaxAge time.Duration, cfg MetaBackupCo
 	if cfg.Replicas <= 0 {
 		cfg.Replicas = 3
 	}
-	if cfg.Retention <= 0 {
-		cfg.Retention = 3
-	}
-	if cfg.Interval <= 0 {
-		cfg.Interval = 10 * time.Minute
-	}
 	return &MetaBackup{
 		store:      store,
 		nodeMaxAge: nodeMaxAge,
-		cfg:        cfg,
+		cfg:        cfg.normalize(),
 		httpClient: &http.Client{Timeout: 30 * time.Second, Transport: &auth.Transport{Token: ""}},
 		scheme:     "http",
 	}
@@ -136,6 +152,21 @@ func NewMetaBackup(store *meta.Store, nodeMaxAge time.Duration, cfg MetaBackupCo
 
 // SetStore 设置元数据库（NewMetaBackup 可传 nil，恢复决策产出 store 后再注入）。
 func (b *MetaBackup) SetStore(s *meta.Store) { b.store = s }
+
+// Config 返回当前配置快照（线程安全）。
+func (b *MetaBackup) Config() MetaBackupConfig {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cfg
+}
+
+// SetConfig 热更新配置（面板调用，立即对后台循环/prune 生效）。规范化后原子替换。
+func (b *MetaBackup) SetConfig(c MetaBackupConfig) {
+	c = c.normalize()
+	b.mu.Lock()
+	b.cfg = c
+	b.mu.Unlock()
+}
 
 // SetToken / SetTLS 同 Scanner：配置出站认证与 TLS。
 func (b *MetaBackup) SetToken(t auth.Token) {
@@ -317,8 +348,9 @@ func (b *MetaBackup) recordResult(err error) {
 
 // backupOnceLocked 是 BackupOnce 的实体（调用方已持 opMu）。
 func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
+	cfg := b.Config()
 	// 选负载最低的 K 个节点放快照/WAL；manifest 稍后宽复制到全部存活节点。
-	targets, err := b.pickLeastLoaded(b.cfg.Replicas)
+	targets, err := b.pickLeastLoaded(cfg.Replicas)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -437,8 +469,9 @@ func parseBlobVersion(key string) (ver uint64, ok bool) {
 func (b *MetaBackup) PruneOldVersions() error {
 	b.mu.Lock()
 	ver := b.version
+	retention := b.cfg.Retention
 	b.mu.Unlock()
-	if ver == 0 || b.cfg.Retention <= 0 {
+	if ver == 0 || retention <= 0 {
 		return nil
 	}
 	// 合法版本窗口是 [cutoff, 当前]。窗口外两头都删：
@@ -447,8 +480,8 @@ func (b *MetaBackup) PruneOldVersions() error {
 	//     可能有比当前更新的合法版本，所以更高号一定是陈旧孤儿——旧逻辑只删 <cutoff，
 	//     这类高号孤儿会永生（本次 bug）。
 	var cutoff uint64 = 1
-	if ver > uint64(b.cfg.Retention) {
-		cutoff = ver - uint64(b.cfg.Retention) + 1
+	if ver > uint64(retention) {
+		cutoff = ver - uint64(retention) + 1
 	}
 	alive, err := b.store.ListAliveNodes(b.nodeMaxAge)
 	if err != nil {
@@ -507,7 +540,7 @@ func (b *MetaBackup) ShipWAL() (Manifest, bool, error) {
 	seg := meta.EncodeWALSegment(frames)
 	key := fmt.Sprintf("wal-%d-%d-%d", base.Version, from+1, toSeq)
 
-	targets, err := b.pickLeastLoaded(b.cfg.Replicas)
+	targets, err := b.pickLeastLoaded(b.Config().Replicas)
 	if err != nil {
 		return Manifest{}, false, err
 	}
@@ -545,11 +578,11 @@ func (b *MetaBackup) ShipWAL() (Manifest, bool, error) {
 // StartLoop 启动后台备份循环：每 walIntv 增量 ShipWAL 一次，每 cfg.Interval 落一次
 // 全量 BackupOnce。ctx 取消时退出。首次立即做一次 BackupOnce 建立基准快照。
 func (b *MetaBackup) StartLoop(ctx context.Context, walIntv time.Duration) {
-	if walIntv <= 0 || walIntv > b.cfg.Interval {
-		walIntv = b.cfg.Interval / 5
-	}
-	if walIntv <= 0 {
-		walIntv = time.Minute
+	// 固定 3s 一跳来"检查该不该动作"，动作时机按当前(可热更新的) Interval 判断——
+	// 这样面板改了周期无需重启 ticker 也能生效。walIntv 参数保留兼容，>0 时作 tick 粒度。
+	tick := walIntv
+	if tick <= 0 || tick > 5*time.Second {
+		tick = 3 * time.Second
 	}
 	b.wg.Add(1)
 	go func() {
@@ -559,21 +592,31 @@ func (b *MetaBackup) StartLoop(ctx context.Context, walIntv time.Duration) {
 			log.Printf("元数据备份: 首次快照失败（将重试）: %v", err)
 		}
 		lastSnap := time.Now()
-		wal := time.NewTicker(walIntv)
-		defer wal.Stop()
+		lastWAL := time.Now()
+		t := time.NewTicker(tick)
+		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-wal.C:
-				if time.Since(lastSnap) >= b.cfg.Interval {
+			case <-t.C:
+				cfg := b.Config()
+				walIntv := cfg.Interval / 5
+				if walIntv < time.Second {
+					walIntv = time.Second
+				}
+				if time.Since(lastSnap) >= cfg.Interval {
 					if _, err := b.BackupOnce(); err != nil {
 						log.Printf("元数据备份: 快照失败: %v", err)
 					} else {
 						lastSnap = time.Now()
+						lastWAL = time.Now()
 					}
-				} else if _, _, err := b.ShipWAL(); err != nil {
-					log.Printf("元数据备份: WAL 增量同步失败: %v", err)
+				} else if time.Since(lastWAL) >= walIntv {
+					if _, _, err := b.ShipWAL(); err != nil {
+						log.Printf("元数据备份: WAL 增量同步失败: %v", err)
+					}
+					lastWAL = time.Now()
 				}
 			}
 		}
@@ -596,6 +639,9 @@ type BackupStatus struct {
 	LastError    string    `json:"last_error"`
 	Retention    int       `json:"retention"`
 	Replicas     int       `json:"replicas"`
+	IntervalSec  int       `json:"interval_sec"`   // 快照周期（秒），面板展示/编辑
+	SyncBeforeAck bool     `json:"sync_before_ack"` // 同步旋钮当前状态
+	SyncMinCopies int      `json:"sync_min_copies"`
 	Versions     []VersionInfo `json:"versions"` // 集群实际留存的各代版本（保留策略可视化）
 }
 
@@ -612,10 +658,13 @@ func (b *MetaBackup) Status() BackupStatus {
 		SnapshotSize: m.SnapshotBytes,
 		Chunks:       m.Chunks,
 		WALSegs:      m.WALSegs,
-		LastBackupAt: b.lastBackupAt,
-		LastError:    b.lastErr,
-		Retention:    b.cfg.Retention,
-		Replicas:     b.cfg.Replicas,
+		LastBackupAt:  b.lastBackupAt,
+		LastError:     b.lastErr,
+		Retention:     b.cfg.Retention,
+		Replicas:      b.cfg.Replicas,
+		IntervalSec:   int(b.cfg.Interval / time.Second),
+		SyncBeforeAck: b.cfg.SyncBeforeAck,
+		SyncMinCopies: b.cfg.SyncMinCopies,
 	}
 }
 

@@ -176,6 +176,35 @@ func (c *masterClient) triggerBackup() error {
 	return nil
 }
 
+// backupConfigReq 是热更新备份配置的请求体（与 master handleAdminMetaBackupConfig 对齐）。
+type backupConfigReq struct {
+	IntervalSec   int  `json:"interval_sec"`
+	Replicas      int  `json:"replicas"`
+	Retention     int  `json:"retention"`
+	SyncBeforeAck bool `json:"sync_before_ack"`
+	SyncMinCopies int  `json:"sync_min_copies"`
+}
+
+// updateBackupConfig 热更新元数据备份配置（master POST /admin/metabackup/config）。走 adminHTTP。
+func (c *masterClient) updateBackupConfig(cfg backupConfigReq) error {
+	body, _ := json.Marshal(cfg)
+	req, err := http.NewRequest(http.MethodPost, c.base+"/admin/metabackup/config", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.adminHTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("更新备份配置: %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
 func (c *masterClient) lookup(path string) (types.Inode, []replicaEntry, error) {
 	var out struct {
 		Inode types.Inode    `json:"inode"`

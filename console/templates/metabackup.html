@@ -61,6 +61,33 @@
           <button type="submit" class="btn-primary">立即备份一次</button>
         </form>
       </div>
+
+      <div class="section">
+        <div class="section-head"><h2>备份设置</h2><span class="count">改动立即生效</span></div>
+        <div class="panel">
+          <form method="post" action="/metabackup/config" class="form-grid">
+            <input type="hidden" name="csrf" value="{{.CSRF}}">
+            <label>快照周期（秒）
+              <input type="number" name="interval_sec" min="5" value="{{.S.IntervalSec}}">
+            </label>
+            <label>副本数 K
+              <input type="number" name="replicas" min="1" value="{{.S.Replicas}}">
+            </label>
+            <label>保留版本数 N
+              <input type="number" name="retention" min="1" value="{{.S.Retention}}">
+            </label>
+            <label>同步确认数 W
+              <input type="number" name="sync_min_copies" min="1" value="{{.S.SyncMinCopies}}">
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" name="sync_before_ack" {{if .S.SyncBeforeAck}}checked{{end}}>
+              同步旋钮（ack 前先落集群，零丢窗口）
+            </label>
+            <div class="form-actions"><button type="submit" class="btn-primary">保存</button></div>
+          </form>
+          <p class="hint">同步旋钮开启后，写元数据会等复制到 W 个节点确认才返回——零丢窗口，但写延迟绑集群、集群不足 W 个存活时写入失败。默认关（异步备份）。<b>注意：真同步逻辑尚在实现中，当前开关仅保存状态。</b></p>
+        </div>
+      </div>
       {{end}}
 
       <div class="section">

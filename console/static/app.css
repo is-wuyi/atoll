@@ -171,5 +171,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .form-grid input, .form-grid select { padding: 8px 11px; border: 1px solid var(--border-strong); border-radius: 8px; font-size: 13.5px; min-width: 200px; background: #fff; }
 .form-grid input:focus, .form-grid select:focus { outline: none; border-color: var(--accent); }
 .form-actions { margin-left: auto; }
+.checkbox-label { flex-direction: row; align-items: center; gap: 8px; }
+.checkbox-label input { min-width: 0; }
 .btn-primary { padding: 9px 20px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-size: 13.5px; font-weight: 550; cursor: pointer; }
 .btn-primary:hover { background: #1d4ed8; }

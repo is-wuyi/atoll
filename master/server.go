@@ -59,7 +59,7 @@ func (s *Server) nodeScheme() string {
 }
 
 // adminPaths 需要 adminToken 的破坏性路径。/admin/objects 是只读清单、不在内。
-var adminPaths = map[string]bool{"/admin/gc": true, "/admin/metabackup/trigger": true}
+var adminPaths = map[string]bool{"/admin/gc": true, "/admin/metabackup/trigger": true, "/admin/metabackup/config": true}
 
 // SetScanner 绑定扫描器，供 /admin/gc 等接口使用。
 func (s *Server) SetScanner(scanner *Scanner) {
@@ -96,6 +96,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/integrity", s.handleAdminIntegrity)
 	mux.HandleFunc("GET /admin/metabackup", s.handleAdminMetaBackup)
 	mux.HandleFunc("POST /admin/metabackup/trigger", s.handleAdminMetaBackupTrigger)
+	mux.HandleFunc("POST /admin/metabackup/config", s.handleAdminMetaBackupConfig)
 	return auth.WrapTokens(mux, s.token, s.adminToken, adminPaths)
 }
 

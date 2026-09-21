@@ -83,6 +83,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /gc/execute", s.requireAuth(s.handleGCExecute))
 	mux.HandleFunc("GET /metabackup", s.requireAuth(s.handleMetaBackup))
 	mux.HandleFunc("POST /metabackup/trigger", s.requireAuth(s.handleMetaBackupTrigger))
+	mux.HandleFunc("POST /metabackup/config", s.requireAuth(s.handleMetaBackupConfig))
 	mux.HandleFunc("GET /accounts", s.requireAuth(s.handleAccounts))
 	mux.HandleFunc("POST /accounts/create", s.requireAuth(s.handleAccountCreate))
 	mux.HandleFunc("POST /accounts/delete", s.requireAuth(s.handleAccountDelete))
