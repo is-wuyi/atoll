@@ -144,9 +144,21 @@ func (w *txw) nextStagingID() (uint64, error) {
 	return cur, nil
 }
 
+// PostCommitHook 在一个产生了变更的写事务成功提交后被调用，收到该帧的 seq 与编码字节。
+// 用途：同步旋钮——钩子里把这一帧同步复制到集群，返回 error 则 write 向调用方返回 error
+// （帧已在本地持久，但客户端视为失败，见 HA 设计决策点 1：不撤回本地，靠后台补 ship）。
+// 钩子在 bbolt 事务之外调用（提交后），不阻塞其它写者。
+type PostCommitHook func(seq uint64, frame []byte) error
+
+// SetPostCommitHook 注册提交后钩子（nil 清除）。非并发安全，应在服务启动、开始写之前设置。
+func (s *Store) SetPostCommitHook(h PostCommitHook) { s.postCommit = h }
+
 // write 执行一个记录型写事务：跑 fn，若产生了变更则把这一帧原子追加进 wal 桶。
+// 提交成功后，若注册了 post-commit 钩子且本次有变更，调用之——钩子 error 透传给调用方。
 func (s *Store) write(fn func(*txw) error) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	var committedSeq uint64
+	var committedFrame []byte
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		w := &txw{tx: tx}
 		if err := fn(w); err != nil {
 			return err
@@ -154,13 +166,27 @@ func (s *Store) write(fn func(*txw) error) error {
 		if len(w.rec) == 0 {
 			return nil // 幂等命中等无实际变更的操作不占 seq
 		}
-		return appendFrame(tx, w.rec)
+		seq, err := appendFrame(tx, w.rec)
+		if err != nil {
+			return err
+		}
+		committedSeq = seq
+		committedFrame = encodeFrame(w.rec)
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// 事务已提交。若本次有变更且注册了钩子，同步调用（同步旋钮在此落集群）。
+	if committedSeq != 0 && s.postCommit != nil {
+		return s.postCommit(committedSeq, committedFrame)
+	}
+	return nil
 }
 
-// appendFrame 把一帧变更写进 wal 桶(seq = 当前 wal_seq + 1)。
+// appendFrame 把一帧变更写进 wal 桶(seq = 当前 wal_seq + 1)，返回分配的 seq。
 // 用底层 tx.Bucket 直接写——WAL 桶与 wal_seq 是日志本身，不能被再次记录。
-func appendFrame(tx *bolt.Tx, muts []mutation) error {
+func appendFrame(tx *bolt.Tx, muts []mutation) (uint64, error) {
 	meta := tx.Bucket(bucketMeta)
 	seq := uint64(0)
 	if v := meta.Get(keyWALSeq); v != nil {
@@ -168,9 +194,12 @@ func appendFrame(tx *bolt.Tx, muts []mutation) error {
 	}
 	seq++
 	if err := meta.Put(keyWALSeq, u64be(seq)); err != nil {
-		return err
+		return 0, err
 	}
-	return tx.Bucket(bucketWAL).Put(u64be(seq), encodeFrame(muts))
+	if err := tx.Bucket(bucketWAL).Put(u64be(seq), encodeFrame(muts)); err != nil {
+		return 0, err
+	}
+	return seq, nil
 }
 
 // ---- 帧编码(raft-ready 字节格式) ----
@@ -249,6 +278,17 @@ func decodeFrame(seq uint64, b []byte) (Frame, error) {
 // 一个 WAL 段 = 若干帧打包成一个 blob。段字节布局(全大端)：
 //   每帧: uint64 seq | uint32 frameLen | frameBytes(encodeFrame 的输出)
 // 帧之间首尾相接。DecodeWALSegment 还原成带 seq 的帧序列，喂给 ApplyFrames。
+
+// EncodeSyncBlob 把单帧(seq + encodeFrame 的字节)包成一个"段"blob，格式与 EncodeWALSegment
+// 一帧时完全一致，故可被 DecodeWALSegment 读回。同步旋钮的 post-commit 钩子用它——钩子拿到的
+// 是 encodeFrame 的原始帧体(无 seq 头)，这里补上 seq 头使 blob 自描述。
+func EncodeSyncBlob(seq uint64, frameBody []byte) []byte {
+	buf := make([]byte, 12+len(frameBody))
+	binary.BigEndian.PutUint64(buf[0:], seq)
+	binary.BigEndian.PutUint32(buf[8:], uint32(len(frameBody)))
+	copy(buf[12:], frameBody)
+	return buf
+}
 
 // EncodeWALSegment 把一批帧打包成一个段 blob。
 func EncodeWALSegment(frames []Frame) []byte {

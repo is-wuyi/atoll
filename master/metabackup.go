@@ -160,6 +160,44 @@ func (b *MetaBackup) Config() MetaBackupConfig {
 	return b.cfg
 }
 
+// InstallSyncHook 把同步 ship 逻辑注册为 store 的 post-commit 钩子。
+// 应在 SetStore 之后、开始服务之前调用一次。钩子内部按当前配置决定是否真同步。
+func (b *MetaBackup) InstallSyncHook() {
+	if b.store == nil {
+		return
+	}
+	b.store.SetPostCommitHook(b.syncShipFrame)
+}
+
+// syncShipFrame 是 post-commit 钩子：同步旋钮开时，把刚提交的这一帧作为独立 WAL blob
+// 复制到 W 个负载最低节点，达不到 W 个确认则返回 error（write 透传给客户端）。
+// 旋钮关时空转（error=nil），完全走后台异步备份——零额外开销。
+//
+// blob key: wal-sync-<seq>，与后台成段的 wal-<ver>-<from>-<to> 区分。恢复时两者都会
+// 被 LIST 扫到重放（见 recovery），所以"落了盘但没进 manifest"的同步帧不会丢。
+func (b *MetaBackup) syncShipFrame(seq uint64, frame []byte) error {
+	cfg := b.Config()
+	if !cfg.SyncBeforeAck {
+		return nil // 旋钮关：异步模式，钩子不介入
+	}
+	targets, err := b.pickLeastLoaded(cfg.Replicas)
+	if err != nil {
+		return fmt.Errorf("同步复制: 选节点失败: %w", err)
+	}
+	need := cfg.SyncMinCopies
+	if need > len(targets) {
+		// 存活节点不足要求的 W → 写失败（决策点3：不偷偷降级，宁可写失败）。
+		return fmt.Errorf("同步复制: 需要 %d 个节点确认，仅 %d 个存活", need, len(targets))
+	}
+	key := fmt.Sprintf("wal-sync-%d", seq)
+	blob := meta.EncodeSyncBlob(seq, frame) // 补 seq 头，使 blob 可被 DecodeWALSegment 读回
+	holders := b.shipBlob(targets, key, blob)
+	if len(holders) < need {
+		return fmt.Errorf("同步复制: 帧 %d 仅 %d/%d 个节点确认", seq, len(holders), need)
+	}
+	return nil
+}
+
 // SetConfig 热更新配置（面板调用，立即对后台循环/prune 生效）。规范化后原子替换。
 func (b *MetaBackup) SetConfig(c MetaBackupConfig) {
 	c = c.normalize()
@@ -483,6 +521,11 @@ func (b *MetaBackup) PruneOldVersions() error {
 	if ver > uint64(retention) {
 		cutoff = ver - uint64(retention) + 1
 	}
+	// 同步帧 blob(wal-sync-<seq>)一旦被最新快照覆盖(seq <= 快照锚点)即冗余，可删。
+	b.mu.Lock()
+	snapSeq := b.lastManifest.SnapshotSeq
+	b.mu.Unlock()
+
 	alive, err := b.store.ListAliveNodes(b.nodeMaxAge)
 	if err != nil {
 		return err
@@ -497,6 +540,15 @@ func (b *MetaBackup) PruneOldVersions() error {
 			continue
 		}
 		for _, bl := range blobs {
+			// 同步帧 blob：seq 已被快照覆盖则删，否则留（它还是唯一持久副本）。
+			if sseq, ok := parseSyncFrameSeq(bl.Key); ok {
+				if sseq <= snapSeq {
+					if err := b.deleteBlob(n.Addr, bl.Key); err != nil && firstErr == nil {
+						firstErr = err
+					}
+				}
+				continue
+			}
 			bver, ok := parseBlobVersion(bl.Key)
 			if !ok {
 				continue // manifest 等非版本化 blob 不动

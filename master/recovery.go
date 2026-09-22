@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strconv"
 
 	"atoll/master/meta"
 	"atoll/pkg/types"
@@ -161,19 +162,93 @@ func (b *MetaBackup) rebuildFromCluster(dbPath string, m Manifest, seeds []strin
 		return nil, err
 	}
 
-	// 重放快照之后的 WAL 段。
-	if len(m.WALSegs) > 0 {
-		frames, err := b.fetchWALFrames(m, seeds)
-		if err != nil {
-			store.Close()
-			return nil, err
-		}
+	// 重放快照之后的 WAL：既包括 manifest 记录的成段 WAL（后台异步 ship），也包括
+	// 散落的同步帧 blob（wal-sync-<seq>，同步旋钮直接落集群、可能还没进 manifest）。
+	// 两者按 seq 合并去重、升序重放——否则"同步落盘但没进 manifest"的帧会丢。
+	frames, err := b.gatherAllFramesAfter(m, store, seeds)
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	if len(frames) > 0 {
 		if err := store.ApplyFrames(frames); err != nil {
 			store.Close()
 			return nil, err
 		}
 	}
 	return store, nil
+}
+
+// gatherAllFramesAfter 汇集快照点之后的所有 WAL 帧：manifest 成段 + 散落同步帧 blob。
+// 按 seq 去重升序，交给 ApplyFrames（它要求连续无缺口）。
+func (b *MetaBackup) gatherAllFramesAfter(m Manifest, store *meta.Store, seeds []string) ([]meta.Frame, error) {
+	bySeq := map[uint64]meta.Frame{}
+
+	// 1) manifest 记录的成段 WAL。
+	if len(m.WALSegs) > 0 {
+		segFrames, err := b.fetchWALFrames(m, seeds)
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range segFrames {
+			bySeq[f.Seq] = f
+		}
+	}
+
+	// 2) 散落的同步帧 blob（wal-sync-<seq>）：LIST 每个种子，取 seq > 快照点的。
+	after := m.SnapshotSeq
+	for _, addr := range seeds {
+		blobs, err := b.listBlobs(addr)
+		if err != nil {
+			continue // 单节点不可达跳过，其它节点可能也有同一帧
+		}
+		for _, bl := range blobs {
+			seq, ok := parseSyncFrameSeq(bl.Key)
+			if !ok || seq <= after {
+				continue
+			}
+			if _, have := bySeq[seq]; have {
+				continue // 已从成段 WAL 拿到
+			}
+			data, found, err := b.getBlob(addr, bl.Key)
+			if err != nil || !found {
+				continue
+			}
+			fs, err := meta.DecodeWALSegment(data) // 同步帧也是"单帧的段"，复用解码
+			if err != nil || len(fs) == 0 {
+				continue
+			}
+			bySeq[seq] = fs[0]
+		}
+	}
+
+	if len(bySeq) == 0 {
+		return nil, nil
+	}
+	// 按 seq 升序输出；ApplyFrames 要求从 (快照点+1) 起连续。
+	seqs := make([]uint64, 0, len(bySeq))
+	for s := range bySeq {
+		seqs = append(seqs, s)
+	}
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	frames := make([]meta.Frame, 0, len(seqs))
+	for _, s := range seqs {
+		frames = append(frames, bySeq[s])
+	}
+	return frames, nil
+}
+
+// parseSyncFrameSeq 解析同步帧 blob key：wal-sync-<seq>。非此格式返回 ok=false。
+func parseSyncFrameSeq(key string) (uint64, bool) {
+	const prefix = "wal-sync-"
+	if len(key) <= len(prefix) || key[:len(prefix)] != prefix {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(key[len(prefix):], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // fetchChunk 从种子里试取一个块，校验 CRC 与大小。

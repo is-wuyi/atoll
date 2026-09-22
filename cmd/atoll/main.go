@@ -145,6 +145,7 @@ func runMaster(args []string, stderr io.Writer) int {
 		return 1
 	}
 	backup.SetStore(store)
+	backup.InstallSyncHook() // 同步旋钮：开启时写元数据 ack 前先落集群（钩子内按配置决定）
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

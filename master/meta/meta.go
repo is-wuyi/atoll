@@ -61,7 +61,8 @@ func validateName(name string) error {
 
 // Store 封装 bbolt 数据库。
 type Store struct {
-	db *bolt.DB
+	db         *bolt.DB
+	postCommit PostCommitHook // 提交后钩子（同步旋钮用；nil = 不调用）
 }
 
 // Open 打开（或创建）元数据库并完成初始化：建 bucket、写根目录、初始化计数器。
