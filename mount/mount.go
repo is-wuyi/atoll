@@ -143,6 +143,9 @@ var (
 	_ fs.NodeCreater   = (*node)(nil)
 	_ fs.NodeOpener    = (*node)(nil)
 	_ fs.NodeSetattrer = (*node)(nil)
+	_ fs.NodeGetxattrer  = (*node)(nil)
+	_ fs.NodeSetxattrer  = (*node)(nil)
+	_ fs.NodeListxattrer = (*node)(nil)
 )
 
 // path 返回该节点对应的集群路径（根节点为 "/"）。
@@ -430,6 +433,27 @@ func (n *node) Setattr(_ context.Context, f fs.FileHandle, in *fuse.SetAttrIn, o
 		fillEntry(&out.Attr, &in2)
 	}
 	return 0
+}
+
+// ---- 扩展属性（xattr）----
+//
+// atoll 不持久化扩展属性，但必须"接受"写入、并对读/列返回"空"而非"不支持"。
+// 原因：macOS Finder 拷贝文件时会写 com.apple.FinderInfo / com.apple.quarantine 等
+// xattr，若挂载层未实现这些接口，go-fuse 默认回 ENOATTR/ENOSYS，Finder 收到后整体
+// 中止并弹「错误代码 -43（找不到项目）」。这里让写操作静默成功（不落盘）、读返回
+// 「无此属性」、列返回空——Finder 拿到"成功/无"即继续，文件内容照常上传。
+// 代价仅是 Finder 标签/隔离标记不持久，对分布式文件存储无实质影响。
+
+func (n *node) Setxattr(_ context.Context, _ string, _ []byte, _ uint32) syscall.Errno {
+	return 0 // 接受但不持久化
+}
+
+func (n *node) Getxattr(_ context.Context, _ string, _ []byte) (uint32, syscall.Errno) {
+	return 0, syscall.ENODATA // ENODATA == ENOATTR：无此属性（不是"不支持"）
+}
+
+func (n *node) Listxattr(_ context.Context, _ []byte) (uint32, syscall.Errno) {
+	return 0, 0 // 空属性列表
 }
 
 // candidateAddrs 从副本列表构造读取候选：done 优先，组内随机打散做负载均衡。
