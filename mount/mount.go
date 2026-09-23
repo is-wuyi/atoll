@@ -146,6 +146,7 @@ var (
 	_ fs.NodeGetxattrer  = (*node)(nil)
 	_ fs.NodeSetxattrer  = (*node)(nil)
 	_ fs.NodeListxattrer = (*node)(nil)
+	_ fs.NodeStatfser    = (*node)(nil)
 )
 
 // path 返回该节点对应的集群路径（根节点为 "/"）。
@@ -402,6 +403,9 @@ func (n *node) Create(ctx context.Context, name string, _ uint32, _ uint32, out 
 	if err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
+	// 标记为新建：Finder 拷贝先 CREATE 空文件占位、再写内容，若中途它 stat 发现
+	// 这个空文件不存在（我们没上传 0 字节文件）就判定失败弹 -43。故新建的空文件也要上传。
+	w.created = true
 	w.attr(&out.Attr)
 	return n.newChildNode(ctx, syntheticIno(n.remotePath(name)), fuse.S_IFREG), w, 0, 0
 }
@@ -449,11 +453,37 @@ func (n *node) Setxattr(_ context.Context, _ string, _ []byte, _ uint32) syscall
 }
 
 func (n *node) Getxattr(_ context.Context, _ string, _ []byte) (uint32, syscall.Errno) {
-	return 0, syscall.ENODATA // ENODATA == ENOATTR：无此属性（不是"不支持"）
+	// 必须返回 ENOATTR（macOS=93）表示"无此属性"。此前误用 ENODATA（macOS=96），
+	// 被 macFUSE 当成真 I/O 错误，Finder 收到后中止拷贝并弹「错误代码 -43」。
+	// Linux 上 ENODATA==ENOATTR==61，此常量在两平台都语义正确。
+	return 0, xattrNotFound
 }
 
 func (n *node) Listxattr(_ context.Context, _ []byte) (uint32, syscall.Errno) {
 	return 0, 0 // 空属性列表
+}
+
+// Statfs 报告集群容量。默认(未实现时)全 0，Finder 会认为磁盘满、拒绝拷贝并报「空间不足」。
+// 这里用 /admin/overview 的集群总量/已用换算成块数报给内核。上游不可达时给一个非零兜底，
+// 避免因一次网络抖动就让 Finder 判定无空间。
+func (n *node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
+	const bsize = 4096
+	total, used, err := n.m.client.ClusterCapacity()
+	if err != nil || total <= 0 {
+		// 兜底：报一个很大的容量，宁可乐观也别让 Finder 误判满盘。
+		total, used = 1<<50, 0
+	}
+	if used > total {
+		used = total
+	}
+	out.Bsize = bsize
+	out.Frsize = bsize
+	out.Blocks = uint64(total / bsize)
+	free := uint64((total - used) / bsize)
+	out.Bfree = free
+	out.Bavail = free
+	out.NameLen = 255
+	return 0
 }
 
 // candidateAddrs 从副本列表构造读取候选：done 优先，组内随机打散做负载均衡。
@@ -690,6 +720,7 @@ type writeHandle struct {
 	f       *os.File
 	mu      sync.Mutex
 	dirty   bool
+	created bool // 经 Create 新建：即使 0 字节也要上传（否则 Finder 建的空占位文件凭空消失→-43）
 	dropped bool
 }
 
@@ -745,7 +776,8 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if !w.dirty || w.dropped {
+	// 有内容变更(dirty)才传；新建文件即使 0 字节也传一次(created)，之后清标记避免重传。
+	if (!w.dirty && !w.created) || w.dropped {
 		return 0
 	}
 	st, err := w.f.Stat()
@@ -772,6 +804,7 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 		return syscall.EIO
 	}
 	w.dirty = false
+	w.created = false // 已上传一次，后续 Flush 只在再次 dirty 时重传
 	// 上传改变了该路径的大小/存在性——失效缓存，下次 Lookup 拿到真实新属性。
 	w.m.attrInvalidate(w.remote)
 	return 0

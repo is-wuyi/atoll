@@ -71,6 +71,19 @@ func (c *Client) Ls(path string) ([]types.Inode, error) {
 	return kids, err
 }
 
+// ClusterCapacity 返回集群总容量与已用字节（供挂载层 Statfs 报告可用空间）。
+// 数据源 /admin/overview 的聚合值（所有存活节点容量之和）。
+func (c *Client) ClusterCapacity() (total, used int64, err error) {
+	var ov struct {
+		TotalBytes int64 `json:"total_bytes"`
+		UsedBytes  int64 `json:"used_bytes"`
+	}
+	if err := c.getJSON("/admin/overview", &ov); err != nil {
+		return 0, 0, err
+	}
+	return ov.TotalBytes, ov.UsedBytes, nil
+}
+
 // Rm 删除文件或空目录。
 func (c *Client) Rm(path string) error {
 	req, err := http.NewRequest(http.MethodDelete, c.MasterURL+"/entry?"+queryPath(path), nil)
