@@ -221,6 +221,7 @@ func newTestServerWithStore(t *testing.T) (*httptest.Server, *meta.Store) {
 	}
 	t.Cleanup(func() { store.Close() })
 	srv := NewServer(store, time.Hour)
+	srv.SetCommitWait(200 * time.Millisecond)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { ts.Close() })
 	return ts, store

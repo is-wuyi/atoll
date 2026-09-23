@@ -29,11 +29,18 @@ type Server struct {
 	adminToken auth.Token    // 破坏性操作（/admin/gc）专用；空 = 回退用 token
 	scheme     string        // 出站访问节点的 scheme：http（默认）/https
 	tlsCfg     *tls.Config   // 出站 TLS 客户端配置（nil = 普通 HTTP）
+	// commitWait 是 min_copies 提交时 master 侧等待从副本到齐的上限。
+	// 与 nodeMaxAge 解耦（后者可能长达小时级）：这里只吸收秒级同步延迟，
+	// 超时仍 409 交客户端兜底。测试可调小以免阻塞。
+	commitWait time.Duration
 }
 
 func NewServer(store *meta.Store, nodeMaxAge time.Duration) *Server {
-	return &Server{store: store, nodeMaxAge: nodeMaxAge}
+	return &Server{store: store, nodeMaxAge: nodeMaxAge, commitWait: 20 * time.Second}
 }
+
+// SetCommitWait 覆盖 min_copies 提交的等待上限（测试用，避免 20s 阻塞）。
+func (s *Server) SetCommitWait(d time.Duration) { s.commitWait = d }
 
 // SetToken 设置集群认证 token（包装 Handler 生效）。空 token = 兼容模式。
 func (s *Server) SetToken(token auth.Token) { s.token = token }
@@ -563,14 +570,28 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// min-copies 档位（改进项3）：每块需 ≥minCopies 个"Done 且节点存活"的副本才放行 commit。
-		// minCopies<=0 = 现状（仅主副本 Done）。副本没到齐 → 409，客户端轮询重试。
+		// minCopies<=0 = 现状（仅主副本 Done）。
+		// master 侧短轮询等待：从副本同步通常一两秒内完成，与其让客户端每 30s 粗粒度重问、
+		// 把"其实早就好了"的等待放大到几十秒，不如在这里以 200ms 细粒度等——副本一齐立即放行，
+		// 客户端一次 commit 就返回。等待上限固定 commitWaitCap（与 nodeMaxAge 解耦：后者可能
+		// 长达小时级；这里只想吸收秒级同步延迟），超时仍 409 由客户端兜底重试。
 		if req.MinCopies > 0 {
-			if st, err := s.store.GetInode(req.InodeID); err == nil && st.Staging {
-				if n := s.countCommitReadyChunks(st, req.MinCopies); n < len(st.Chunks) {
+			deadline := time.Now().Add(s.commitWait)
+			for {
+				st, err := s.store.GetInode(req.InodeID)
+				if err != nil || !st.Staging {
+					break // 非 staging（已被并发 commit 等）——交给下面 CommitStagingFile 处理
+				}
+				ready := s.countCommitReadyChunks(st, req.MinCopies)
+				if ready >= len(st.Chunks) {
+					break // 副本齐了，放行
+				}
+				if time.Now().After(deadline) {
 					httpError(w, http.StatusConflict, fmt.Sprintf(
-						"min_copies=%d not reached: %d/%d chunks ready", req.MinCopies, n, len(st.Chunks)))
+						"min_copies=%d not reached: %d/%d chunks ready", req.MinCopies, ready, len(st.Chunks)))
 					return
 				}
+				time.Sleep(200 * time.Millisecond)
 			}
 		}
 		in, old, hadOld, err := s.store.CommitStagingFile(req.InodeID, req.Name, req.Size)
