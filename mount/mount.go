@@ -247,8 +247,10 @@ func (n *node) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 	// 关键优化：/dirs/children 已返回每个子项的完整 inode，趁机批量填进属性缓存。
 	// 内核紧接着对每个条目发的 Lookup/Getattr 就直接命中，省掉 N 次跨网 /meta 往返。
 	entries := make([]fuse.DirEntry, 0, len(kids))
+	seen := make(map[string]bool, len(kids))
 	for i := range kids {
 		k := kids[i]
+		seen[k.Name] = true
 		mode := uint32(fuse.S_IFREG)
 		if k.Type == types.TypeDir {
 			mode = fuse.S_IFDIR
@@ -256,6 +258,26 @@ func (n *node) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 		entries = append(entries, fuse.DirEntry{Name: k.Name, Mode: mode, Ino: k.ID})
 		n.m.attrPut(strings.TrimSuffix(dir, "/")+"/"+k.Name, k)
 	}
+	// 流式上传中的文件（活跃写句柄）合并进目录列表：staging 在 master 目录里
+	// 不可见，不合并的话 Finder 刷新一变就"消失"（400MB 事故现场：文件闪现→
+	// Finder 收尾时找不到自己的文件→不弹进度条→最终弹"设备已消失"）。
+	// 内核对它的后续 Lookup/Getattr 走 writes 表，属性=本地缓冲实时大小。
+	prefix := strings.TrimSuffix(dir, "/") + "/"
+	n.m.mu.Lock()
+	for remote := range n.m.writes {
+		if !strings.HasPrefix(remote, prefix) {
+			continue
+		}
+		name := remote[len(prefix):]
+		if name == "" || strings.ContainsRune(name, '/') {
+			continue // 只合并该目录的直接子项
+		}
+		if seen[name] {
+			continue
+		}
+		entries = append(entries, fuse.DirEntry{Name: name, Mode: fuse.S_IFREG, Ino: syntheticIno(remote)})
+	}
+	n.m.mu.Unlock()
 	return &sliceDirStream{entries: entries}, 0
 }
 
@@ -851,12 +873,13 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
 		return syscall.EIO
 	}
-	// commit 前等待的持久性下限：取 min(replicas, 2)。此前硬等满副本，
-	// replicas=3 时只要一个从副本慢/掉就阻塞到 15 分钟再 EIO（cp 卡死）。
-	// 2 份已能扛单节点丢失，其余由后台复制 + 修复补齐——既有持久性又不卡写。
+	// commit 前等待的持久性下限：只等主副本（1 份）落盘即返回。
+	// 跨公网（EasyTier）环境下节点间复制远慢于写入，等第 2 份 Done 常凑不齐，
+	// 阻塞到 15 分钟再 EIO（cp 卡死）。改为主副本落盘即成功，第 2、3 份由后台
+	// 复制 + 修复扫描异步补齐——写入即时完成，持久性最终收敛。
 	minCopies := w.m.replicas
-	if minCopies > 2 {
-		minCopies = 2
+	if minCopies > 1 {
+		minCopies = 1
 	}
 	var err2 error
 	if st.Size() > 0 {

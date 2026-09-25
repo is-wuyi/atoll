@@ -48,8 +48,8 @@ func (c *Client) BeginStreamUpload(remotePath string, replicas int) (*StreamUplo
 		return nil, fmt.Errorf("invalid remote path: %s", remotePath)
 	}
 	minCopies := replicas
-	if minCopies > 2 {
-		minCopies = 2 // 与旧 Flush 相同的持久性档位
+	if minCopies > 1 {
+		minCopies = 1 // 只等主副本落盘即 commit，第 2、3 份后台异步补齐（与 Flush 一致）
 	}
 	var created struct {
 		Inode types.Inode      `json:"inode"`

@@ -41,9 +41,11 @@ func TestStreamUploadBasic(t *testing.T) {
 	if len(in.Chunks) != 4 {
 		t.Fatalf("chunks %d != 4", len(in.Chunks))
 	}
+	// commit 只保证主副本落盘（minCopies=1）；第 2 份由后台复制/修复异步补齐，
+	// commit 时不作保证。
 	for _, c2 := range in.Chunks {
-		if len(c2.Done) < 2 {
-			t.Fatalf("块 %d done=%v < 2（minCopies=2）", c2.Index, c2.Done)
+		if len(c2.Done) < 1 {
+			t.Fatalf("块 %d done=%v < 1（minCopies=1）", c2.Index, c2.Done)
 		}
 	}
 	if got := u.Progress(); got != total {
