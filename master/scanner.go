@@ -403,6 +403,35 @@ func (s *Scanner) repairLegacyInode(in types.Inode, nodes []types.NodeInfo, now 
 // 退避 key 用 chunkID（staging inode 与已提交 inode 的块都修——
 // staging 的块也要保持副本数，客户端可能传得很慢）。
 func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now time.Time) {
+	// 主副本 Done 探测兜底（27348 事故）：块的 Done 标记挂在"节点查推送目标"的上报
+	// 链上；节点到 master 的 DNS/网络一抖，PUT 已成功的块就谁都没标记 →
+	// planRepairs 视为"无可用源"永远跳过，commit 409 循环到 15 分钟超时、
+	// 大文件上传整体失败。扫描时先探测副本槽位：对象在、节点活、却未标 Done → 补标。
+	// 下一轮 planRepairs 即有源，正常 pull，死锁解除。
+	nodeByID := make(map[uint64]types.NodeInfo, len(nodes))
+	for _, n := range nodes {
+		nodeByID[n.ID] = n
+	}
+	doneAll := map[uint64]bool{}
+	for _, c := range in.Chunks {
+		for _, id := range c.Done {
+			doneAll[id] = true
+		}
+		for _, id := range c.Replicas {
+			if doneAll[id] {
+				continue
+			}
+			n, ok := nodeByID[id]
+			if !ok || time.Since(n.LastHeartbeat) > s.nodeMaxAge {
+				continue
+			}
+			chunkID := types.ChunkID(in.ID, c.Index)
+			if s.probeChunkObject(n.Addr, chunkID) {
+				_ = s.store.MarkChunkDone(chunkID, id)
+				log.Printf("inode %d chunk %d: 探测兜底——副本 %d 对象在而未标 Done，补标", in.ID, c.Index, id)
+			}
+		}
+	}
 	for _, c := range in.Chunks {
 		chunkID := types.ChunkID(in.ID, c.Index)
 		// 单副本窗口告警（改进项2）：块存活副本数（Done 且节点 alive）< len(Replicas)
@@ -595,6 +624,25 @@ func (s *Scanner) probeSource(sourceAddr string, inodeID uint64) bool {
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body) // 排空以便连接复用
 	return resp.StatusCode != http.StatusNotFound
+}
+
+// probeChunkObject 探测节点上块对象是否确实存在（Range 1 字节）。
+// 与 probeSource 的乐观策略相反：这里要据此补标 Done（向 commit 承诺持久性），
+// 必须"明确看到 200/206"才算存在——网络错误/401/500 一律保守判不在。
+func (s *Scanner) probeChunkObject(nodeAddr string, objectID uint64) bool {
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("%s://%s/objects/%d", s.scheme, nodeAddr, objectID), nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent
 }
 
 // triggerPull 调用目标节点 POST /pull。
