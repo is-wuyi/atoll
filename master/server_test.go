@@ -23,6 +23,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	t.Cleanup(func() { store.Close() })
 	srv := NewServer(store, time.Hour) // 测试里节点心跳 1 小时内都算存活
 	srv.SetCommitWait(200 * time.Millisecond) // min_copies 测试不阻塞在 20s 默认等待
+	srv.SetHealthProbe(func(string) bool { return true }) // 假地址节点无 /healthz，桩为始终可达
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { ts.Close() })
 	return ts
@@ -428,6 +429,7 @@ func TestCreateFileOverwrite(t *testing.T) {
 		}
 		t.Cleanup(func() { store.Close() })
 		srv := NewServer(store, time.Hour)
+		srv.SetHealthProbe(func(string) bool { return true })
 		ts := httptest.NewServer(srv.Handler())
 		t.Cleanup(func() { ts.Close() })
 

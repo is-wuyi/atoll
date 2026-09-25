@@ -222,9 +222,60 @@ func newTestServerWithStore(t *testing.T) (*httptest.Server, *meta.Store) {
 	t.Cleanup(func() { store.Close() })
 	srv := NewServer(store, time.Hour)
 	srv.SetCommitWait(200 * time.Millisecond)
+	srv.SetHealthProbe(func(string) bool { return true }) // 假地址节点无 /healthz，桩为始终可达
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { ts.Close() })
 	return ts, store
+}
+
+// 幽灵节点过滤（27472/27348 关机事故回归）：节点心跳未过期但 master 已连不上，
+// 不得被选为副本目标——否则那份副本永远传不上、min_copies 永远差一个、commit 无限 409。
+// 之前 pickAliveNodes 只看心跳时间戳，单测又用假地址，故这条从没被覆盖过。
+func TestPickAliveNodesSkipsUnreachable(t *testing.T) {
+	store, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatalf("meta.Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	srv := NewServer(store, time.Hour)
+	srv.SetCommitWait(200 * time.Millisecond)
+	// 9002 是幽灵节点：心跳新鲜但探测连不上；9001 健康。
+	srv.SetHealthProbe(func(addr string) bool { return addr != "127.0.0.1:9002" })
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { ts.Close() })
+
+	registerNode(t, ts.URL, 1) // 127.0.0.1:9001 健康
+	registerNode(t, ts.URL, 2) // 127.0.0.1:9002 幽灵
+
+	st := stagingCreate(t, ts.URL, "/ghost.bin", false)
+
+	// replicas=2：仅 1 个可达 → 503（宁可分配失败，也不把副本指给连不上的节点）。
+	if _, code := assignChunk(t, ts.URL, st.ID, 0, 100, false); code != http.StatusServiceUnavailable {
+		t.Fatalf("仅 1 个可达节点时 replicas=2 应 503, got %d", code)
+	}
+
+	// replicas=1：唯一可达的 9001 应被选中，绝不会是幽灵 9002。
+	c, code := assignChunkReplicas(t, ts.URL, st.ID, 0, 100, 1)
+	if code != http.StatusOK {
+		t.Fatalf("replicas=1 应成功分配可达节点, got %d", code)
+	}
+	if len(c.Replicas) != 1 {
+		t.Fatalf("replicas=1 应分 1 个副本, got %+v", c.Replicas)
+	}
+	nodes, _ := store.NodeInfos(c.Replicas)
+	if len(nodes) != 1 || nodes[0].Addr != "127.0.0.1:9001" {
+		t.Fatalf("应选中可达节点 9001, got %+v", nodes)
+	}
+}
+
+// assignChunkReplicas 同 assignChunk 但可指定副本数。
+func assignChunkReplicas(t *testing.T, base string, inodeID uint64, index int, size int64, replicas int) (types.ChunkInfo, int) {
+	t.Helper()
+	var out chunkAssignResp
+	resp := postJSON(t, base+"/files/chunks", map[string]any{
+		"inode_id": inodeID, "index": index, "size": size, "replicas": replicas, "reassign": false,
+	}, &out)
+	return out.Chunk, resp.StatusCode
 }
 
 // min-copies 存活校验（改进项1）：死节点上的 Done 不计数。

@@ -33,6 +33,9 @@ type Server struct {
 	// 与 nodeMaxAge 解耦（后者可能长达小时级）：这里只吸收秒级同步延迟，
 	// 超时仍 409 交客户端兜底。测试可调小以免阻塞。
 	commitWait time.Duration
+	// healthProbe 探测节点实时可达性；nil = 用真实 probeHealthz（GET /healthz）。
+	// 测试注入桩绕过真实网络（单测节点是假地址，无 /healthz 服务）。
+	healthProbe func(addr string) bool
 }
 
 func NewServer(store *meta.Store, nodeMaxAge time.Duration) *Server {
@@ -41,6 +44,9 @@ func NewServer(store *meta.Store, nodeMaxAge time.Duration) *Server {
 
 // SetCommitWait 覆盖 min_copies 提交的等待上限（测试用，避免 20s 阻塞）。
 func (s *Server) SetCommitWait(d time.Duration) { s.commitWait = d }
+
+// SetHealthProbe 覆盖节点可达性探测（测试用，注入桩绕过真实 /healthz 网络请求）。
+func (s *Server) SetHealthProbe(fn func(addr string) bool) { s.healthProbe = fn }
 
 // SetToken 设置集群认证 token（包装 Handler 生效）。空 token = 兼容模式。
 func (s *Server) SetToken(token auth.Token) { s.token = token }
@@ -399,23 +405,53 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 }
 
 // pickAliveNodes 随机挑选 n 个剩余容量足够的活跃节点，不足返回错误。
+// 除了心跳时间戳，还实时探测 master→节点的可达性：节点可能刚关机/退网，
+// 心跳还没过期（30s 窗口）却已连不上——若把这种"幽灵节点"分配为副本，
+// 那个副本永远传不上去，min_copies 永远差一个，commit 无限 409 到超时
+// （27348 关机事故：块副本被指派到连不上的节点，大文件上传整体失败）。
 func (s *Server) pickAliveNodes(n int, needBytes int64) ([]types.NodeInfo, error) {
 	alive, err := s.store.ListAliveNodes(s.nodeMaxAge)
 	if err != nil {
 		return nil, err
 	}
-	// 过滤容量足够的节点（块级分配的关键：不再要求单节点装下整个文件）。
+	// 过滤容量足够 + master 当前可达的节点。
+	probe := s.healthProbe
+	if probe == nil {
+		probe = s.probeHealthz
+	}
 	var fit []types.NodeInfo
 	for _, nd := range alive {
-		if nd.TotalBytes-nd.UsedBytes >= needBytes {
-			fit = append(fit, nd)
+		if nd.TotalBytes-nd.UsedBytes < needBytes {
+			continue
 		}
+		if !probe(nd.Addr) {
+			continue // 心跳未过期但已连不上——幽灵节点，跳过
+		}
+		fit = append(fit, nd)
 	}
 	if len(fit) < n {
-		return nil, fmt.Errorf("alive nodes with capacity %d < %d", len(fit), n)
+		return nil, fmt.Errorf("alive+reachable nodes with capacity %d < %d", len(fit), n)
 	}
 	rand.Shuffle(len(fit), func(i, j int) { fit[i], fit[j] = fit[j], fit[i] })
 	return fit[:n], nil
+}
+
+// probeHealthz 探测 master→节点的实时可达性（GET /healthz，2s 超时）。
+// 连不上返回 false。用于副本分配前过滤幽灵节点。
+func (s *Server) probeHealthz(nodeAddr string) bool {
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("%s://%s/healthz", s.nodeScheme(), nodeAddr), nil)
+	if err != nil {
+		return false
+	}
+	client := &http.Client{Timeout: 2 * time.Second, Transport: auth.HTTPTransport(s.token, s.tlsCfg, nil)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
 }
 
 // handleAssignChunk 为 staging 文件分配块副本：POST /files/chunks
