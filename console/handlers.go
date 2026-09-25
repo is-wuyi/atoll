@@ -667,6 +667,17 @@ func buildMatrix(in types.Inode, alive map[uint64]bool) ([]matrixCol, []matrixRo
 		if len(c.Replicas) > 0 {
 			primary = c.Replicas[0]
 		}
+		// healthyCount = 已落盘且节点存活的副本数（与 integrity 页同口径）。
+		// 决定"未 Done 格子"的语义：副本已满员 → 未 Done 只是尚未同步（"同"）；
+		// 副本有缺口 → 未 Done 的格子就是缺的那个坑（"缺"），不管节点死活——
+		// 修复换节点后旧坑永远不会再被同步，画成"同"会永久误导（曾发生：用户看到
+		// 一堆"同步中"但文件其实降级，"缺失"一格不出现）。
+		healthyCount := 0
+		for _, id := range c.Done {
+			if alive[id] && inReplicas[id] {
+				healthyCount++
+			}
+		}
 		cells := make([]matrixCell, len(colIDs))
 		for i, id := range colIDs {
 			switch {
@@ -678,10 +689,10 @@ func buildMatrix(in types.Inode, alive map[uint64]bool) ([]matrixCol, []matrixRo
 				cells[i] = matrixCell{Class: "primary", Label: "主"}
 			case doneSet[id]:
 				cells[i] = matrixCell{Class: "replica", Label: "副"}
-			case !alive[id]:
-				cells[i] = matrixCell{Class: "missing", Label: "失"}
-			default:
+			case healthyCount >= len(c.Replicas):
 				cells[i] = matrixCell{Class: "syncing", Label: "同"}
+			default:
+				cells[i] = matrixCell{Class: "missing", Label: "缺"}
 			}
 		}
 		rows = append(rows, matrixRow{Index: c.Index, Cells: cells})
