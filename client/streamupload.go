@@ -141,17 +141,20 @@ func (u *StreamUploader) Finish(tail []byte, totalSize int64) error {
 	if u.minCopies > 0 {
 		commitBody["min_copies"] = u.minCopies
 	}
-	deadline := time.Now().Add(15 * time.Minute)
-	for attempt := 0; ; attempt++ {
+	// min_copies=1 且主副本 PUT 已同步落盘（uploadChunkOnce 收到 201），commit
+	// 通常首次即成功；这里只为吸收 master 标 Done 的短暂滞后做有限轮询，60s 内
+	// 仍 409 则判失败返回（不再死等 15 分钟拖垮 Finder）。
+	deadline := time.Now().Add(60 * time.Second)
+	for {
 		err := u.c.postJSON("/files/commit", commitBody, nil)
 		if err == nil {
 			return nil
 		}
-		if u.minCopies <= 0 || attempt >= 30 || !strings.Contains(err.Error(), "http 409") || time.Now().After(deadline) {
+		if u.minCopies <= 0 || !strings.Contains(err.Error(), "http 409") || time.Now().After(deadline) {
 			u.abort()
 			return fmt.Errorf("commit: %w", err)
 		}
-		time.Sleep(30 * time.Second)
+		time.Sleep(3 * time.Second)
 	}
 }
 

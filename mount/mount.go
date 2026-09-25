@@ -754,11 +754,14 @@ type writeHandle struct {
 	created bool // 经 Create 新建：即使 0 字节也要上传（否则 Finder 建的空占位文件凭空消失→-43）
 	dropped bool
 
-	// 流式上传会话（仅新建/截断写入时启用；trunc=false 就地编辑为 nil 走旧整传）
-	stream   *client.StreamUploader
-	streamOn bool
-	pend     []byte // 当前攒的未满一块数据（≤64MB，满了就 Push）
-	sentIdx  int64  // 已推入流式的字节数（= 已满块数×64MB）
+	// 流式上传会话（仅新建/截断写入时启用；trunc=false 就地编辑为 nil 走旧整传）。
+	// 整块从本地缓冲文件按"连续写入水位"读出后推入，对 FUSE 并发/乱序写鲁棒
+	// （旧版按到达的 data 攒块 + off==sentIdx 判定，一旦写乱序就漏块→commit 死等）。
+	stream    *client.StreamUploader
+	streamOn  bool
+	sentIdx   int64           // 已作为整块从本地文件推入的字节数（ChunkSize 整数倍）
+	contigEnd int64           // 从 0 起连续已写入的字节数（含已推与待推）
+	ooo       map[int64]int64 // 越过 contigEnd 的乱序写片段 start→end（FUSE 写页对齐不重叠）
 }
 
 var (
@@ -810,7 +813,6 @@ func (w *writeHandle) startStream() error {
 	}
 	w.stream = u
 	w.streamOn = true
-	w.pend = nil
 	w.sentIdx = 0
 	return nil
 }
@@ -823,18 +825,47 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 		return 0, syscall.EIO
 	}
 	w.dirty = true
-	if w.streamOn && off == w.sentIdx {
-		if w.stream == nil {
-			if err := w.startStream(); err != nil {
-				return 0, syscall.EIO
+	if !w.streamOn {
+		return uint32(n), 0
+	}
+	// 更新"从 0 起连续写入水位"。FUSE 并发/乱序投递下，data 的到达顺序不可靠，
+	// 故只据水位从本地文件读整块推送——写到哪、按文件真实内容推到哪。
+	end := off + int64(n)
+	if off <= w.contigEnd {
+		if end > w.contigEnd {
+			w.contigEnd = end
+		}
+		for { // 吸收此前乱序、现在能接上的片段
+			e, ok := w.ooo[w.contigEnd]
+			if !ok {
+				break
+			}
+			delete(w.ooo, w.contigEnd)
+			if e > w.contigEnd {
+				w.contigEnd = e
 			}
 		}
-		// 顺序追加写（Finder/cp 的模式）：攒块满 64MB 即投入流式上传。
-		w.pend = append(w.pend, data...)
-		for int64(len(w.pend)) >= types.ChunkSize {
+	} else {
+		if w.ooo == nil {
+			w.ooo = make(map[int64]int64)
+		}
+		if e, ok := w.ooo[off]; !ok || end > e {
+			w.ooo[off] = end
+		}
+	}
+	// byte 0 已落盘即可建会话（乱序时首个到达的写可能不是 0 号，等它到齐再建）。
+	if w.stream == nil && w.contigEnd > 0 {
+		if err := w.startStream(); err != nil {
+			return 0, syscall.EIO
+		}
+	}
+	// 连续区每够一整块，从文件读出推入（并发 ≤2，满则在此背压等待）。
+	if w.stream != nil {
+		for w.contigEnd-w.sentIdx >= types.ChunkSize {
 			blk := make([]byte, types.ChunkSize)
-			copy(blk, w.pend[:types.ChunkSize])
-			w.pend = w.pend[types.ChunkSize:]
+			if _, err := w.f.ReadAt(blk, w.sentIdx); err != nil {
+				return 0, syscall.EIO
+			}
 			if err := w.stream.Push(blk); err != nil {
 				return 0, syscall.EIO
 			}
@@ -857,16 +888,35 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 		return syscall.EIO
 	}
 
-	// 流式路径：整块已在 WRITE 期间陆续上传，这里只收尾。
+	// 流式路径：整块已在 WRITE 期间陆续上传，这里只读尾巴 + commit。
 	if w.streamOn && w.stream != nil {
-		if err := w.stream.Finish(w.pend, st.Size()); err != nil {
+		size := st.Size()
+		if w.contigEnd < size {
+			// 文件尾部存在未连续覆盖的空洞（乱序/稀疏写未闭合）：放弃流式、
+			// 回退到下方整传路径，从完整的本地文件重传，保证正确性。
+			_ = w.stream.Close()
 			w.stream = nil
-			return syscall.EIO
+			w.streamOn = false
+		} else {
+			var tail []byte
+			if size > w.sentIdx { // [sentIdx, size) 必 < 一整块（WRITE 已推完所有整块）
+				tail = make([]byte, size-w.sentIdx)
+				if _, err := w.f.ReadAt(tail, w.sentIdx); err != nil && err != io.EOF {
+					w.stream = nil
+					return syscall.EIO
+				}
+			}
+			if err := w.stream.Finish(tail, size); err != nil {
+				w.stream = nil
+				return syscall.EIO
+			}
+			w.stream = nil
+			w.streamOn = false
+			w.dirty = false
+			w.created = false
+			w.m.attrInvalidate(w.remote)
+			return 0
 		}
-		w.dirty = false
-		w.created = false
-		w.m.attrInvalidate(w.remote)
-		return 0
 	}
 
 	// 旧整传路径（就地编辑、或从未启用流式的小文件）。
@@ -938,21 +988,16 @@ func (w *writeHandle) discard() {
 func (w *writeHandle) truncate(size uint64) syscall.Errno {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// 流式会话中途 truncate 与已推送块冲突（流式只支持顺序追加）：
-	// 若尚未推过任何块，直接重置会话状态从头再来；已推过则放弃流式回退旧整传。
-	if w.streamOn && w.stream != nil {
-		if w.sentIdx > 0 {
-			_ = w.stream.Close() // abort 本轮 staging
-			w.stream = nil
-			w.streamOn = false
-			w.pend = nil
-			w.sentIdx = 0
-		} else {
-			_ = w.stream.Close()
-			w.stream = nil
-			w.pend = nil
-		}
+	// 流式只支持从空文件顺序生长；中途 truncate 与已推块语义冲突，
+	// 直接放弃本轮流式会话、回退整传（从完整本地文件重传），truncate 罕见、可接受。
+	if w.stream != nil {
+		_ = w.stream.Close() // abort 本轮 staging
+		w.stream = nil
 	}
+	w.streamOn = false
+	w.sentIdx = 0
+	w.contigEnd = 0
+	w.ooo = nil
 	if err := w.f.Truncate(int64(size)); err != nil {
 		return syscall.EIO
 	}
