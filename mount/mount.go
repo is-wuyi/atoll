@@ -406,6 +406,8 @@ func (n *node) Create(ctx context.Context, name string, _ uint32, _ uint32, out 
 	// 标记为新建：Finder 拷贝先 CREATE 空文件占位、再写内容，若中途它 stat 发现
 	// 这个空文件不存在（我们没上传 0 字节文件）就判定失败弹 -43。故新建的空文件也要上传。
 	w.created = true
+	// 流式上传：staging 延迟到首个 WRITE 再建（0 字节文件没必要建 staging 再 abort）。
+	w.streamOn = true
 	w.attr(&out.Attr)
 	return n.newChildNode(ctx, syntheticIno(n.remotePath(name)), fuse.S_IFREG), w, 0, 0
 }
@@ -711,7 +713,14 @@ func (ch *chunkedReadHandle) Read(_ context.Context, dest []byte, off int64) (fu
 	return fuse.ReadResultData(out), 0
 }
 
-// ---- 写句柄：本地缓冲，Flush 整传 ----
+// ---- 写句柄：本地缓冲 + 流式分块上传 ----
+//
+// 流式模式（方案 B）：写打开即建 staging；WRITE 攒满一个块（64MB）就投给
+// StreamUploader 后台上传（并发 ≤2）；Flush 只传最后不满一块的尾巴 + commit。
+// close 秒级返回，Finder 不再因等待整个文件上传而"设备已消失"。
+//
+// 就地编辑（trunc=false）依旧先下载现有内容到本地缓冲——编辑通常改动小，
+// Flush 走旧的整传路径（复用覆盖写原子换名），不值得为罕见场景拆块。
 
 type writeHandle struct {
 	m       *Mount
@@ -722,6 +731,12 @@ type writeHandle struct {
 	dirty   bool
 	created bool // 经 Create 新建：即使 0 字节也要上传（否则 Finder 建的空占位文件凭空消失→-43）
 	dropped bool
+
+	// 流式上传会话（仅新建/截断写入时启用；trunc=false 就地编辑为 nil 走旧整传）
+	stream   *client.StreamUploader
+	streamOn bool
+	pend     []byte // 当前攒的未满一块数据（≤64MB，满了就 Push）
+	sentIdx  int64  // 已推入流式的字节数（= 已满块数×64MB）
 }
 
 var (
@@ -730,7 +745,8 @@ var (
 	_ fs.FileReleaser = (*writeHandle)(nil)
 )
 
-// newWriteHandle 建立写缓冲。trunc=true 从空文件开始；否则先下载现有内容（就地编辑）。
+// newWriteHandle 建立写缓冲。trunc=true 从空文件开始（启用流式）；
+// 否则先下载现有内容（就地编辑，走旧整传）。
 func (m *Mount) newWriteHandle(remote string, trunc bool) (*writeHandle, error) {
 	tmp, err := os.CreateTemp(m.cacheDir, "w-*")
 	if err != nil {
@@ -751,12 +767,30 @@ func (m *Mount) newWriteHandle(remote string, trunc bool) (*writeHandle, error) 
 				w.f = f
 			}
 		}
-		// 下载失败（如文件不存在）视为从空开始。
+		// 下载失败（如文件不存在）视为从空开始——此时同样能走流式。
 	}
 	m.mu.Lock()
 	m.writes[remote] = w
 	m.mu.Unlock()
 	return w, nil
+}
+
+// startStream 惰性启动流式会话：首次 WRITE 攒块前调用。
+// 已有同路径 staging 的并发写者场景：两个会话各自 staging，commit 时
+// 单事务原子换名，后 commit 者胜——与旧路径语义一致。
+func (w *writeHandle) startStream() error {
+	if w.stream != nil {
+		return nil
+	}
+	u, err := w.m.client.BeginStreamUpload(w.remote, w.m.replicas)
+	if err != nil {
+		return err
+	}
+	w.stream = u
+	w.streamOn = true
+	w.pend = nil
+	w.sentIdx = 0
+	return nil
 }
 
 func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, syscall.Errno) {
@@ -767,16 +801,32 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 		return 0, syscall.EIO
 	}
 	w.dirty = true
+	if w.streamOn && off == w.sentIdx {
+		if w.stream == nil {
+			if err := w.startStream(); err != nil {
+				return 0, syscall.EIO
+			}
+		}
+		// 顺序追加写（Finder/cp 的模式）：攒块满 64MB 即投入流式上传。
+		w.pend = append(w.pend, data...)
+		for int64(len(w.pend)) >= types.ChunkSize {
+			blk := make([]byte, types.ChunkSize)
+			copy(blk, w.pend[:types.ChunkSize])
+			w.pend = w.pend[types.ChunkSize:]
+			if err := w.stream.Push(blk); err != nil {
+				return 0, syscall.EIO
+			}
+			w.sentIdx += types.ChunkSize
+		}
+	}
 	return uint32(n), 0
 }
 
-// Flush 上传缓冲文件到集群。可能被多次调用（每次 close），有变更才重传。
-// 非空文件走分块流水线（覆盖写由 commit 单事务原子换名，旧版本或新版本必居其一）；
-// 空文件走 legacy 单对象路径（chunked 模式要求至少一块）。
+// Flush 完成上传。流式会话：传尾巴 + commit（秒级）；旧路径（就地编辑/空文件）：
+// 整传。可能被多次调用（每次 close），成功后幂等。
 func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// 有内容变更(dirty)才传；新建文件即使 0 字节也传一次(created)，之后清标记避免重传。
 	if (!w.dirty && !w.created) || w.dropped {
 		return 0
 	}
@@ -784,6 +834,20 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	if err != nil {
 		return syscall.EIO
 	}
+
+	// 流式路径：整块已在 WRITE 期间陆续上传，这里只收尾。
+	if w.streamOn && w.stream != nil {
+		if err := w.stream.Finish(w.pend, st.Size()); err != nil {
+			w.stream = nil
+			return syscall.EIO
+		}
+		w.dirty = false
+		w.created = false
+		w.m.attrInvalidate(w.remote)
+		return 0
+	}
+
+	// 旧整传路径（就地编辑、或从未启用流式的小文件）。
 	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
 		return syscall.EIO
 	}
@@ -810,7 +874,8 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	return 0
 }
 
-// Release 清理本地缓冲与注册表（只执行一次）。
+// Release 清理本地缓冲与注册表（只执行一次）。流式会话若未 Finish（异常关闭）
+// 则 abort——staging 由 master TTL 兜底回收，已传块对象由 GC 两轮确认清理。
 func (w *writeHandle) Release(_ context.Context) syscall.Errno {
 	w.mu.Lock()
 	if w.dropped {
@@ -818,6 +883,10 @@ func (w *writeHandle) Release(_ context.Context) syscall.Errno {
 		return 0
 	}
 	w.dropped = true
+	if w.stream != nil {
+		_ = w.stream.Close() // 未 Finish 的会话：abort staging
+		w.stream = nil
+	}
 	w.mu.Unlock()
 	w.f.Close()
 	os.Remove(w.local)
@@ -846,6 +915,21 @@ func (w *writeHandle) discard() {
 func (w *writeHandle) truncate(size uint64) syscall.Errno {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// 流式会话中途 truncate 与已推送块冲突（流式只支持顺序追加）：
+	// 若尚未推过任何块，直接重置会话状态从头再来；已推过则放弃流式回退旧整传。
+	if w.streamOn && w.stream != nil {
+		if w.sentIdx > 0 {
+			_ = w.stream.Close() // abort 本轮 staging
+			w.stream = nil
+			w.streamOn = false
+			w.pend = nil
+			w.sentIdx = 0
+		} else {
+			_ = w.stream.Close()
+			w.stream = nil
+			w.pend = nil
+		}
+	}
 	if err := w.f.Truncate(int64(size)); err != nil {
 		return syscall.EIO
 	}
