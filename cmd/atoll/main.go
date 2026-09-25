@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -306,8 +307,15 @@ func runMount(args []string, stderr io.Writer) int {
 	// （无缓存 + 网络失败 → ENOENT → 内核立即重试的热循环曾致 90% CPU 空转）。
 	// 正存在缓存 1s；负缓存（不存在的路径）1s 防止扫描类负载打爆 master。
 	entryT, attrT, negT := 1*time.Second, 1*time.Second, 1*time.Second
+	mountOpts := fuse.MountOptions{Name: "atoll", Debug: *debug}
+	if runtime.GOOS == "darwin" {
+		// macFUSE 默认 daemon_timeout=60s：任一 FUSE 操作（跨公网慢上传的 Write/Flush）
+		// 超 60s 未返回，内核就判进程失联、驱逐挂载 → Finder「设备已消失」。网络文件
+		// 系统本就慢，调大到 600s 让内核有耐心（sshfs 等同样做法）。
+		mountOpts.Options = append(mountOpts.Options, "daemon_timeout=600")
+	}
 	server, err := fs.Mount(mountPoint, m.Root(), &fs.Options{
-		MountOptions:    fuse.MountOptions{Name: "atoll", Debug: *debug},
+		MountOptions:    mountOpts,
 		EntryTimeout:    &entryT,
 		AttrTimeout:     &attrT,
 		NegativeTimeout: &negT,
