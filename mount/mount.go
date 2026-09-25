@@ -988,17 +988,27 @@ func (w *writeHandle) discard() {
 func (w *writeHandle) truncate(size uint64) syscall.Errno {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// 流式只支持从空文件顺序生长；中途 truncate 与已推块语义冲突，
-	// 直接放弃本轮流式会话、回退整传（从完整本地文件重传），truncate 罕见、可接受。
-	if w.stream != nil {
+	sz := int64(size)
+	// Finder 拷贝会先 ftruncate 到完整大小做预分配，再顺序写。这属于"增长/预分配"，
+	// 与流式并不冲突——若在此放弃流式，整份文件就退回 close 时整传、大文件必然把
+	// Finder 的 close 拖超时（「设备已消失」）。因此：只有截断到"已推整块之下"才
+	// 真冲突（会孤立已推块），才放弃流式回退整传；否则保留流式，按新大小夹逼水位。
+	if w.stream != nil && sz < w.sentIdx {
 		_ = w.stream.Close() // abort 本轮 staging
 		w.stream = nil
+		w.streamOn = false
+		w.sentIdx = 0
+		w.contigEnd = 0
+		w.ooo = nil
+	} else if w.streamOn && sz < w.contigEnd {
+		w.contigEnd = sz
+		for k := range w.ooo {
+			if k >= sz {
+				delete(w.ooo, k)
+			}
+		}
 	}
-	w.streamOn = false
-	w.sentIdx = 0
-	w.contigEnd = 0
-	w.ooo = nil
-	if err := w.f.Truncate(int64(size)); err != nil {
+	if err := w.f.Truncate(sz); err != nil {
 		return syscall.EIO
 	}
 	w.dirty = true

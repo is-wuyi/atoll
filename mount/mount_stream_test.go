@@ -108,3 +108,60 @@ func TestStreamWriteOutOfOrder(t *testing.T) {
 	rng.Shuffle(len(order), func(i, j int) { order[i], order[j] = order[j], order[i] })
 	streamWriteAndVerify(t, cc, "/s/ooo.bin", content, order)
 }
+
+// 预分配写（Finder 拷贝的模式）：先 ftruncate 到完整大小再顺序写。
+// 之前 truncate 一律放弃流式→退回 close 整传→大文件把 Finder close 拖超时
+// （「设备已消失」）。修复后预分配应保留流式；本例锁死该回归。
+func TestStreamWritePreallocatedThenWrite(t *testing.T) {
+	withChunkSize(t, 1024)
+	cc := newChunkedCluster(t, 2)
+	if _, err := cc.client.Mkdir("/s"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	content := make([]byte, 3584) // 3×1024 + 512 → 4 块
+	rand.New(rand.NewSource(23)).Read(content)
+
+	w, err := cc.m.newWriteHandle("/s/prealloc.bin", true)
+	if err != nil {
+		t.Fatalf("newWriteHandle: %v", err)
+	}
+	w.created = true
+	w.streamOn = true
+	ctx := context.Background()
+	// Finder 式：先预分配到完整大小。
+	if errno := w.truncate(uint64(len(content))); errno != 0 {
+		t.Fatalf("truncate(预分配): %v", errno)
+	}
+	if !w.streamOn {
+		t.Fatalf("预分配后不应关闭流式（否则大文件 close 会拖垮 Finder）")
+	}
+	for off := 0; off < len(content); off += 200 {
+		n := 200
+		if off+n > len(content) {
+			n = len(content) - off
+		}
+		if _, errno := w.Write(ctx, content[off:off+n], int64(off)); errno != 0 {
+			t.Fatalf("Write(off=%d): %v", off, errno)
+		}
+	}
+	if errno := w.Flush(ctx); errno != 0 {
+		t.Fatalf("Flush: %v（预分配路径卡住即回归）", errno)
+	}
+	_ = w.Release(ctx)
+
+	in, _, err := cc.client.Lookup("/s/prealloc.bin")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if !in.Chunked || in.Size != int64(len(content)) {
+		t.Fatalf("元数据不符: chunked=%v size=%d want %d", in.Chunked, in.Size, len(content))
+	}
+	out := filepath.Join(t.TempDir(), "out.bin")
+	if err := cc.client.Get("/s/prealloc.bin", out); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if !bytes.Equal(got, content) {
+		t.Fatalf("读回不符: got %d want %d", len(got), len(content))
+	}
+}

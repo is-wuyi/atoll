@@ -4,6 +4,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -436,10 +437,16 @@ func (c *Client) uploadChunkOnce(stagingID uint64, index int, data []byte, repli
 	if err != nil {
 		return fmt.Errorf("assign chunk %d: %w", index, err)
 	}
-	// PUT 主副本：重试 2 次；仍失败 → reassign 换节点再试 1 轮。
-	for round := 0; round < 2; round++ {
+	// PUT 主副本，每次带上下文超时：节点在 EasyTier 上可能中途卡死（TCP 不再 ACK），
+	// 无超时的 Do 会永久挂起 → 拖死 Flush/close → Finder「设备已消失」。超时按块大小
+	// 给足慢速链路（≥512KB/s），仍卡住即判该节点失联，换节点重试（最多轮换 3 个节点）。
+	putTimeout := 30*time.Second + time.Duration(int64(len(data))/(512*1024))*time.Second
+	if putTimeout > 150*time.Second {
+		putTimeout = 150 * time.Second
+	}
+	for round := 0; round < 3; round++ {
 		nodes := assign.Nodes
-		if round == 1 {
+		if round > 0 {
 			assign, err = c.reassignChunk(stagingID, index, len(data), replicas, crc)
 			if err != nil {
 				return fmt.Errorf("reassign chunk %d: %w", index, err)
@@ -450,31 +457,27 @@ func (c *Client) uploadChunkOnce(stagingID uint64, index int, data []byte, repli
 			return fmt.Errorf("chunk %d: master 未分配节点", index)
 		}
 		primary := nodes[0].Addr
-		ok := false
-		for attempt := 0; attempt < 2; attempt++ {
-			req, err := http.NewRequest(http.MethodPut,
-				fmt.Sprintf("%s://%s/objects/%d", c.scheme(), primary, types.ChunkID(stagingID, index)),
-				bytes.NewReader(data))
-			if err == nil {
-				req.ContentLength = int64(len(data))
-				req.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", crc))
-				resp, err := c.HTTP.Do(req)
-				if err == nil {
-					io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
-					if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
-						ok = true
-						break
-					}
+		ctx, cancel := context.WithTimeout(context.Background(), putTimeout)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+			fmt.Sprintf("%s://%s/objects/%d", c.scheme(), primary, types.ChunkID(stagingID, index)),
+			bytes.NewReader(data))
+		if err == nil {
+			req.ContentLength = int64(len(data))
+			req.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", crc))
+			resp, derr := c.HTTP.Do(req)
+			if derr == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+					cancel()
+					return nil
 				}
 			}
-			time.Sleep(500 * time.Millisecond)
 		}
-		if ok {
-			return nil
-		}
+		cancel()
+		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("chunk %d: 全部尝试失败", index)
+	return fmt.Errorf("chunk %d: 全部尝试失败（3 个节点均超时/失败）", index)
 }
 
 // assignChunk 向 master 申请块分配（幂等）。checksum 为块内容 CRC32C。
