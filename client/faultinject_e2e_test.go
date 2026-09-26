@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,8 +25,9 @@ import (
 
 // faultOpts 描述对单个节点注入的故障。
 type faultOpts struct {
-	latency  time.Duration // 每个请求前固定延迟（模拟 RTT）
-	stallPut time.Duration // 对 PUT /objects 额外卡住这么久（模拟"连得上但传不动"）
+	latency    time.Duration // 每个请求前固定延迟（模拟 RTT）
+	stallPut   time.Duration // 对 PUT /objects 额外卡住这么久（模拟"连得上但传不动"）
+	healthzCnt *int64        // 非 nil 时统计 /healthz 被探测的次数（验证探测缓存）
 }
 
 // faultHandler 包装节点 Handler 注入故障；/healthz 永远快速正常，
@@ -33,6 +35,9 @@ type faultOpts struct {
 func faultHandler(inner http.Handler, f faultOpts) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
+			if f.healthzCnt != nil {
+				atomic.AddInt64(f.healthzCnt, 1)
+			}
 			inner.ServeHTTP(w, r)
 			return
 		}
@@ -187,6 +192,38 @@ func TestFaultStalledNodeReassignsToHealthy(t *testing.T) {
 		if !bytes.Equal(got, content) {
 			t.Fatalf("r%d 读回不符", i)
 		}
+	}
+}
+
+// 探测缓存：连传一批小文件时，master 对节点 /healthz 的探测次数应远小于文件数
+// （靠短 TTL 缓存），否则每文件都串行重探每节点会把 folder 拷贝拖垮。
+func TestProbeCacheBoundsHealthzCalls(t *testing.T) {
+	withChunkSize(t, 1<<20) // 大块 → 每个小文件单块单次分配
+	var h0, h1 int64
+	c := newFaultCluster(t, 2, map[int]faultOpts{
+		0: {healthzCnt: &h0},
+		1: {healthzCnt: &h1},
+	})
+	if _, err := c.Mkdir("/w"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	content := make([]byte, 4096)
+	rand.New(rand.NewSource(9)).Read(content)
+	src := filepath.Join(t.TempDir(), "in.bin")
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const nFiles = 20
+	for i := 0; i < nFiles; i++ {
+		if err := c.PutChunked(src, fmt.Sprintf("/w/s%d.bin", i), 2); err != nil {
+			t.Fatalf("第 %d 个文件上传失败: %v", i, err)
+		}
+	}
+	total := atomic.LoadInt64(&h0) + atomic.LoadInt64(&h1)
+	// 无缓存时 ≈ nFiles×2=40 次；有 3s 缓存时这批快速上传只探几次。放宽到 nFiles 以内
+	// 就足以证明"不随文件数线性爆炸"。
+	if total > nFiles {
+		t.Fatalf("探测次数 %d 过高（应被缓存压到远小于 %d×2）——缓存没生效", total, nFiles)
 	}
 }
 

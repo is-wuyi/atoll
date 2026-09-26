@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"atoll/master/meta"
@@ -36,7 +37,21 @@ type Server struct {
 	// healthProbe 探测节点实时可达性；nil = 用真实 probeHealthz（GET /healthz）。
 	// 测试注入桩绕过真实网络（单测节点是假地址，无 /healthz 服务）。
 	healthProbe func(addr string) bool
+	// probeCache 缓存 /healthz 探测结果，避免每次块分配都同步重探每个节点——
+	// 大量小文件拷贝时这份"过路费"会乘上文件数拖垮 folder 上传。短 TTL 保证幽灵
+	// 节点仍能及时被发现（心跳 30s 是粗筛，这里只是秒级可达性细筛）。
+	probeMu    sync.Mutex
+	probeCache map[string]probeEntry
 }
+
+// probeEntry 是一次 /healthz 探测结果 + 时间戳。
+type probeEntry struct {
+	ok bool
+	at time.Time
+}
+
+// probeCacheTTL 是探测结果的有效期。
+const probeCacheTTL = 3 * time.Second
 
 func NewServer(store *meta.Store, nodeMaxAge time.Duration) *Server {
 	return &Server{store: store, nodeMaxAge: nodeMaxAge, commitWait: 20 * time.Second}
@@ -414,12 +429,12 @@ func (s *Server) pickAliveNodes(n int, needBytes int64, exclude map[uint64]bool)
 	if err != nil {
 		return nil, err
 	}
-	// 过滤容量足够 + master 当前可达 + 未被排除的节点。
+	// 过滤容量足够 + 未被排除的节点，再并行探测可达性（带短 TTL 缓存）。
 	probe := s.healthProbe
 	if probe == nil {
-		probe = s.probeHealthz
+		probe = s.probeCached
 	}
-	var fit []types.NodeInfo
+	var cands []types.NodeInfo
 	for _, nd := range alive {
 		if exclude[nd.ID] {
 			continue // 调用方指名排除（如 reassign 时刚卡死的节点）
@@ -427,16 +442,46 @@ func (s *Server) pickAliveNodes(n int, needBytes int64, exclude map[uint64]bool)
 		if nd.TotalBytes-nd.UsedBytes < needBytes {
 			continue
 		}
-		if !probe(nd.Addr) {
-			continue // 心跳未过期但已连不上——幽灵节点，跳过
+		cands = append(cands, nd)
+	}
+	// 并行探测：最坏 = 1 次超时，而非 N 次串行超时（大量小文件分配时尤其关键）。
+	oks := make([]bool, len(cands))
+	var wg sync.WaitGroup
+	for i := range cands {
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); oks[i] = probe(cands[i].Addr) }(i)
+	}
+	wg.Wait()
+	var fit []types.NodeInfo
+	for i, nd := range cands {
+		if oks[i] {
+			fit = append(fit, nd) // 心跳未过期且当前可达
 		}
-		fit = append(fit, nd)
 	}
 	if len(fit) < n {
 		return nil, fmt.Errorf("alive+reachable nodes with capacity %d < %d", len(fit), n)
 	}
 	rand.Shuffle(len(fit), func(i, j int) { fit[i], fit[j] = fit[j], fit[i] })
 	return fit[:n], nil
+}
+
+// probeCached 是带短 TTL 缓存的 probeHealthz：命中缓存直接返回，避免每次块分配
+// 都同步重探每个节点（大量小文件时这份开销乘以文件数会拖垮 folder 上传）。
+func (s *Server) probeCached(nodeAddr string) bool {
+	s.probeMu.Lock()
+	if s.probeCache == nil {
+		s.probeCache = make(map[string]probeEntry)
+	}
+	if e, ok := s.probeCache[nodeAddr]; ok && time.Since(e.at) < probeCacheTTL {
+		s.probeMu.Unlock()
+		return e.ok
+	}
+	s.probeMu.Unlock()
+	ok := s.probeHealthz(nodeAddr)
+	s.probeMu.Lock()
+	s.probeCache[nodeAddr] = probeEntry{ok: ok, at: time.Now()}
+	s.probeMu.Unlock()
+	return ok
 }
 
 // probeHealthz 探测 master→节点的实时可达性（GET /healthz，2s 超时）。
