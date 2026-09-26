@@ -1,0 +1,39 @@
+name: Nightly Soak
+
+# 夜间加压跑：多地存储融合项目的时序/并发/抖动类 bug 单跑一次常测不出，
+# 用 -count 反复跑来抖出来。真·多机 soak 需访问私有 EasyTier 集群、GitHub 托管
+# runner 到不了，只能在进程内做（真跨机 soak 请在自建 runner 或手动跑）。
+on:
+  schedule:
+    - cron: "0 18 * * *" # 每天 UTC 18:00 ≈ 北京 02:00
+  workflow_dispatch: {} # 支持手动触发
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod # 用 go.mod 里钉的版本，避免 stable 落后于 1.26
+          cache: true
+
+      - name: Race soak (重复跑，抖出时序/并发/抖动类偶发)
+        run: go test -race -count=5 -timeout 40m ./client/ ./master/ ./master/meta/ ./mount/ ./node/
+
+      - name: WAN 故障注入 e2e（延迟/卡死/自愈，单独点名加倍跑）
+        run: go test -race -count=10 -run 'TestFault' ./client/
+
+      - name: FUSE 集成（Finder 行为，真挂载）
+        # GitHub 托管 runner 通常没有可用的 /dev/fuse——测试会 t.Skip、不判失败；
+        # 若哪天 runner 支持，则这些用例真正跑起来并参与门禁。
+        run: |
+          sudo apt-get update && sudo apt-get install -y fuse3 libfuse2t64 || sudo apt-get install -y fuse libfuse2 || true
+          go test -tags fuse -v -run 'TestFinder|TestKernelMount|TestReadInProgress' ./mount/
