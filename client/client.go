@@ -453,10 +453,11 @@ func (c *Client) uploadChunkOnce(stagingID uint64, index int, data []byte, repli
 			putTimeout = 150 * time.Second
 		}
 	}
+	var failed []uint64 // 已卡死/失败的节点：reassign 时告诉 master 排除，别再选中
 	for round := 0; round < 3; round++ {
 		nodes := assign.Nodes
 		if round > 0 {
-			assign, err = c.reassignChunk(stagingID, index, len(data), replicas, crc)
+			assign, err = c.reassignChunk(stagingID, index, len(data), replicas, crc, failed)
 			if err != nil {
 				return fmt.Errorf("reassign chunk %d: %w", index, err)
 			}
@@ -484,6 +485,7 @@ func (c *Client) uploadChunkOnce(stagingID uint64, index int, data []byte, repli
 			}
 		}
 		cancel()
+		failed = append(failed, nodes[0].ID) // 这台失败，下轮排除
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("chunk %d: 全部尝试失败（3 个节点均超时/失败）", index)
@@ -498,11 +500,13 @@ func (c *Client) assignChunk(stagingID uint64, index int, size int, replicas int
 	return out, err
 }
 
-// reassignChunk 请求 master 强制换一组节点。
-func (c *Client) reassignChunk(stagingID uint64, index int, size int, replicas int, checksum uint32) (chunkAssignOut, error) {
+// reassignChunk 请求 master 强制换一组节点。exclude 是本轮要排除的节点（刚卡死/失败的），
+// 避免 master 又把副本分回同一台坏节点、白白耗一轮。
+func (c *Client) reassignChunk(stagingID uint64, index int, size int, replicas int, checksum uint32, exclude []uint64) (chunkAssignOut, error) {
 	var out chunkAssignOut
 	err := c.postJSON("/files/chunks", map[string]any{
-		"inode_id": stagingID, "index": index, "size": size, "replicas": replicas, "reassign": true, "checksum": checksum,
+		"inode_id": stagingID, "index": index, "size": size, "replicas": replicas,
+		"reassign": true, "checksum": checksum, "exclude": exclude,
 	}, &out)
 	return out, err
 }

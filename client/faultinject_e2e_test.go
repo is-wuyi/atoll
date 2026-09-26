@@ -156,3 +156,37 @@ func TestFaultStalledNodeBoundedFailure(t *testing.T) {
 	}
 }
 
+// 卡死节点旁有健康节点时应确定性自愈：节点0 PUT 卡死、节点1/2 健康，PUT 超时 400ms。
+// reassign 排除刚卡死的节点后必落到健康节点——每个文件都应成功、内容一致。
+// （靠"reassign 排除失败节点"才能确定性通过，否则随机重选可能再撞坏节点而 flaky。）
+func TestFaultStalledNodeReassignsToHealthy(t *testing.T) {
+	withChunkSize(t, 1<<20) // 大块 → 单块文件，一次 PUT 决策
+	c := newFaultCluster(t, 3, map[int]faultOpts{
+		0: {stallPut: 3 * time.Second},
+	})
+	c.SetPutTimeout(400 * time.Millisecond)
+	if _, err := c.Mkdir("/w"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	content := make([]byte, 4096)
+	rand.New(rand.NewSource(3)).Read(content)
+	src := filepath.Join(t.TempDir(), "in.bin")
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		remote := fmt.Sprintf("/w/r%d.bin", i)
+		if err := c.PutChunked(src, remote, 1); err != nil {
+			t.Fatalf("有健康节点时第 %d 个文件仍失败: %v", i, err)
+		}
+		out := filepath.Join(t.TempDir(), fmt.Sprintf("o%d", i))
+		if err := c.Get(remote, out); err != nil {
+			t.Fatalf("Get r%d: %v", i, err)
+		}
+		got, _ := os.ReadFile(out)
+		if !bytes.Equal(got, content) {
+			t.Fatalf("r%d 读回不符", i)
+		}
+	}
+}
+

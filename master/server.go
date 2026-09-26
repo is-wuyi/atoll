@@ -409,18 +409,21 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 // 心跳还没过期（30s 窗口）却已连不上——若把这种"幽灵节点"分配为副本，
 // 那个副本永远传不上去，min_copies 永远差一个，commit 无限 409 到超时
 // （27348 关机事故：块副本被指派到连不上的节点，大文件上传整体失败）。
-func (s *Server) pickAliveNodes(n int, needBytes int64) ([]types.NodeInfo, error) {
+func (s *Server) pickAliveNodes(n int, needBytes int64, exclude map[uint64]bool) ([]types.NodeInfo, error) {
 	alive, err := s.store.ListAliveNodes(s.nodeMaxAge)
 	if err != nil {
 		return nil, err
 	}
-	// 过滤容量足够 + master 当前可达的节点。
+	// 过滤容量足够 + master 当前可达 + 未被排除的节点。
 	probe := s.healthProbe
 	if probe == nil {
 		probe = s.probeHealthz
 	}
 	var fit []types.NodeInfo
 	for _, nd := range alive {
+		if exclude[nd.ID] {
+			continue // 调用方指名排除（如 reassign 时刚卡死的节点）
+		}
 		if nd.TotalBytes-nd.UsedBytes < needBytes {
 			continue
 		}
@@ -462,8 +465,9 @@ func (s *Server) handleAssignChunk(w http.ResponseWriter, r *http.Request) {
 		Index    int    `json:"index"`
 		Size     int64  `json:"size"`
 		Replicas int    `json:"replicas"`
-		Reassign bool   `json:"reassign"`
-		Checksum uint32 `json:"checksum"` // 块内容 CRC32C（0 = 未提供）
+		Reassign bool     `json:"reassign"`
+		Checksum uint32   `json:"checksum"` // 块内容 CRC32C（0 = 未提供）
+		Exclude  []uint64 `json:"exclude"`  // reassign 时排除的节点（刚卡死/失败的）
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
@@ -492,7 +496,14 @@ func (s *Server) handleAssignChunk(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	chosen, err := s.pickAliveNodes(req.Replicas, req.Size)
+	var exclude map[uint64]bool
+	if len(req.Exclude) > 0 {
+		exclude = make(map[uint64]bool, len(req.Exclude))
+		for _, id := range req.Exclude {
+			exclude[id] = true
+		}
+	}
+	chosen, err := s.pickAliveNodes(req.Replicas, req.Size, exclude)
 	if err != nil {
 		httpError(w, http.StatusServiceUnavailable, err.Error())
 		return
