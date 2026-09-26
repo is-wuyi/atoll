@@ -49,6 +49,13 @@ type Mount struct {
 	attrMu  sync.Mutex
 	attrTTL time.Duration
 	attrs   map[string]attrCacheEntry // 远程路径 → 缓存的 inode
+
+	// statfs 缓存：Finder 拷贝每个文件都发多次 STATFS，每次 ClusterCapacity() 打一趟
+	// master /admin/overview——跨公网下又是每文件几趟无谓往返。容量非实时数据，短 TTL 够用。
+	statfsMu   sync.Mutex
+	statfsAt   time.Time
+	statfsTot  int64
+	statfsUsed int64
 }
 
 type attrCacheEntry struct {
@@ -478,9 +485,22 @@ func (n *node) Setattr(_ context.Context, f fs.FileHandle, in *fuse.SetAttrIn, o
 		w.attr(&out.Attr)
 		return 0
 	}
-	// 其余（mtime/chmod）接受但不动集群元数据。
-	in2, _, err := n.m.client.Lookup(n.path())
-	if err == nil {
+	// 其余（mtime/chmod）接受但不落集群元数据。关键：不能每次 SETATTR 都打 master——
+	// Finder 拷贝每个文件会连发好几次 chmod/mtime，每次一趟 /meta 往返，跨公网下光这
+	// 一项每文件就多花一两秒。写入中文件用本地缓冲属性；已提交文件走属性缓存，都不产生
+	// 新的 /meta 往返。
+	remote := n.path()
+	n.m.mu.Lock()
+	w, _ := f.(*writeHandle)
+	if w == nil {
+		w = n.m.writes[remote]
+	}
+	n.m.mu.Unlock()
+	if w != nil {
+		w.attr(&out.Attr)
+		return 0
+	}
+	if in2, err := n.m.lookupCached(remote); err == nil {
 		fillEntry(&out.Attr, &in2)
 	}
 	return 0
@@ -513,13 +533,29 @@ func (n *node) Listxattr(_ context.Context, _ []byte) (uint32, syscall.Errno) {
 // Statfs 报告集群容量。默认(未实现时)全 0，Finder 会认为磁盘满、拒绝拷贝并报「空间不足」。
 // 这里用 /admin/overview 的集群总量/已用换算成块数报给内核。上游不可达时给一个非零兜底，
 // 避免因一次网络抖动就让 Finder 判定无空间。
+// clusterCapacityCached 返回集群容量，带 ~2s 缓存，避免 Finder 的密集 STATFS
+// 每次都打 master /admin/overview。出错时兜底报一个很大的容量（别让 Finder 误判满盘）。
+func (m *Mount) clusterCapacityCached() (total, used int64) {
+	m.statfsMu.Lock()
+	if !m.statfsAt.IsZero() && time.Since(m.statfsAt) < 2*time.Second {
+		total, used = m.statfsTot, m.statfsUsed
+		m.statfsMu.Unlock()
+		return total, used
+	}
+	m.statfsMu.Unlock()
+	t, u, err := m.client.ClusterCapacity()
+	if err != nil || t <= 0 {
+		return 1 << 50, 0 // 兜底：乐观报大容量，不缓存（下次再试真值）
+	}
+	m.statfsMu.Lock()
+	m.statfsTot, m.statfsUsed, m.statfsAt = t, u, time.Now()
+	m.statfsMu.Unlock()
+	return t, u
+}
+
 func (n *node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
 	const bsize = 4096
-	total, used, err := n.m.client.ClusterCapacity()
-	if err != nil || total <= 0 {
-		// 兜底：报一个很大的容量，宁可乐观也别让 Finder 误判满盘。
-		total, used = 1<<50, 0
-	}
+	total, used := n.m.clusterCapacityCached()
 	if used > total {
 		used = total
 	}
