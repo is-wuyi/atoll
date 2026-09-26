@@ -49,7 +49,7 @@ func TestKernelMount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	buf := make([]byte, 6)
+	buf := make([]byte, 7)
 	if _, err := f.ReadAt(buf, 7); err != nil {
 		t.Fatalf("ReadAt: %v", err)
 	}
@@ -117,4 +117,44 @@ func TestKernelMount(t *testing.T) {
 		t.Fatal("大文件分段读内容不符")
 	}
 	bf.Close()
+}
+
+// 写入中(staging)文件的只读打开必须能读到本地缓冲，而不是 ENOENT。
+// Finder 拷贝后回读校验 / Spotlight / QuickLook 会在文件还没提交时只读打开它，
+// 若返回 ENOENT，Finder 判拷贝失败→删文件→报「设备已消失」。
+func TestReadInProgressFile(t *testing.T) {
+	_, m := newTestCluster(t, 2)
+	mnt := t.TempDir()
+	server, err := fs.Mount(mnt, m.Root(), &fs.Options{
+		MountOptions: fuse.MountOptions{Name: "atoll-test"},
+	})
+	if err != nil {
+		t.Skipf("挂载失败（环境不支持）: %v", err)
+	}
+	t.Cleanup(func() { server.Unmount() })
+
+	p := filepath.Join(mnt, "inprogress.bin")
+	wf, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatalf("创建写句柄: %v", err)
+	}
+	content := bytes.Repeat([]byte("Z"), 3000)
+	if _, err := wf.Write(content); err != nil {
+		t.Fatalf("写: %v", err)
+	}
+	// 不 close wf：文件仍是 staging（未提交）。此刻另开只读句柄读它。
+	rf, err := os.Open(p)
+	if err != nil {
+		t.Fatalf("写入中文件只读打开不应失败（曾 ENOENT→设备已消失）: %v", err)
+	}
+	got := make([]byte, len(content))
+	nr, err := rf.ReadAt(got, 0)
+	rf.Close()
+	if err != nil && err.Error() != "EOF" {
+		t.Fatalf("读: %v", err)
+	}
+	if nr != len(content) || !bytes.Equal(got[:nr], content) {
+		t.Fatalf("读回不符: n=%d want %d", nr, len(content))
+	}
+	wf.Close()
 }

@@ -369,9 +369,25 @@ func parentOf(p string) string {
 func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	remote := n.path()
 	writeIntent := flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0 || flags&syscall.O_TRUNC != 0
+	// 正在写入（staging，未提交）的文件：master 命名空间里还查不到。任何进程
+	// 此刻只读打开它（Finder 拷贝后回读校验、Spotlight/QuickLook 索引）都会因
+	// master Lookup 查无而 ENOENT——Finder 遂判拷贝失败、删文件、报「设备已消失」。
+	// 故 in-progress 文件的读打开直接从本地缓冲文件伺服。
+	n.m.mu.Lock()
+	w := n.m.writes[remote]
+	n.m.mu.Unlock()
+	if w != nil && !writeIntent {
+		f, err := os.Open(w.local)
+		if err != nil {
+			return nil, 0, syscall.EIO
+		}
+		return &localReadHandle{f: f}, 0, 0
+	}
 	if writeIntent {
-		if _, _, err := n.m.client.Lookup(remote); err != nil {
-			return nil, 0, syscall.ENOENT
+		if w == nil {
+			if _, _, err := n.m.client.Lookup(remote); err != nil {
+				return nil, 0, syscall.ENOENT
+			}
 		}
 		w, err := n.m.newWriteHandle(remote, flags&syscall.O_TRUNC != 0)
 		if err != nil {
@@ -1031,6 +1047,31 @@ func (w *writeHandle) truncate(size uint64) syscall.Errno {
 		return syscall.EIO
 	}
 	w.dirty = true
+	return 0
+}
+
+// localReadHandle 伺服"写入中(staging)文件"的只读打开：直接读本地缓冲文件，
+// 不经 master（此时 master 里还没有这个文件）。允许 Finder 回读校验、预览等。
+type localReadHandle struct{ f *os.File }
+
+var (
+	_ fs.FileReader   = (*localReadHandle)(nil)
+	_ fs.FileReleaser = (*localReadHandle)(nil)
+	_ fs.FileFlusher  = (*localReadHandle)(nil)
+)
+
+func (h *localReadHandle) Read(_ context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	nr, err := h.f.ReadAt(dest, off)
+	if err != nil && err != io.EOF {
+		return nil, syscall.EIO
+	}
+	return fuse.ReadResultData(dest[:nr]), 0
+}
+
+func (h *localReadHandle) Flush(_ context.Context) syscall.Errno { return 0 }
+
+func (h *localReadHandle) Release(_ context.Context) syscall.Errno {
+	h.f.Close()
 	return 0
 }
 
