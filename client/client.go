@@ -24,7 +24,13 @@ import (
 type Client struct {
 	MasterURL string
 	HTTP      *http.Client
+	// putTimeout 覆盖块 PUT 的上下文超时；0 = 按块大小公式。测试注入小值以在秒级
+	// 验证"节点卡死→超时→换节点"，无需真等 150s。
+	putTimeout time.Duration
 }
+
+// SetPutTimeout 覆盖块 PUT 超时（测试用，注入小值快速验证超时+换节点）。
+func (c *Client) SetPutTimeout(d time.Duration) { c.putTimeout = d }
 
 // New 创建客户端。token 为空 = 兼容模式（不注入认证头，连未启认证的旧集群）。
 func New(masterURL string) *Client {
@@ -440,9 +446,12 @@ func (c *Client) uploadChunkOnce(stagingID uint64, index int, data []byte, repli
 	// PUT 主副本，每次带上下文超时：节点在 EasyTier 上可能中途卡死（TCP 不再 ACK），
 	// 无超时的 Do 会永久挂起 → 拖死 Flush/close → Finder「设备已消失」。超时按块大小
 	// 给足慢速链路（≥512KB/s），仍卡住即判该节点失联，换节点重试（最多轮换 3 个节点）。
-	putTimeout := 30*time.Second + time.Duration(int64(len(data))/(512*1024))*time.Second
-	if putTimeout > 150*time.Second {
-		putTimeout = 150 * time.Second
+	putTimeout := c.putTimeout
+	if putTimeout == 0 {
+		putTimeout = 30*time.Second + time.Duration(int64(len(data))/(512*1024))*time.Second
+		if putTimeout > 150*time.Second {
+			putTimeout = 150 * time.Second
+		}
 	}
 	for round := 0; round < 3; round++ {
 		nodes := assign.Nodes
