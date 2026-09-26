@@ -109,7 +109,46 @@ func TestStreamWriteOutOfOrder(t *testing.T) {
 	streamWriteAndVerify(t, cc, "/s/ooo.bin", content, order)
 }
 
-// 预分配写（Finder 拷贝的模式）：先 ftruncate 到完整大小再顺序写。
+// st_ino 一致性：写入中报告的 ino 必须等于提交后的真实 inode ID。
+// 否则 go-fuse 把 GETATTR 的 ino 强制成建节点时的值，提交后 Finder 认不出文件、
+// 拷贝一直不收尾（⊗ 徽标不消失）。锁死该回归。
+func TestStreamInoMatchesCommittedID(t *testing.T) {
+	withChunkSize(t, 1024)
+	cc := newChunkedCluster(t, 2)
+	if _, err := cc.client.Mkdir("/s"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	w, err := cc.m.newWriteHandle("/s/ino.bin", true)
+	if err != nil {
+		t.Fatalf("newWriteHandle: %v", err)
+	}
+	w.streamOn = true
+	if err := w.startStream(); err != nil {
+		t.Fatalf("startStream: %v", err)
+	}
+	stagingIno := w.ino
+	if stagingIno == 0 {
+		t.Fatalf("startStream 后 w.ino 应为 staging ID，实际 0")
+	}
+	ctx := context.Background()
+	content := make([]byte, 2600) // 2×1024 + 552 → 3 块
+	rand.New(rand.NewSource(5)).Read(content)
+	if _, errno := w.Write(ctx, content, 0); errno != 0 {
+		t.Fatalf("Write: %v", errno)
+	}
+	if errno := w.Flush(ctx); errno != 0 {
+		t.Fatalf("Flush: %v", errno)
+	}
+	_ = w.Release(ctx)
+
+	in, _, err := cc.client.Lookup("/s/ino.bin")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if in.ID != stagingIno {
+		t.Fatalf("提交后 inode ID=%d != 写入中报告的 ino=%d（ino 会变→Finder 认不出）", in.ID, stagingIno)
+	}
+}
 // 之前 truncate 一律放弃流式→退回 close 整传→大文件把 Finder close 拖超时
 // （「设备已消失」）。修复后预分配应保留流式；本例锁死该回归。
 func TestStreamWritePreallocatedThenWrite(t *testing.T) {

@@ -224,7 +224,7 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	n.m.mu.Unlock()
 	if w != nil {
 		w.attr(&out.Attr)
-		return n.newChildNode(ctx, syntheticIno(remote), fuse.S_IFREG), 0
+		return n.newChildNode(ctx, w.inoOrSynthetic(), fuse.S_IFREG), 0
 	}
 	in, err := n.m.lookupCached(remote)
 	if err != nil {
@@ -264,7 +264,7 @@ func (n *node) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 	// 内核对它的后续 Lookup/Getattr 走 writes 表，属性=本地缓冲实时大小。
 	prefix := strings.TrimSuffix(dir, "/") + "/"
 	n.m.mu.Lock()
-	for remote := range n.m.writes {
+	for remote, w := range n.m.writes {
 		if !strings.HasPrefix(remote, prefix) {
 			continue
 		}
@@ -275,7 +275,7 @@ func (n *node) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 		if seen[name] {
 			continue
 		}
-		entries = append(entries, fuse.DirEntry{Name: name, Mode: fuse.S_IFREG, Ino: syntheticIno(remote)})
+		entries = append(entries, fuse.DirEntry{Name: name, Mode: fuse.S_IFREG, Ino: w.inoOrSynthetic()})
 	}
 	n.m.mu.Unlock()
 	return &sliceDirStream{entries: entries}, 0
@@ -428,10 +428,17 @@ func (n *node) Create(ctx context.Context, name string, _ uint32, _ uint32, out 
 	// 标记为新建：Finder 拷贝先 CREATE 空文件占位、再写内容，若中途它 stat 发现
 	// 这个空文件不存在（我们没上传 0 字节文件）就判定失败弹 -43。故新建的空文件也要上传。
 	w.created = true
-	// 流式上传：staging 延迟到首个 WRITE 再建（0 字节文件没必要建 staging 再 abort）。
 	w.streamOn = true
+	// 立即建 staging，用它的 ID 作节点 st_ino。commit 走原子换名保留该 ID，
+	// 故写入中与提交后 ino 一致——否则合成 ino≠提交后真实 ID，go-fuse 把 GETATTR
+	// 的 ino 强制成建节点时的合成值，Finder 认不出这个文件、拷贝一直不收尾（⊗）。
+	// 建 staging 失败（网络抖动）只退化用合成 ino，不阻断创建。
+	ino := syntheticIno(n.remotePath(name))
+	if err := w.startStream(); err == nil {
+		ino = w.ino
+	}
 	w.attr(&out.Attr)
-	return n.newChildNode(ctx, syntheticIno(n.remotePath(name)), fuse.S_IFREG), w, 0, 0
+	return n.newChildNode(ctx, ino, fuse.S_IFREG), w, 0, 0
 }
 
 // Setattr 处理 truncate（打开的写句柄）；其余属性修改忽略。
@@ -759,6 +766,7 @@ type writeHandle struct {
 	// （旧版按到达的 data 攒块 + off==sentIdx 判定，一旦写乱序就漏块→commit 死等）。
 	stream    *client.StreamUploader
 	streamOn  bool
+	ino       uint64          // = staging ID（= 提交后 inode ID）；写入中/提交后 st_ino 一致
 	sentIdx   int64           // 已作为整块从本地文件推入的字节数（ChunkSize 整数倍）
 	contigEnd int64           // 从 0 起连续已写入的字节数（含已推与待推）
 	ooo       map[int64]int64 // 越过 contigEnd 的乱序写片段 start→end（FUSE 写页对齐不重叠）
@@ -814,6 +822,7 @@ func (w *writeHandle) startStream() error {
 	w.stream = u
 	w.streamOn = true
 	w.sentIdx = 0
+	w.ino = u.StagingID() // 用 staging ID 作 st_ino，与提交后一致
 	return nil
 }
 
@@ -891,7 +900,13 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	// 流式路径：整块已在 WRITE 期间陆续上传，这里只读尾巴 + commit。
 	if w.streamOn && w.stream != nil {
 		size := st.Size()
-		if w.contigEnd < size {
+		if size == 0 {
+			// 0 字节文件（如 Finder 的空占位）：放弃流式会话，走下方整传的
+			// 0 字节路径提交（提交 0 块的 chunked staging 语义不稳，避开）。
+			_ = w.stream.Close()
+			w.stream = nil
+			w.streamOn = false
+		} else if w.contigEnd < size {
 			// 文件尾部存在未连续覆盖的空洞（乱序/稀疏写未闭合）：放弃流式、
 			// 回退到下方整传路径，从完整的本地文件重传，保证正确性。
 			_ = w.stream.Close()
@@ -980,6 +995,10 @@ func (w *writeHandle) discard() {
 	}
 	w.dropped = true
 	w.dirty = false
+	if w.stream != nil {
+		_ = w.stream.Close() // abort staging（预建 staging 后被 unlink：别泄漏）
+		w.stream = nil
+	}
 	w.mu.Unlock()
 	w.f.Close()
 	os.Remove(w.local)
@@ -1020,14 +1039,22 @@ func (w *writeHandle) attr(a *fuse.Attr) {
 	st, err := os.Stat(w.local)
 	a.Uid = uint32(os.Getuid())
 	a.Gid = uint32(os.Getgid())
+	a.Ino = w.inoOrSynthetic()
 	if err != nil {
 		a.Mode = fuse.S_IFREG | 0o644
 		return
 	}
-	a.Ino = syntheticIno(w.remote) // 写入中文件：稳定且不与真实 inode ID 冲突
 	a.Size = uint64(st.Size())
 	a.Mode = fuse.S_IFREG | 0o644
 	a.Mtime = uint64(st.ModTime().Unix())
+}
+
+// inoOrSynthetic 优先用 staging ID（= 提交后 ID），未建 staging 时退化为合成 ino。
+func (w *writeHandle) inoOrSynthetic() uint64 {
+	if w.ino != 0 {
+		return w.ino
+	}
+	return syntheticIno(w.remote)
 }
 
 // ---- DirStream 简单切片实现 ----

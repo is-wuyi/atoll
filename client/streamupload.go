@@ -158,6 +158,11 @@ func (u *StreamUploader) Finish(tail []byte, totalSize int64) error {
 	}
 }
 
+// StagingID 返回本会话的 staging inode ID。commit 走原子换名保留该 ID，
+// 因此它等于最终提交后的 inode ID——挂载层用它做 in-progress 文件的 st_ino，
+// 使写入中与提交后 ino 一致（否则 Finder 拿到会变的 ino 认不出文件、拷贝不收尾）。
+func (u *StreamUploader) StagingID() uint64 { return u.staging }
+
 // Progress 返回已上传字节数（供 FUSE 层报告文件大小做进度条）。
 func (u *StreamUploader) Progress() int64 {
 	u.mu.Lock()
