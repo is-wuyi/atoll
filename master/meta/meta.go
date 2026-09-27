@@ -470,6 +470,18 @@ func (s *Store) CreateStagingFile(parentID uint64) (types.Inode, error) {
 	return in, nil
 }
 
+// SetInodeMtimeForTest 直接改 inode 的 Mtime（仅测试用：meta 层无对外 mtime API，
+// 用于确定性地把 staging 回退到过去，避免 TTL 测试依赖 wall-clock sleep 而在 CI/-race 下偶发）。
+func (s *Store) SetInodeMtimeForTest(id uint64, mt time.Time) error {
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, id)
+		if err != nil {
+			return err
+		}
+		in.Mtime = mt
+		return w.putInode(&in)
+	})
+}
 // AssignChunk 为 staging 文件的第 index 块分配副本节点。
 // 幂等：该块已分配则原样返回既有分配（重试安全）。
 func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []uint64, checksum uint32) (types.ChunkInfo, error) {

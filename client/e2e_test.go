@@ -414,19 +414,18 @@ func repairOnceAndWait(t *testing.T, cv *clusterV3, c *Client, path string, vict
 	// 等待 victim 心跳过期（nodeMaxAge=1s）。
 	time.Sleep(1200 * time.Millisecond)
 
-	// 关键：给幸存节点重新发心跳，否则全部节点心跳过期会被判 dead，无源可修。
-	for _, n := range cv.nodes {
-		if n != victim {
-			cv.heartbeatNode(n)
-		}
-	}
-
-	cv.scanner.RepairScanOnce()
-
-	deadline := time.Now().Add(10 * time.Second)
+	// 轮询：每轮都给幸存节点续心跳 + 再跑一次修复扫描。CI/-race 满载下的抗抖关键——
+	// ① 满载时幸存节点心跳也可能因调度饥饿过期被判 dead → 无源可修，故每轮续心跳；
+	// ② 只扫一次可能恰好撞上某节点瞬时过期而无动作，故每轮重扫，直到 done 达标或超时。
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		_, reps, err := c.Lookup(path)
-		if err == nil {
+		for _, n := range cv.nodes {
+			if n != victim {
+				cv.heartbeatNode(n)
+			}
+		}
+		cv.scanner.RepairScanOnce()
+		if _, reps, err := c.Lookup(path); err == nil {
 			done := 0
 			for _, r := range reps {
 				if r.Done {
@@ -437,7 +436,10 @@ func repairOnceAndWait(t *testing.T, cv *clusterV3, c *Client, path string, vict
 				return reps
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
+	}
+	if _, reps, err := c.Lookup(path); err == nil {
+		t.Fatalf("副本修复超时: 等待 %d 个 done 副本, 实际 reps=%+v", want, reps)
 	}
 	t.Fatalf("副本修复超时: 等待 %d 个 done 副本: %s", want, path)
 	return nil

@@ -464,16 +464,16 @@ func TestGCConfirmTwoRounds(t *testing.T) {
 // TestSweepStagingExpiredTTL 超 TTL 的 staging 被回收，未超时保留。
 func TestSweepStagingExpiredTTL(t *testing.T) {
 	s, store := newTestScanner(t, time.Hour)
-	s.stagingTTL = 100 * time.Millisecond
+	s.stagingTTL = 30 * time.Minute // 大 TTL：fresh 永不误判；old 靠回退 mtime 判过期，不依赖 wall-clock
 
-	// old：mtime 超过 TTL 的 staging。
+	// old：把 mtime 确定性回退到 TTL 之前（不靠 sleep——CI/-race 下 sleep 边距会偶发不足）。
 	old, _ := store.CreateStagingFile(1)
 	store.AssignChunk(old.ID, 0, 10, []uint64{7}, 0)
-	// 把 mtime 改老：meta 层没有 API，用直接改 TTL 的方式 —— 等待 TTL 过期。
-	// 留足余量（TTL 的数倍）：-race + 并行满载下 50ms 边距会偶发不足。
-	time.Sleep(400 * time.Millisecond)
+	if err := store.SetInodeMtimeForTest(old.ID, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("回退 mtime: %v", err)
+	}
 
-	// fresh：刚建的 staging。
+	// fresh：刚建的 staging（mtime≈now，远在 TTL 内）。
 	fresh, _ := store.CreateStagingFile(1)
 
 	s.sweepStaging()
