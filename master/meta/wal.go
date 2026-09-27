@@ -156,6 +156,10 @@ func (s *Store) SetPostCommitHook(h PostCommitHook) { s.postCommit = h }
 // write 执行一个记录型写事务：跑 fn，若产生了变更则把这一帧原子追加进 wal 桶。
 // 提交成功后，若注册了 post-commit 钩子且本次有变更，调用之——钩子 error 透传给调用方。
 func (s *Store) write(fn func(*txw) error) error {
+	// 串行化「提交 + 钩子」：保证 postCommit 严格按 seq 顺序执行，避免同步旋钮下
+	// seq 乱序 ack 造成集群 WAL 空洞。bbolt 本就单写，钩子为 nil 时此锁几乎无额外开销。
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
 	var committedSeq uint64
 	var committedFrame []byte
 	err := s.db.Update(func(tx *bolt.Tx) error {

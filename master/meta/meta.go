@@ -15,6 +15,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -63,6 +64,10 @@ func validateName(name string) error {
 type Store struct {
 	db         *bolt.DB
 	postCommit PostCommitHook // 提交后钩子（同步旋钮用；nil = 不调用）
+	// commitMu 把「提交 + postCommit 钩子」串成一个原子段，保证钩子按 seq 顺序执行。
+	// 否则同步旋钮开启时 seq6 可能先于 seq5 被 ship+ack，master 掉盘后集群 WAL 现空洞、
+	// 整段重放被拒。钩子为 nil（默认）时只是多一层 bbolt 本就有的写串行化，无额外代价。
+	commitMu sync.Mutex
 }
 
 // Open 打开（或创建）元数据库并完成初始化：建 bucket、写根目录、初始化计数器。
