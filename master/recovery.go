@@ -7,10 +7,27 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 
 	"atoll/master/meta"
 	"atoll/pkg/types"
 )
+
+// chunkKeyIdx 解析快照分块 key（snapshot-<ver>-<idx>）末尾的数字下标。
+// 用于拼接排序：绝不能按 key 字符串排——idx≥10 时 "snapshot-5-10" 会排到
+// "snapshot-5-2" 前面，快照字节错位、bbolt 能打开却内容全乱（元数据静默损坏）。
+// 解析失败返回 -1（排到最前，尽早暴露异常 key），调用方再兜底。
+func chunkKeyIdx(key string) int {
+	i := strings.LastIndexByte(key, '-')
+	if i < 0 || i == len(key)-1 {
+		return -1
+	}
+	n, err := strconv.Atoi(key[i+1:])
+	if err != nil {
+		return -1
+	}
+	return n
+}
 
 // 元数据恢复（HA 第一阶段，步骤 4）：master 启动时决定用本地 bbolt 还是从集群重建。
 //
@@ -137,9 +154,10 @@ func (b *MetaBackup) gatherClusterManifest(seeds []string) (best Manifest, found
 // holder ID 无法直接映射地址（成员表尚未持久化），故对每个块 key 遍历种子试取，取到 CRC
 // 符合的即用——块 key 全局唯一，任一持有者的副本都一样。
 func (b *MetaBackup) rebuildFromCluster(dbPath string, m Manifest, seeds []string) (*meta.Store, error) {
-	// 块按 idx 升序拼接。manifest.Chunks 构造时即升序，这里再排一次防御。
+	// 块按 idx 数字升序拼接。manifest.Chunks 构造时即升序，但绝不能按 key 字符串
+	// 再排（idx≥10 会字典序错位、拼出静默损坏的快照）——按解析出的数字下标排。
 	chunks := append([]ChunkRef(nil), m.Chunks...)
-	sort.Slice(chunks, func(i, j int) bool { return chunks[i].Key < chunks[j].Key })
+	sort.Slice(chunks, func(i, j int) bool { return chunkKeyIdx(chunks[i].Key) < chunkKeyIdx(chunks[j].Key) })
 
 	var snapshot []byte
 	for _, ch := range chunks {

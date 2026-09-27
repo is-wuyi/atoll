@@ -348,8 +348,9 @@ func (b *MetaBackup) shipBlob(nodes []types.NodeInfo, key string, data []byte) [
 }
 
 // metaChunkSize 是元数据快照的分块大小。元数据通常远小于此，多数快照就是单块；
-// 大到超过时复用同一分块思路（每块独立 K 副本）。
-const metaChunkSize = 16 << 20 // 16MB
+// 大到超过时复用同一分块思路（每块独立 K 副本）。var 而非 const 仅为测试可调小
+// 以构造真实多分块（≥10 块）快照，验证拼接按数字下标而非字典序。生产不改。
+var metaChunkSize = 16 << 20 // 16MB
 
 // 备份错误。
 var (

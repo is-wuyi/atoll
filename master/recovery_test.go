@@ -80,6 +80,64 @@ func TestRecoverRebuildFromCluster(t *testing.T) {
 	}
 }
 
+// 多分块快照重建：把分块调到很小、造 ≥11 块，验证拼接按数字下标而非字典序。
+// 回归：此前 rebuildFromCluster 按 key 字符串排序，idx≥10 时 "snapshot-v-10" 排到
+// "snapshot-v-2" 前，拼出的 bbolt 能打开但内容错乱（元数据静默损坏）。
+func TestRecoverRebuildMultiChunkOrdering(t *testing.T) {
+	orig := metaChunkSize
+	metaChunkSize = 4096 // 4KB 块 → 小元数据也能造出很多块
+	defer func() { metaChunkSize = orig }()
+
+	store, b, _ := newBackupCluster(t, 3)
+	seeds := seedAddrs(b, t)
+
+	// 造足够多的目录/文件，让快照远超 11×4KB。
+	docs, _ := store.CreateDir(meta.RootID, "docs")
+	for i := 0; i < 200; i++ {
+		store.CreateFile(docs.ID, fmt.Sprintf("f%03d.bin", i), []uint64{1, 2})
+	}
+	m, err := b.BackupOnce()
+	if err != nil {
+		t.Fatalf("BackupOnce: %v", err)
+	}
+	if len(m.Chunks) < 11 {
+		t.Fatalf("需 ≥11 块才能触发字典序错位，实际 %d 块——增大数据量", len(m.Chunks))
+	}
+
+	want := snapshotTree(t, store)
+	dbPath := store.DBPath()
+	store.Close()
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatalf("删库: %v", err)
+	}
+
+	rs, err := b.Recover(dbPath, seeds, RecoverCluster)
+	if err != nil {
+		t.Fatalf("Recover（多块拼接若错位这里会失败或内容不符）: %v", err)
+	}
+	defer rs.Close()
+	got := snapshotTree(t, rs)
+	if !treeEq(want, got) {
+		t.Fatalf("多块重建后状态不符（拼接顺序错）:\n want=%d entries\n got =%d entries", len(want), len(got))
+	}
+}
+
+// chunkKeyIdx 必须按数字解析下标，不能字典序。
+func TestChunkKeyIdx(t *testing.T) {
+	cases := map[string]int{
+		"snapshot-5-0": 0, "snapshot-5-2": 2, "snapshot-5-10": 10, "snapshot-5-123": 123,
+		"bad": -1, "snapshot-5-": -1, "snapshot-5-x": -1,
+	}
+	for k, want := range cases {
+		if got := chunkKeyIdx(k); got != want {
+			t.Errorf("chunkKeyIdx(%q)=%d want %d", k, got, want)
+		}
+	}
+	// 关键断言：10 的数字序 > 2，字典序则相反。
+	if !(chunkKeyIdx("snapshot-5-10") > chunkKeyIdx("snapshot-5-2")) {
+		t.Fatal("数字序应 10>2")
+	}
+}
 // auto 模式下本地在且够新 → 直接用本地，不碰集群。
 func TestRecoverAutoUsesFreshLocal(t *testing.T) {
 	store, b, _ := newBackupCluster(t, 2)
