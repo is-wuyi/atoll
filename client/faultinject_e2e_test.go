@@ -27,6 +27,7 @@ import (
 type faultOpts struct {
 	latency    time.Duration // 每个请求前固定延迟（模拟 RTT）
 	stallPut   time.Duration // 对 PUT /objects 额外卡住这么久（模拟"连得上但传不动"）
+	stallGet   time.Duration // 对 GET /objects 额外卡住这么久（模拟读路径节点卡死）
 	healthzCnt *int64        // 非 nil 时统计 /healthz 被探测的次数（验证探测缓存）
 }
 
@@ -59,6 +60,11 @@ func faultHandler(inner http.Handler, f faultOpts) http.Handler {
 		}
 		if f.stallPut > 0 && r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/objects/") {
 			if !sleep(f.stallPut) {
+				return
+			}
+		}
+		if f.stallGet > 0 && r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/objects/") {
+			if !sleep(f.stallGet) {
 				return
 			}
 		}
@@ -224,6 +230,38 @@ func TestProbeCacheBoundsHealthzCalls(t *testing.T) {
 	// 就足以证明"不随文件数线性爆炸"。
 	if total > nFiles {
 		t.Fatalf("探测次数 %d 过高（应被缓存压到远小于 %d×2）——缓存没生效", total, nFiles)
+	}
+}
+
+// 读路径：节点收了 GET 连接后卡住，Get 必须有界失败而非永久挂起。
+// 回归：此前对象 GET 用无超时的 c.HTTP.Get，卡死节点让 FUSE 读永不返回。
+func TestFaultStalledGetBoundedFailure(t *testing.T) {
+	withChunkSize(t, 1<<20)
+	c := newFaultCluster(t, 1, map[int]faultOpts{
+		0: {stallGet: 5 * time.Second},
+	})
+	if _, err := c.Mkdir("/w"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	content := make([]byte, 4096)
+	rand.New(rand.NewSource(7)).Read(content)
+	src := filepath.Join(t.TempDir(), "in.bin")
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PutChunked(src, "/w/g.bin", 1); err != nil { // PUT 不受 stallGet 影响
+		t.Fatalf("上传失败: %v", err)
+	}
+	c.SetPutTimeout(500 * time.Millisecond) // 让 GET 的 ioTimeout=500ms
+	out := filepath.Join(t.TempDir(), "out.bin")
+	start := time.Now()
+	err := c.Get("/w/g.bin", out)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("唯一副本 GET 卡死时读取应失败，而非成功")
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("读取应有界失败（~500ms 量级），实际 %v——退化成挂起了", elapsed)
 	}
 }
 

@@ -32,6 +32,23 @@ type Client struct {
 // SetPutTimeout 覆盖块 PUT 超时（测试用，注入小值快速验证超时+换节点）。
 func (c *Client) SetPutTimeout(d time.Duration) { c.putTimeout = d }
 
+// metadataTimeout 是 master 元数据请求（assign/commit/create/rm 等）的单次超时。
+// 这些调用短小，卡住必是节点失联——绝不能无限挂起（否则上传会永久卡在 wg.Wait）。
+const metadataTimeout = 30 * time.Second
+
+// ioTimeout 按数据大小给出对象 PUT/GET 的单次请求超时：给足慢速链路，封顶 150s，
+// 卡住即失败换节点/重试而非永久挂起。putTimeout 非 0（测试注入）时直接用它。
+func (c *Client) ioTimeout(size int64) time.Duration {
+	if c.putTimeout != 0 {
+		return c.putTimeout
+	}
+	t := 30*time.Second + time.Duration(size/(512*1024))*time.Second
+	if t > 150*time.Second {
+		t = 150 * time.Second
+	}
+	return t
+}
+
 // New 创建客户端。token 为空 = 兼容模式（不注入认证头，连未启认证的旧集群）。
 func New(masterURL string) *Client {
 	return NewWithToken(masterURL, "")
@@ -188,7 +205,7 @@ func (c *Client) PutReaderOverwrite(remotePath string, size int64, r io.Reader, 
 	var putErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		hh := types.NewCRC32C()
-		if putErr = c.putObject(created.Nodes[0].Addr, created.Inode.ID, io.TeeReader(r, hh)); putErr == nil {
+		if putErr = c.putObject(created.Nodes[0].Addr, created.Inode.ID, io.TeeReader(r, hh), size); putErr == nil {
 			crcVal = hh.Sum32()
 			break
 		}
@@ -245,25 +262,31 @@ func (c *Client) Get(remotePath, localPath string) error {
 func (c *Client) getFromReplicas(in types.Inode, candidates []Replica, localPath string) error {
 	var lastErr error
 	for _, n := range candidates {
-		resp, err := c.HTTP.Get(fmt.Sprintf("%s://%s/objects/%d", c.scheme(), n.Addr, in.ID))
+		ctx, cancel := context.WithTimeout(context.Background(), c.ioTimeout(in.Size))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s://%s/objects/%d", c.scheme(), n.Addr, in.ID), nil)
+		resp, err := c.HTTP.Do(req)
 		if err != nil {
+			cancel()
 			lastErr = fmt.Errorf("节点 %s: %w", n.Addr, err)
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
+			cancel()
 			lastErr = fmt.Errorf("节点 %s 返回 %d", n.Addr, resp.StatusCode)
 			continue
 		}
 		out, err := os.Create(localPath)
 		if err != nil {
 			resp.Body.Close()
+			cancel()
 			return err
 		}
 		h := types.NewCRC32C()
 		written, copyErr := io.Copy(out, io.TeeReader(resp.Body, h))
 		closeErr := out.Close()
 		resp.Body.Close()
+		cancel()
 		if copyErr != nil || closeErr != nil {
 			return fmt.Errorf("写本地文件: %v / %v", copyErr, closeErr)
 		}
@@ -445,14 +468,8 @@ func (c *Client) uploadChunkOnce(stagingID uint64, index int, data []byte, repli
 	}
 	// PUT 主副本，每次带上下文超时：节点在 EasyTier 上可能中途卡死（TCP 不再 ACK），
 	// 无超时的 Do 会永久挂起 → 拖死 Flush/close → Finder「设备已消失」。超时按块大小
-	// 给足慢速链路（≥512KB/s），仍卡住即判该节点失联，换节点重试（最多轮换 3 个节点）。
-	putTimeout := c.putTimeout
-	if putTimeout == 0 {
-		putTimeout = 30*time.Second + time.Duration(int64(len(data))/(512*1024))*time.Second
-		if putTimeout > 150*time.Second {
-			putTimeout = 150 * time.Second
-		}
-	}
+	// 给足慢速链路，仍卡住即判该节点失联，换节点重试（最多轮换 3 个节点）。
+	putTimeout := c.ioTimeout(int64(len(data)))
 	var failed []uint64 // 已卡死/失败的节点：reassign 时告诉 master 排除，别再选中
 	for round := 0; round < 3; round++ {
 		nodes := assign.Nodes
@@ -570,13 +587,17 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 			lastErr = fmt.Errorf("节点 %d 地址未知", id)
 			continue
 		}
-		resp, err := c.HTTP.Get(fmt.Sprintf("%s://%s/objects/%d", c.scheme(), a, chunkID))
+		ctx, cancel := context.WithTimeout(context.Background(), c.ioTimeout(ch.Size))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s://%s/objects/%d", c.scheme(), a, chunkID), nil)
+		resp, err := c.HTTP.Do(req)
 		if err != nil {
+			cancel()
 			lastErr = fmt.Errorf("节点 %s: %w", a, err)
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
+			cancel()
 			lastErr = fmt.Errorf("节点 %s 返回 %d", a, resp.StatusCode)
 			continue
 		}
@@ -584,6 +605,7 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 		// 否则损坏块已落到输出文件、故障转移重写会导致内容重复错位。
 		buf, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		cancel()
 		if readErr != nil {
 			lastErr = fmt.Errorf("节点 %s: 读取失败 %w", a, readErr)
 			continue
@@ -605,11 +627,14 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 }
 
 // putObject 向节点写入对象数据。
-func (c *Client) putObject(nodeAddr string, inodeID uint64, r io.Reader) error {
+func (c *Client) putObject(nodeAddr string, inodeID uint64, r io.Reader, size int64) error {
 	// io.NopCloser 包裹：http transport 上传完成后会关闭 req.Body，
 	// 若直接传 *os.File 会被关掉句柄，导致同一写句柄后续 Write 报 EIO
 	// （实机覆盖写 bug 根因：FLUSH 上传后 transport 关文件 → 再 WRITE 失败）。
-	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("%s://%s/objects/%d", c.scheme(), nodeAddr, inodeID), io.NopCloser(r))
+	// 带上下文超时：节点中途卡死不能让整传永久挂起（同 uploadChunkOnce）。
+	ctx, cancel := context.WithTimeout(context.Background(), c.ioTimeout(size))
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, fmt.Sprintf("%s://%s/objects/%d", c.scheme(), nodeAddr, inodeID), io.NopCloser(r))
 	if err != nil {
 		return err
 	}
@@ -628,7 +653,14 @@ func (c *Client) postJSON(path string, body any, out any) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.HTTP.Post(c.MasterURL+path, "application/json", bytes.NewReader(b))
+	ctx, cancel := context.WithTimeout(context.Background(), metadataTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.MasterURL+path, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err
 	}
@@ -643,7 +675,13 @@ func (c *Client) postJSON(path string, body any, out any) error {
 }
 
 func (c *Client) getJSON(path string, out any) error {
-	resp, err := c.HTTP.Get(c.MasterURL + path)
+	ctx, cancel := context.WithTimeout(context.Background(), metadataTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.MasterURL+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err
 	}
