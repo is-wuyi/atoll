@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"atoll/pkg/types"
 )
 
 // newTestNode 启动一个 httptest 存储节点。
@@ -313,6 +315,104 @@ func TestPullObject(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("pull 后对象未在目标节点落盘或内容不一致")
+}
+
+// putObjectTo PUT 一个对象到指定节点 URL（测试辅助），可带期望 CRC 头。
+func putObjectTo(t *testing.T, baseURL string, id uint64, data []byte, crc uint32) int {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/objects/%d", baseURL, id), bytes.NewReader(data))
+	if crc != 0 {
+		req.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", crc))
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// objectExists GET 对象，返回是否 200 落盘。
+func objectExists(baseURL string, id uint64) bool {
+	resp, err := http.Get(fmt.Sprintf("%s/objects/%d", baseURL, id))
+	if err != nil {
+		return false
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// pull 带期望 CRC：正确校验和落盘、错误校验和拒绝（不落盘、不上报 Done）。
+// 回归：此前 pull 用 expectCRC=0 从不校验，撕裂/位翻转会被当健康副本认证 Done、修复永不重拷。
+func TestPullVerifiesChecksum(t *testing.T) {
+	_, sourceTS := newTestNode(t)
+	data := []byte("repair pull payload 0123456789")
+	crc := types.CRC32C(data)
+	if code := putObjectTo(t, sourceTS.URL, 200, data, crc); code != http.StatusCreated {
+		t.Fatalf("源 PUT 200 = %d", code)
+	}
+	if code := putObjectTo(t, sourceTS.URL, 202, data, crc); code != http.StatusCreated {
+		t.Fatalf("源 PUT 202 = %d", code)
+	}
+	sourceAddr := sourceTS.URL[len("http://"):]
+
+	_, targetTS := newTestNode(t)
+	pull := func(id uint64, checksum uint32) {
+		body, _ := json.Marshal(map[string]any{"inode_id": id, "source_addr": sourceAddr, "checksum": checksum})
+		resp, err := http.Post(targetTS.URL+"/pull", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+
+	// 正确 CRC：应落盘。
+	pull(200, crc)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !objectExists(targetTS.URL, 200) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !objectExists(targetTS.URL, 200) {
+		t.Fatal("正确校验和的 pull 应落盘")
+	}
+
+	// 错误 CRC（源数据好、但期望值不符/源被篡改）：必须拒绝、不落盘。
+	pull(202, crc^0x1)
+	time.Sleep(1 * time.Second)
+	if objectExists(targetTS.URL, 202) {
+		t.Fatal("错误校验和的 pull 不应落盘（撕裂/损坏必须被拒）")
+	}
+}
+
+// /replicate 收到 CRC 头与实际字节不符（传输撕裂）必须拒绝、不落盘。
+func TestReplicateVerifiesChecksum(t *testing.T) {
+	_, ts := newTestNode(t)
+	good := []byte("replicate payload abcxyz")
+	crc := types.CRC32C(good)
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/replicate/300", bytes.NewReader(good))
+	req.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", crc))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || !objectExists(ts.URL, 300) {
+		t.Fatalf("匹配校验和的 replicate 应落盘, status=%d", resp.StatusCode)
+	}
+
+	torn := []byte("replicate payload ABCXYZ") // 内容不同、crc 头仍是 good 的
+	req2, _ := http.NewRequest(http.MethodPut, ts.URL+"/replicate/301", bytes.NewReader(torn))
+	req2.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", crc))
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode == http.StatusCreated || objectExists(ts.URL, 301) {
+		t.Fatal("字节与校验和不符的 replicate 必须被拒、不落盘")
+	}
 }
 
 // TestAdminObjects 验证 GET /admin/objects 返回全部对象，跳过 .tmp-* 临时文件。

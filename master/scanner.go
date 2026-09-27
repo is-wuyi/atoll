@@ -233,6 +233,7 @@ type repairTask struct {
 	NewNodeAddr string
 	TargetAddr  string // pull 目标地址（triggerPull 场景为该槽节点地址）
 	SourceAddr  string // 源节点地址
+	Checksum    uint32 // 期望 CRC32C，随 pull 下发给目标节点校验（0 = legacy/未记录则跳过）
 }
 
 // planRepairs 对单个文件产出修复计划（纯函数，便于单测）。
@@ -301,6 +302,7 @@ func planRepairs(inode types.Inode, nodes []types.NodeInfo, maxAge time.Duration
 				SlotIdx:    i,
 				TargetAddr: targetAddr,
 				SourceAddr: aliveDoneAddrs[srcIdx],
+				Checksum:   inode.Checksum,
 			})
 		} else {
 			// dead 或 重复槽：选一个不在 Replicas 中的新目标替换。
@@ -327,6 +329,7 @@ func planRepairs(inode types.Inode, nodes []types.NodeInfo, maxAge time.Duration
 				NewNodeID:   chosen.ID,
 				NewNodeAddr: chosen.Addr,
 				SourceAddr:  aliveDoneAddrs[srcIdx],
+				Checksum:    inode.Checksum,
 			})
 		}
 	}
@@ -412,13 +415,17 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 	for _, n := range nodes {
 		nodeByID[n.ID] = n
 	}
-	doneAll := map[uint64]bool{}
 	for _, c := range in.Chunks {
+		// Done 是按块的：done 集合必须每块单独算，绝不能跨块累积。此前用一个跨块
+		// doneAll，节点在别的块 Done 就会被本块跳过——恰是"某节点 chunk0 Done、
+		// chunk1 的 Done 报告丢了"这一场景不补标，chunk1 零 Done → commit 409 死循环，
+		// 重新触发本兜底本要解决的 27348 死锁。
+		done := make(map[uint64]bool, len(c.Done))
 		for _, id := range c.Done {
-			doneAll[id] = true
+			done[id] = true
 		}
 		for _, id := range c.Replicas {
-			if doneAll[id] {
+			if done[id] {
 				continue
 			}
 			n, ok := nodeByID[id]
@@ -444,6 +451,7 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 			Replicas:     c.Replicas,
 			DoneReplicas: c.Done,
 			Size:         c.Size,
+			Checksum:     c.Checksum, // 供 planRepairs 把块校验和随 pull 下发给目标节点
 		}
 		tasks := planRepairs(pseudo, nodes, s.nodeMaxAge)
 		if len(tasks) == 0 {
@@ -549,7 +557,7 @@ func (s *Scanner) executeChunkRepair(inodeID uint64, index int, t repairTask) {
 			return
 		}
 		log.Printf("inode %d chunk %d: 替换 dead node %d → %d，触发 pull", inodeID, index, t.OldNodeID, t.NewNodeID)
-		s.triggerPull(t.NewNodeAddr, chunkID, t.SourceAddr)
+		s.triggerPull(t.NewNodeAddr, chunkID, t.SourceAddr, t.Checksum)
 	case repairTriggerPull:
 		chunkID := types.ChunkID(inodeID, index)
 		if !s.probeSource(t.SourceAddr, chunkID) {
@@ -557,7 +565,7 @@ func (s *Scanner) executeChunkRepair(inodeID uint64, index int, t repairTask) {
 			return
 		}
 		log.Printf("inode %d chunk %d: 触发 pull（alive 未 Done）", inodeID, index)
-		s.triggerPull(t.TargetAddr, chunkID, t.SourceAddr)
+		s.triggerPull(t.TargetAddr, chunkID, t.SourceAddr, t.Checksum)
 	}
 }
 
@@ -597,14 +605,14 @@ func (s *Scanner) executeRepair(inodeID uint64, t repairTask) {
 			return
 		}
 		log.Printf("inode %d slot %d: 替换 dead node %d → %d，触发 pull", inodeID, t.SlotIdx, t.OldNodeID, t.NewNodeID)
-		s.triggerPull(t.NewNodeAddr, inodeID, t.SourceAddr)
+		s.triggerPull(t.NewNodeAddr, inodeID, t.SourceAddr, t.Checksum)
 	case repairTriggerPull:
 		if !s.probeSource(t.SourceAddr, inodeID) {
 			log.Printf("inode %d slot %d: 源 %s 上对象缺失（404），跳过 pull", inodeID, t.SlotIdx, t.SourceAddr)
 			return
 		}
 		log.Printf("inode %d slot %d: 触发 pull（alive 未 Done）", inodeID, t.SlotIdx)
-		s.triggerPull(t.TargetAddr, inodeID, t.SourceAddr)
+		s.triggerPull(t.TargetAddr, inodeID, t.SourceAddr, t.Checksum)
 	}
 }
 
@@ -645,11 +653,13 @@ func (s *Scanner) probeChunkObject(nodeAddr string, objectID uint64) bool {
 	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent
 }
 
-// triggerPull 调用目标节点 POST /pull。
-func (s *Scanner) triggerPull(targetAddr string, inodeID uint64, sourceAddr string) {
+// triggerPull 调用目标节点 POST /pull。checksum 是期望 CRC32C，随请求下发让目标
+// 落盘即校验（0 = legacy/未记录则目标跳过校验）。
+func (s *Scanner) triggerPull(targetAddr string, inodeID uint64, sourceAddr string, checksum uint32) {
 	body, _ := json.Marshal(map[string]any{
 		"inode_id":    inodeID,
 		"source_addr": sourceAddr,
+		"checksum":    checksum,
 	})
 	resp, err := s.httpClient.Post(fmt.Sprintf("%s://%s/pull", s.scheme, targetAddr), "application/json", bytes.NewReader(body))
 	if err != nil {

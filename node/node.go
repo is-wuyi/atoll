@@ -206,7 +206,14 @@ func (n *Node) fetchReplicaTargets(inodeID uint64) ([]string, error) {
 
 // pushObject 把本地对象推送到目标节点（目标节点会落盘并上报 master）。
 func (n *Node) pushObject(peerAddr string, inodeID uint64) error {
-	f, err := os.Open(n.objectPath(inodeID))
+	path := n.objectPath(inodeID)
+	// 先算本地对象 CRC32C 随 PUT 头下发：对端落盘即校验，挡住 EasyTier 上的传输撕裂——
+	// 否则复制/修复会把撕裂的字节当健康副本落盘并上报 Done，静默损坏且修复永不重拷。
+	crc, err := fileCRC32C(path)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
@@ -216,6 +223,7 @@ func (n *Node) pushObject(peerAddr string, inodeID uint64) error {
 	if err != nil {
 		return err
 	}
+	req.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", crc))
 	resp, err := n.bulkClient.Do(req)
 	if err != nil {
 		return err
@@ -225,6 +233,20 @@ func (n *Node) pushObject(peerAddr string, inodeID uint64) error {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// fileCRC32C 流式计算文件的 CRC32C（Castagnoli），不整读进内存。
+func fileCRC32C(path string) (uint32, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	h := types.NewCRC32C()
+	if _, err := io.Copy(h, f); err != nil {
+		return 0, err
+	}
+	return h.Sum32(), nil
 }
 
 // reportReplicated 向 master 上报"我已完成该对象的同步"，失败重试 3 次。
@@ -279,6 +301,7 @@ func (n *Node) handlePull(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		InodeID    uint64 `json:"inode_id"`
 		SourceAddr string `json:"source_addr"`
+		Checksum   uint32 `json:"checksum"` // master 元数据里的期望 CRC32C（0 = 未知/legacy 跳过校验）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, "invalid request body")
@@ -294,11 +317,11 @@ func (n *Node) handlePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
-	go n.pullObject(req.InodeID, req.SourceAddr)
+	go n.pullObject(req.InodeID, req.SourceAddr, req.Checksum)
 }
 
 // pullObject 后台从源节点拉取对象并落盘，完成后上报 master。
-func (n *Node) pullObject(inodeID uint64, sourceAddr string) {
+func (n *Node) pullObject(inodeID uint64, sourceAddr string, expectCRC uint32) {
 	defer n.pulling.Delete(inodeID)
 	url := fmt.Sprintf("%s://%s/objects/%d", n.scheme(), sourceAddr, inodeID)
 	resp, err := n.bulkClient.Get(url)
@@ -311,9 +334,11 @@ func (n *Node) pullObject(inodeID uint64, sourceAddr string) {
 		log.Printf("pull %d from %s: status %d", inodeID, sourceAddr, resp.StatusCode)
 		return
 	}
-	size, _, err := n.storeObject(inodeID, resp.Body, 0) // pull 源无期望值，读时由客户端按元数据校验
+	// 用 master 下发的期望 CRC 校验：源盘位翻转或传输撕裂都会被拒（不落盘、不上报 Done），
+	// 让下一轮修复换个源重试，而不是把损坏认证为健康副本。expectCRC=0（legacy/未记录）跳过。
+	size, _, err := n.storeObject(inodeID, resp.Body, expectCRC)
 	if err != nil {
-		log.Printf("pull %d: %v", inodeID, err)
+		log.Printf("pull %d: %v（校验失败或落盘失败，保持未 Done 待下轮换源重拉）", inodeID, err)
 		return
 	}
 	log.Printf("pull %d: 已落盘 %d 字节", inodeID, size)
