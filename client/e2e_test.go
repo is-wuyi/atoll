@@ -406,26 +406,19 @@ func TestPutOverwrite(t *testing.T) {
 
 // ---- 阶段4 e2e 测试 ----
 
-// repairOnceAndWait 杀掉 victim 后：等待心跳过期 → 给幸存节点重新心跳 →
-// 触发一次修复扫描 → 轮询直到文件 done 副本恢复至 want 个。
-// 返回恢复后的副本列表。前置：集群 nodeMaxAge=1s。
+// repairOnceAndWait 杀掉 victim → 回退其心跳确定性判死 →
+// 触发修复扫描 → 轮询直到文件 done 副本恢复至 want 个。返回恢复后的副本列表。
+// 前置：集群 nodeMaxAge 很大（幸存节点在满载下也不会被误判死亡）；victim 靠回退心跳
+// 确定性判死，不依赖 wall-clock 等过期——彻底消除 -race/满载下的时序偶发。
 func repairOnceAndWait(t *testing.T, cv *clusterV3, c *Client, path string, victim *clusterNode, want int) []Replica {
 	t.Helper()
 	victim.server.Close()
-
-	// 等待 victim 心跳过期（nodeMaxAge=1s）。
-	time.Sleep(1200 * time.Millisecond)
-
-	// 轮询：每轮都给幸存节点续心跳 + 再跑一次修复扫描。CI/-race 满载下的抗抖关键——
-	// ① 满载时幸存节点心跳也可能因调度饥饿过期被判 dead → 无源可修，故每轮续心跳；
-	// ② 只扫一次可能恰好撞上某节点瞬时过期而无动作，故每轮重扫，直到 done 达标或超时。
+	// 确定性判死：直接把 victim 心跳回退到过去（配合大 nodeMaxAge，幸存节点始终 alive）。
+	if err := cv.store.SetNodeHeartbeatAt(victim.node.NodeIDForTest(), time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("回退 victim 心跳: %v", err)
+	}
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		for _, n := range cv.nodes {
-			if n != victim {
-				cv.heartbeatNode(n)
-			}
-		}
 		cv.scanner.RepairScanOnce()
 		if _, reps, err := c.Lookup(path); err == nil {
 			done := 0
@@ -449,7 +442,9 @@ func repairOnceAndWait(t *testing.T, cv *clusterV3, c *Client, path string, vict
 
 // TestRepairAfterNodeDeath 4 节点 3 副本杀 1 → 修复后 done 恢复 3、Replicas 不含 dead 节点、内容一致。
 func TestRepairAfterNodeDeath(t *testing.T) {
-	cv := newClusterV3(t, 4, time.Second)
+	// nodeMaxAge=time.Minute：幸存节点在满载 -race 下也不会被误判死亡；
+	// victim 靠 repairOnceAndWait 回退心跳确定性判死。
+	cv := newClusterV3(t, 4, time.Minute)
 	c := cv.client
 
 	// 初始心跳全部 alive。
@@ -510,7 +505,8 @@ func TestRepairAfterNodeDeath(t *testing.T) {
 
 // TestRepairAfterNodeDeath3Nodes 3 节点 2 副本杀 1 → 修复后 done 恢复 2（换到第 3 台）。
 func TestRepairAfterNodeDeath3Nodes(t *testing.T) {
-	cv := newClusterV3(t, 3, time.Second)
+	// nodeMaxAge=time.Minute：满载 -race 下幸存节点不被误判死亡（见 TestRepairAfterNodeDeath）。
+	cv := newClusterV3(t, 3, time.Minute)
 	c := cv.client
 
 	for _, n := range cv.nodes {

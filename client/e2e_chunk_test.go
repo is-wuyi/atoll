@@ -115,7 +115,8 @@ func waitChunkDone(t *testing.T, c *Client, path string, n int) {
 
 // TestChunkedRepairAfterNodeDeath 分块文件 + 杀一个节点 → 块级修复恢复副本数。
 func TestChunkedRepairAfterNodeDeath(t *testing.T) {
-	cv := newClusterV3(t, 3, time.Second)
+	// nodeMaxAge=time.Minute：满载 -race 下幸存节点不被误判死亡；victim 靠回退心跳确定性判死。
+	cv := newClusterV3(t, 3, time.Minute)
 	c := cv.client
 	for _, n := range cv.nodes {
 		cv.heartbeatNode(n)
@@ -147,16 +148,13 @@ func TestChunkedRepairAfterNodeDeath(t *testing.T) {
 		t.Fatal("未找到块副本节点")
 	}
 	victim.server.Close()
-	time.Sleep(1200 * time.Millisecond) // 心跳过期
-	// 轮询：每轮续幸存节点心跳 + 重扫，满载抗抖（同 repairOnceAndWait）——只续一次/只扫
-	// 一次在 -race -count 满载下会偶发不修复。直到块 done 恢复到 2 或超时。
+	// 确定性判死：回退 victim 心跳到过去（配合大 nodeMaxAge，幸存节点始终 alive）。
+	if err := cv.store.SetNodeHeartbeatAt(victimID, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("回退 victim 心跳: %v", err)
+	}
+	// 轮询重扫，直到块 done 恢复到 2 或超时。
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		for _, cn := range cv.nodes {
-			if cn != victim {
-				cv.heartbeatNode(cn)
-			}
-		}
 		cv.scanner.RepairScanOnce()
 		if in2, _, err := c.Lookup("/docs/r.bin"); err == nil && len(in2.Chunks) == 1 && len(in2.Chunks[0].Done) >= 2 {
 			break
