@@ -378,7 +378,18 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 		}{Inode: st})
 		return
 	}
-	// legacy：如果路径已存在，根据 overwrite 标记决定行为。
+	// legacy：先校验节点可用性，再动旧文件——否则删了旧文件才发现节点不足、
+	// 返回 503，旧文件已丢且对象在回收（覆盖失败即数据丢失）。
+	alive, err := s.store.ListAliveNodes(s.nodeMaxAge)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(alive) < req.Replicas {
+		httpError(w, http.StatusServiceUnavailable, fmt.Sprintf("alive nodes %d < replicas %d", len(alive), req.Replicas))
+		return
+	}
+	// 路径已存在：按 overwrite 决定拒绝还是删旧（此时已确认节点够，删旧是安全的）。
 	if old, err := s.store.ResolvePath(req.Path); err == nil {
 		if !req.Overwrite {
 			httpError(w, http.StatusConflict, meta.ErrExist.Error())
@@ -390,15 +401,6 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		go s.notifyObjectDelete(old.ID, old.Replicas)
-	}
-	alive, err := s.store.ListAliveNodes(s.nodeMaxAge)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if len(alive) < req.Replicas {
-		httpError(w, http.StatusServiceUnavailable, fmt.Sprintf("alive nodes %d < replicas %d", len(alive), req.Replicas))
-		return
 	}
 	rand.Shuffle(len(alive), func(i, j int) { alive[i], alive[j] = alive[j], alive[i] })
 	chosen := alive[:req.Replicas]

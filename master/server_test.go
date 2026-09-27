@@ -193,6 +193,26 @@ func TestLookupReturnsNodeAddrs(t *testing.T) {
 	}
 }
 
+// 覆盖写节点不足时不得删旧文件：先校验可用性、再动旧文件。
+// 回归：此前先 DeleteFile 再查节点，节点不足返回 503 时旧文件已丢。
+func TestLegacyOverwriteInsufficientNodesKeepsOld(t *testing.T) {
+	ts := newTestServer(t)
+	registerNode(t, ts.URL, 1) // 只有 1 个节点
+
+	if resp := postJSON(t, ts.URL+"/files", map[string]any{"path": "/a.txt", "replicas": 1}, nil); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("建文件状态码 = %d", resp.StatusCode)
+	}
+	// 覆盖写要 2 副本、只有 1 个节点 → 必须 503。
+	resp := postJSON(t, ts.URL+"/files", map[string]any{"path": "/a.txt", "replicas": 2, "overwrite": true}, nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("节点不足的覆盖写应 503, got %d", resp.StatusCode)
+	}
+	// 关键：旧文件必须还在（没被 503 顺手删掉）。
+	if r := getJSON(t, ts.URL+"/meta?path=/a.txt", nil); r.StatusCode != http.StatusOK {
+		t.Fatalf("覆盖失败后旧文件应仍在, /meta 状态码 = %d", r.StatusCode)
+	}
+}
+
 func TestCommitUpdatesSize(t *testing.T) {
 	ts := newTestServer(t)
 	registerNode(t, ts.URL, 1)
