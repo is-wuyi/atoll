@@ -88,7 +88,7 @@ func TestChunkedAbortOnFailure(t *testing.T) {
 // waitChunkDone 轮询直到分块文件全部块达到 n 个 done 副本。
 func waitChunkDone(t *testing.T, c *Client, path string, n int) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second) // 满载 -race -count 下异步复制会变慢，放宽消除偶发
 	for time.Now().Before(deadline) {
 		in, _, err := c.Lookup(path)
 		if err == nil && len(in.Chunks) > 0 {
@@ -148,23 +148,20 @@ func TestChunkedRepairAfterNodeDeath(t *testing.T) {
 	}
 	victim.server.Close()
 	time.Sleep(1200 * time.Millisecond) // 心跳过期
-	for _, cn := range cv.nodes {
-		if cn != victim {
-			cv.heartbeatNode(cn)
-		}
-	}
-	cv.scanner.RepairScanOnce()
-
-	// 块副本恢复到 2。
-	deadline := time.Now().Add(10 * time.Second)
+	// 轮询：每轮续幸存节点心跳 + 重扫，满载抗抖（同 repairOnceAndWait）——只续一次/只扫
+	// 一次在 -race -count 满载下会偶发不修复。直到块 done 恢复到 2 或超时。
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		in2, _, err := c.Lookup("/docs/r.bin")
-		if err == nil && len(in2.Chunks) == 1 {
-			if len(in2.Chunks[0].Done) >= 2 {
-				break
+		for _, cn := range cv.nodes {
+			if cn != victim {
+				cv.heartbeatNode(cn)
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		cv.scanner.RepairScanOnce()
+		if in2, _, err := c.Lookup("/docs/r.bin"); err == nil && len(in2.Chunks) == 1 && len(in2.Chunks[0].Done) >= 2 {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
 	}
 	in2, _, _ := c.Lookup("/docs/r.bin")
 	if len(in2.Chunks[0].Done) < 2 {

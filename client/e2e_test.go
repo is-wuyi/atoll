@@ -142,7 +142,9 @@ func (cv *clusterV3) heartbeatNode(cn *clusterNode) {
 // waitDone 轮询 master 直到该文件有 >= n 个已完成副本，超时失败。
 func waitDone(t *testing.T, c *Client, path string, n int) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	// 30s：夜间 soak 全包 -race -count 满载下，异步复制+上报 Done 会明显变慢，
+	// 10s 会偶发不足（操作其实会完成，只是被 CPU/内存争用拖慢）。放宽消除偶发。
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		_, nodes, err := c.lookup(path)
 		if err == nil {
@@ -337,8 +339,8 @@ func TestDeleteReclaimsObjects(t *testing.T) {
 		t.Fatalf("Rm: %v", err)
 	}
 
-	// master 的回收通知是异步的，轮询等待所有节点对象消失。
-	deadline := time.Now().Add(5 * time.Second)
+	// master 的回收通知是异步的，轮询等待所有节点对象消失（满载下放宽到 20s）。
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		remaining := 0
 		for _, cn := range nodes {
@@ -417,7 +419,7 @@ func repairOnceAndWait(t *testing.T, cv *clusterV3, c *Client, path string, vict
 	// 轮询：每轮都给幸存节点续心跳 + 再跑一次修复扫描。CI/-race 满载下的抗抖关键——
 	// ① 满载时幸存节点心跳也可能因调度饥饿过期被判 dead → 无源可修，故每轮续心跳；
 	// ② 只扫一次可能恰好撞上某节点瞬时过期而无动作，故每轮重扫，直到 done 达标或超时。
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range cv.nodes {
 			if n != victim {
