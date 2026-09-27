@@ -204,3 +204,48 @@ func TestStreamWritePreallocatedThenWrite(t *testing.T) {
 		t.Fatalf("读回不符: got %d want %d", len(got), len(content))
 	}
 }
+
+// 回写到已推送块内：必须放弃流式、回退整传，提交的是改写后的内容而非旧数据。
+// 回归：此前 Write 不检查 off<sentIdx，改写已推块只更新本地文件、提交旧块 → 静默损坏。
+func TestStreamRewriteBelowPushedFallsBack(t *testing.T) {
+	withChunkSize(t, 1024) // 1KB 块
+	cc := newChunkedCluster(t, 2)
+	if _, err := cc.client.Mkdir("/rw"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	w, err := cc.m.newWriteHandle("/rw/f.bin", true)
+	if err != nil {
+		t.Fatalf("newWriteHandle: %v", err)
+	}
+	w.created = true
+	w.streamOn = true
+	ctx := context.Background()
+
+	content := make([]byte, 3072) // 3 块
+	rand.New(rand.NewSource(3)).Read(content)
+	// 顺序写满 → 推出块 0/1/2，sentIdx 前进。
+	for off := 0; off < len(content); off += 256 {
+		if _, errno := w.Write(ctx, content[off:off+256], int64(off)); errno != 0 {
+			t.Fatalf("顺序写 off=%d: %v", off, errno)
+		}
+	}
+	// 回写块 0 内（off=0 < sentIdx）：改前 100 字节。
+	newHead := bytes.Repeat([]byte{0xEE}, 100)
+	if _, errno := w.Write(ctx, newHead, 0); errno != 0 {
+		t.Fatalf("回写 off=0: %v", errno)
+	}
+	if errno := w.Flush(ctx); errno != 0 {
+		t.Fatalf("Flush: %v", errno)
+	}
+	_ = w.Release(ctx)
+
+	want := append(append([]byte{}, newHead...), content[100:]...)
+	out := filepath.Join(t.TempDir(), "out.bin")
+	if err := cc.client.Get("/rw/f.bin", out); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("回写后内容错：提交了旧块而非改写内容（got[:4]=%x want[:4]=%x len=%d/%d）", got[:4], want[:4], len(got), len(want))
+	}
+}

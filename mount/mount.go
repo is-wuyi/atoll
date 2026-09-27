@@ -826,9 +826,22 @@ type writeHandle struct {
 
 var (
 	_ fs.FileWriter   = (*writeHandle)(nil)
+	_ fs.FileReader   = (*writeHandle)(nil)
 	_ fs.FileFlusher  = (*writeHandle)(nil)
 	_ fs.FileReleaser = (*writeHandle)(nil)
 )
+
+// Read 从本地缓冲文件读：让 O_RDWR / r+ 打开（就地读改写、rsync --inplace 等）能读到
+// 当前内容。此前 writeHandle 只实现 FileWriter，go-fuse 对读句柄回 ENOTSUP，读全失败。
+func (w *writeHandle) Read(_ context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	nr, err := w.f.ReadAt(dest, off)
+	if err != nil && err != io.EOF {
+		return nil, syscall.EIO
+	}
+	return fuse.ReadResultData(dest[:nr]), 0
+}
 
 // newWriteHandle 建立写缓冲。trunc=true 从空文件开始（启用流式）；
 // 否则先下载现有内容（就地编辑，走旧整传）。
@@ -844,7 +857,17 @@ func (m *Mount) newWriteHandle(remote string, trunc bool) (*writeHandle, error) 
 		f:      tmp,
 	}
 	if !trunc {
-		if err := m.client.Get(remote, tmp.Name()); err == nil {
+		if err := m.client.Get(remote, tmp.Name()); err != nil {
+			// 关键：只有"文件确实不存在"才当空文件开始。其它错误（网络抖动/节点不可达）
+			// 若也当空处理，后续 Flush 会用空/截断内容覆盖掉远端好文件（就地编辑丢数据）。
+			// 调用方（Open 写打开）已 Lookup 确认文件存在，故非 ENOENT 一律失败。
+			if mapErrno(err) != syscall.ENOENT {
+				tmp.Close()
+				os.Remove(tmp.Name())
+				return nil, err
+			}
+			// 不存在：从空开始（同样能走流式）。
+		} else {
 			// Get 用完会关闭文件句柄，重新以读写模式打开。
 			f, err := os.OpenFile(tmp.Name(), os.O_RDWR, 0o600)
 			if err == nil {
@@ -852,7 +875,6 @@ func (m *Mount) newWriteHandle(remote string, trunc bool) (*writeHandle, error) 
 				w.f = f
 			}
 		}
-		// 下载失败（如文件不存在）视为从空开始——此时同样能走流式。
 	}
 	m.mu.Lock()
 	m.writes[remote] = w
@@ -886,6 +908,14 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 		return 0, syscall.EIO
 	}
 	w.dirty = true
+	// 回写到"已作为整块推送过"的区域（off < sentIdx）：推出去的块内容已过期、且无法
+	// 重推 → 放弃流式，回退整传（Flush 从完整本地文件重传），绝不提交旧数据。
+	if w.streamOn && w.stream != nil && off < w.sentIdx {
+		_ = w.stream.Close()
+		w.stream = nil
+		w.streamOn = false
+		return uint32(n), 0
+	}
 	if !w.streamOn {
 		return uint32(n), 0
 	}

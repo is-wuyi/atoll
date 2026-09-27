@@ -174,3 +174,28 @@ func TestFinderXattrAccepted(t *testing.T) {
 	}
 }
 
+
+// O_RDWR 打开必须能读：就地读改写（r+/rsync --inplace/编辑器）。
+// 回归：writeHandle 之前不实现 FileReader，go-fuse 对读回 ENOTSUP，r+ 读全失败。
+func TestFinderReadWriteOpenCanRead(t *testing.T) {
+	mnt := mountForTest(t, 2)
+	p := filepath.Join(mnt, "rw.txt")
+	content := []byte("read-modify-write payload 0123456789")
+	if err := os.WriteFile(p, content, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// O_RDWR 打开并读回。
+	fd, err := os.OpenFile(p, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("O_RDWR open: %v", err)
+	}
+	defer fd.Close()
+	got := make([]byte, len(content))
+	nr, err := fd.ReadAt(got, 0)
+	if err != nil && err.Error() != "EOF" {
+		t.Fatalf("O_RDWR 读应成功（曾 ENOTSUP）: %v", err)
+	}
+	if nr != len(content) || !bytes.Equal(got[:nr], content) {
+		t.Fatalf("O_RDWR 读回不符: n=%d want %d", nr, len(content))
+	}
+}
