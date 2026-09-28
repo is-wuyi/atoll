@@ -112,6 +112,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /files/staging/{id}", s.handleAbortStaging)   // 分块：放弃上传
 	mux.HandleFunc("GET /files/replica-targets", s.handleReplicaTargets) // node 查询推送目标
 	mux.HandleFunc("POST /files/replicated", s.handleReplicated)         // 从副本上报同步完成
+	mux.HandleFunc("POST /files/corrupt", s.handleReportCorrupt)         // 读端上报副本内容损坏
 	mux.HandleFunc("POST /entry/rename", s.handleRename)                 // 同目录改名
 	mux.HandleFunc("DELETE /entry", s.handleDelete)                      // ?path=/a/b
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
@@ -326,6 +327,42 @@ func (s *Server) handleReplicated(w http.ResponseWriter, r *http.Request) {
 		httpErrorFromMeta(w, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleReportCorrupt 读端发现某副本内容校验和不符时上报：POST /files/corrupt
+// {inode_id, node_id}。inode_id 对分块是块对象 ID（ChunkID），对 legacy 是文件 inode ID
+// （与 /files/replicated 同一编码约定）。处理：先删该节点上的坏对象、再清其 Done。
+//
+// 顺序关键：必须先删对象再清 Done。否则修复扫描的"探测兜底"只看对象是否存在（1 字节 Range）、
+// 不看内容，会在清 Done 后立刻把这份坏副本重新标 Done，自愈被抵消。删掉后探测得 404，
+// 修复扫描才会从完好副本重新 pull（带 CRC 校验）覆盖它，闭环才真正闭合。
+func (s *Server) handleReportCorrupt(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InodeID uint64 `json:"inode_id"`
+		NodeID  uint64 `json:"node_id"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	if req.InodeID == 0 || req.NodeID == 0 {
+		httpError(w, http.StatusBadRequest, "inode_id and node_id required")
+		return
+	}
+	// 先删坏对象（同步、单节点、5s 上限），再清 Done——见上文顺序说明。
+	s.notifyObjectDelete(req.InodeID, []uint64{req.NodeID})
+	var err error
+	if req.InodeID >= types.StagingInodeBase<<8 {
+		err = s.store.MarkChunkUndone(req.InodeID, req.NodeID)
+	} else {
+		err = s.store.RemoveReplicaDone(req.InodeID, req.NodeID)
+	}
+	if err != nil {
+		httpErrorFromMeta(w, err)
+		return
+	}
+	log.Printf("副本损坏上报: 对象 %d 节点 %d 内容校验和不符，已删坏对象并清 Done 待修复", req.InodeID, req.NodeID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

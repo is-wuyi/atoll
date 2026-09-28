@@ -2,12 +2,15 @@ package client
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"atoll/pkg/types"
 )
 
 // TestChunkedPutGetSingleBlockMeta 分块协议全链路（单块文件，协议与多块完全相同）：
@@ -220,5 +223,111 @@ func TestChunkedConcurrentWritersLastWins(t *testing.T) {
 	in, _, err := c.Lookup("/docs/race.bin")
 	if err != nil || !in.Chunked {
 		t.Fatalf("元数据不符: %+v %v", in, err)
+	}
+}
+
+// TestChunkedReadReportsCorruptAndSelfHeals 读端发现块副本内容校验和不符时上报 master，
+// master 删坏对象并清其 Done，修复扫描随后从完好副本重新 pull 覆盖，副本恢复为正确内容。
+// 此前读端只静默故障转移、从不回报 → 坏副本永远算健康、修复链看不见它（本测试守此闭环）。
+func TestChunkedReadReportsCorruptAndSelfHeals(t *testing.T) {
+	cv := newClusterV3(t, 3, time.Minute)
+	c := cv.client
+	for _, n := range cv.nodes {
+		cv.heartbeatNode(n)
+	}
+	dir := t.TempDir()
+	if _, err := c.Mkdir("/docs"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	content := bytes.Repeat([]byte("corrupt-selfheal-"), 4096)
+	local := filepath.Join(dir, "c.bin")
+	os.WriteFile(local, content, 0o644)
+	if err := c.PutChunked(local, "/docs/c.bin", 2); err != nil {
+		t.Fatalf("PutChunked: %v", err)
+	}
+	waitChunkDone(t, c, "/docs/c.bin", 2)
+
+	in, _, err := c.Lookup("/docs/c.bin")
+	if err != nil || len(in.Chunks) != 1 {
+		t.Fatalf("Lookup 期望单块: %+v %v", in, err)
+	}
+	ch := in.Chunks[0]
+	victim := ch.Done[0]
+	chunkID := types.ChunkID(in.ID, 0)
+
+	var vnode *clusterNode
+	for _, n := range cv.nodes {
+		if n.node.NodeIDForTest() == victim {
+			vnode = n
+			break
+		}
+	}
+	if vnode == nil {
+		t.Fatalf("未找到 victim 节点 %d", victim)
+	}
+	// 篡改 victim 盘上块对象（等长翻转前 64 字节）。
+	p := objectDiskPath(vnode.node.DataDirForTest(), chunkID)
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("读块对象: %v", err)
+	}
+	bad := append([]byte(nil), raw...)
+	for i := 0; i < 64 && i < len(bad); i++ {
+		bad[i] ^= 0xff
+	}
+	os.WriteFile(p, bad, 0o644)
+
+	// 强制读到坏副本：只给 victim 地址调 fetchChunkInto → 校验失败并触发上报。
+	only := map[uint64]string{victim: vnode.addr()}
+	if err := c.fetchChunkInto(in.ID, ch, only, io.Discard); err == nil {
+		t.Fatalf("读坏副本应失败")
+	}
+
+	// 上报异步：轮询直到 master 把 victim 从块 Done 移除（自愈第一步）。
+	deadline := time.Now().Add(10 * time.Second)
+	dropped := false
+	for time.Now().Before(deadline) {
+		if in2, _, err := c.Lookup("/docs/c.bin"); err == nil && len(in2.Chunks) == 1 &&
+			!types.ContainsUint64(in2.Chunks[0].Done, victim) {
+			dropped = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !dropped {
+		t.Fatal("上报后 victim 应从块 Done 移除")
+	}
+
+	// 修复扫描：从完好副本重新 pull 覆盖坏副本，收敛回 2 个 Done。
+	for _, n := range cv.nodes {
+		cv.heartbeatNode(n)
+	}
+	deadline = time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		cv.scanner.RepairScanOnce()
+		if in3, _, err := c.Lookup("/docs/c.bin"); err == nil && len(in3.Chunks[0].Done) >= 2 {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	in4, _, _ := c.Lookup("/docs/c.bin")
+	if len(in4.Chunks[0].Done) < 2 {
+		t.Fatalf("自愈后块 Done 应恢复到 2, got %d", len(in4.Chunks[0].Done))
+	}
+	// victim 盘上对象应被重拉覆盖为正确内容。
+	fixed, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("读修复后对象: %v", err)
+	}
+	if types.CRC32C(fixed) != ch.Checksum {
+		t.Fatal("victim 副本未被修复为正确内容（CRC 不符）")
+	}
+	// 整文件读回仍正确。
+	out := filepath.Join(dir, "out.bin")
+	if err := c.Get("/docs/c.bin", out); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got, _ := os.ReadFile(out); !bytes.Equal(got, content) {
+		t.Fatal("最终读回内容不符")
 	}
 }

@@ -300,6 +300,7 @@ func (c *Client) getFromReplicas(in types.Inode, candidates []Replica, localPath
 		// 校验和：元数据有记录（非 0）且不符 → 该副本内容损坏，换下一个副本。
 		if in.Checksum != 0 && h.Sum32() != in.Checksum {
 			lastErr = fmt.Errorf("节点 %s: 校验和不符 %08x != %08x", n.Addr, h.Sum32(), in.Checksum)
+			go c.reportCorrupt(in.ID, n.ID) // 尽力上报：master 删坏对象并清 Done → 修复重拉
 			continue
 		}
 		return nil
@@ -616,6 +617,7 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 		}
 		if ch.Checksum != 0 && types.CRC32C(buf) != ch.Checksum {
 			lastErr = fmt.Errorf("节点 %s: 块 %d 校验和不符", a, ch.Index)
+			go c.reportCorrupt(chunkID, id) // 尽力上报：master 删坏对象并清 Done → 修复重拉
 			continue
 		}
 		if _, err := w.Write(buf); err != nil {
@@ -624,6 +626,29 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 		return nil
 	}
 	return fmt.Errorf("全部副本失败: %w", lastErr)
+}
+
+// reportCorrupt 读端发现某副本内容校验和不符时，尽力上报 master（失败静默）。
+// objectID 对分块传块对象 ID（ChunkID），对 legacy 传文件 inode ID（与 /files/replicated
+// 同编码）。master 会删该节点坏对象并清其 Done，使修复扫描重新拉取覆盖，自愈闭环闭合。
+// 调用方以 goroutine 触发：读路径已完成故障转移，上报不得阻塞或影响读结果。
+func (c *Client) reportCorrupt(objectID, nodeID uint64) {
+	body, err := json.Marshal(map[string]uint64{"inode_id": objectID, "node_id": nodeID})
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), metadataTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.MasterURL+"/files/corrupt", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
 }
 
 // putObject 向节点写入对象数据。

@@ -683,6 +683,65 @@ func (s *Store) MarkChunkDone(chunkID, nodeID uint64) error {
 	})
 }
 
+// MarkChunkUndone 把某节点从块的 Done 集合移除（读端发现该副本内容校验和不符时上报）。
+// 移除后 planRepairs 视该槽位为不健康 → 下一轮从完好副本重新 pull（带 CRC 校验）覆盖它，
+// 自愈闭环由此闭合。此前读端只静默故障转移、从不回报，坏副本永远算健康、永不被修。
+// 保留 Replicas 不动（仍是该节点的槽位），只清 Done；非成员/未 Done 静默无操作（幂等）。
+func (s *Store) MarkChunkUndone(chunkID, nodeID uint64) error {
+	inodeID, index := types.ParseChunkID(chunkID)
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, inodeID)
+		if err != nil {
+			return err
+		}
+		if !in.Chunked {
+			return ErrChunkNotExist
+		}
+		for i := range in.Chunks {
+			if in.Chunks[i].Index != index {
+				continue
+			}
+			if !types.ContainsUint64(in.Chunks[i].Done, nodeID) {
+				return nil // 未 Done，无操作（幂等）
+			}
+			filtered := in.Chunks[i].Done[:0]
+			for _, d := range in.Chunks[i].Done {
+				if d != nodeID {
+					filtered = append(filtered, d)
+				}
+			}
+			in.Chunks[i].Done = filtered
+			return w.putInode(&in)
+		}
+		return ErrChunkNotExist
+	})
+}
+
+// RemoveReplicaDone 把某节点从 legacy 文件的 DoneReplicas 移除（读端上报副本内容损坏）。
+// 与 MarkChunkUndone 同义（legacy 整对象版）：清 Done 让修复扫描重新拉取覆盖坏副本。
+func (s *Store) RemoveReplicaDone(id, nodeID uint64) error {
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, id)
+		if err != nil {
+			return err
+		}
+		if in.Type != types.TypeFile {
+			return ErrNotFile
+		}
+		if !types.ContainsUint64(in.DoneReplicas, nodeID) {
+			return nil // 幂等
+		}
+		filtered := in.DoneReplicas[:0]
+		for _, d := range in.DoneReplicas {
+			if d != nodeID {
+				filtered = append(filtered, d)
+			}
+		}
+		in.DoneReplicas = filtered
+		return w.putInode(&in)
+	})
+}
+
 // ReplaceChunkReplica 块级槽位替换（修复扫描）：Replicas 中 oldNodeID → newNodeID，
 // 同时从 Done 中移除 oldNodeID。staging 与已提交的分块文件均适用。
 func (s *Store) ReplaceChunkReplica(inodeID uint64, index int, oldNodeID, newNodeID uint64) error {

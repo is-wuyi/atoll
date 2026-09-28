@@ -373,6 +373,50 @@ func TestStagingInvisibleByPath(t *testing.T) {
 	}
 }
 
+// TestMarkUndoneClearsDone 读端上报副本损坏后，Done 被清、Replicas 不动（自愈前置）。
+// legacy 走 RemoveReplicaDone、分块走 MarkChunkUndone；均幂等（未 Done 无操作）。
+func TestMarkUndoneClearsDone(t *testing.T) {
+	s := newTestStore(t)
+
+	// legacy：RemoveReplicaDone 清 Done、留 Replicas。
+	f, _ := s.CreateFile(RootID, "l.bin", []uint64{10, 20})
+	s.AddReplicaDone(f.ID, 10)
+	s.AddReplicaDone(f.ID, 20)
+	if err := s.RemoveReplicaDone(f.ID, 10); err != nil {
+		t.Fatalf("RemoveReplicaDone: %v", err)
+	}
+	got, _ := s.GetInode(f.ID)
+	if types.ContainsUint64(got.DoneReplicas, 10) {
+		t.Fatal("Done 中不应再有 10")
+	}
+	if !types.ContainsUint64(got.DoneReplicas, 20) || len(got.Replicas) != 2 {
+		t.Fatalf("应只清 Done、保留 Replicas 与其它 Done: %+v", got)
+	}
+	if err := s.RemoveReplicaDone(f.ID, 10); err != nil {
+		t.Fatalf("重复 RemoveReplicaDone 应幂等: %v", err)
+	}
+
+	// 分块：MarkChunkUndone 清块 Done、留块 Replicas。
+	st, _ := s.CreateStagingFile(RootID)
+	s.AssignChunk(st.ID, 0, 1024, []uint64{7, 8}, 0)
+	cid := types.ChunkID(st.ID, 0)
+	s.MarkChunkDone(cid, 7)
+	s.MarkChunkDone(cid, 8)
+	if err := s.MarkChunkUndone(cid, 7); err != nil {
+		t.Fatalf("MarkChunkUndone: %v", err)
+	}
+	ci, _ := s.GetInode(st.ID)
+	if types.ContainsUint64(ci.Chunks[0].Done, 7) {
+		t.Fatal("块 Done 中不应再有 7")
+	}
+	if !types.ContainsUint64(ci.Chunks[0].Done, 8) || len(ci.Chunks[0].Replicas) != 2 {
+		t.Fatalf("应只清块 Done、保留块 Replicas 与其它 Done: %+v", ci.Chunks[0])
+	}
+	if err := s.MarkChunkUndone(cid, 7); err != nil {
+		t.Fatalf("重复 MarkChunkUndone 应幂等: %v", err)
+	}
+}
+
 func TestAssignChunkIdempotent(t *testing.T) {
 	s := newTestStore(t)
 	st, _ := s.CreateStagingFile(RootID)
