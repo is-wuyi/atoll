@@ -389,18 +389,30 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusServiceUnavailable, fmt.Sprintf("alive nodes %d < replicas %d", len(alive), req.Replicas))
 		return
 	}
-	// 路径已存在：按 overwrite 决定拒绝还是删旧（此时已确认节点够，删旧是安全的）。
-	if old, err := s.store.ResolvePath(req.Path); err == nil {
+	// 路径已存在：按 overwrite 决定拒绝还是覆盖。覆盖不在此刻删旧——只建一个 staging
+	// 新版本（旧文件继续可读），待客户端把数据传到 staging 后 commit 才原子替换。
+	// 此前 create 阶段就 DeleteFile + 回收旧对象，上传随后失败即旧数据永久丢失。
+	if _, err := s.store.ResolvePath(req.Path); err == nil {
 		if !req.Overwrite {
 			httpError(w, http.StatusConflict, meta.ErrExist.Error())
 			return
 		}
-		// overwrite=true：删除旧文件元数据并异步通知副本节点回收旧对象。
-		if err := s.store.DeleteFile(old.ID); err != nil {
+		rand.Shuffle(len(alive), func(i, j int) { alive[i], alive[j] = alive[j], alive[i] })
+		chosen := alive[:req.Replicas]
+		nodeIDs := make([]uint64, len(chosen))
+		for i, n := range chosen {
+			nodeIDs[i] = n.ID
+		}
+		st, err := s.store.CreateStagingFileLegacy(parent.ID, name, nodeIDs)
+		if err != nil {
 			httpErrorFromMeta(w, err)
 			return
 		}
-		go s.notifyObjectDelete(old.ID, old.Replicas)
+		writeJSON(w, http.StatusCreated, struct {
+			Inode types.Inode      `json:"inode"`
+			Nodes []types.NodeInfo `json:"nodes"`
+		}{Inode: st, Nodes: chosen})
+		return
 	}
 	rand.Shuffle(len(alive), func(i, j int) { alive[i], alive[j] = alive[j], alive[i] })
 	chosen := alive[:req.Replicas]
@@ -598,7 +610,12 @@ func (s *Server) handleAbortStaging(w http.ResponseWriter, r *http.Request) {
 		httpErrorFromMeta(w, err)
 		return
 	}
-	s.reclaimChunkObjects(in)
+	// 分块 staging 回收各块对象；legacy staging 回收单对象。
+	if in.Chunked {
+		s.reclaimChunkObjects(in)
+	} else if len(in.Replicas) > 0 {
+		go s.notifyObjectDelete(in.ID, in.Replicas)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -707,6 +724,25 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 	// legacy：更新大小并标记主副本 Done。
 	if req.InodeID == 0 {
 		httpError(w, http.StatusBadRequest, "inode_id required")
+		return
+	}
+	// 覆盖写走 staging：commit 时才原子替换旧文件（见 handleCreateFile legacy 分支）。
+	// 非 staging 的普通新建文件仍走 UpdateFileSize（名字在 create 时已挂好）。
+	if st, err := s.store.GetInode(req.InodeID); err == nil && st.Staging && !st.Chunked {
+		in, old, hadOld, cerr := s.store.CommitLegacyStagingFile(req.InodeID, req.Size, req.Checksum)
+		if cerr != nil {
+			httpErrorFromMeta(w, cerr)
+			return
+		}
+		// 被替换旧版本异步回收（分块旧版本回收其块对象，legacy 回收单对象）。
+		if hadOld {
+			if old.Chunked {
+				s.reclaimChunkObjects(old)
+			} else if len(old.Replicas) > 0 {
+				go s.notifyObjectDelete(old.ID, old.Replicas)
+			}
+		}
+		writeJSON(w, http.StatusOK, in)
 		return
 	}
 	if err := s.store.UpdateFileSize(req.InodeID, req.Size, req.Checksum); err != nil {

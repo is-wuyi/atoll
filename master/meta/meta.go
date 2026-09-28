@@ -470,7 +470,102 @@ func (s *Store) CreateStagingFile(parentID uint64) (types.Inode, error) {
 	return in, nil
 }
 
-// SetInodeMtimeForTest 直接改 inode 的 Mtime（仅测试用：meta 层无对外 mtime API，
+// CreateStagingFileLegacy 建一个非分块 staging inode，记住目标名/父目录/副本，但不占用
+// 父目录的名字项——旧同名文件继续对外可读。用于 legacy 覆盖写：新数据先传到这个 staging
+// inode，直到 CommitLegacyStagingFile 才原子替换旧文件。覆盖中断时旧文件与旧对象原样保留。
+func (s *Store) CreateStagingFileLegacy(parentID uint64, name string, replicas []uint64) (types.Inode, error) {
+	if err := validateName(name); err != nil {
+		return types.Inode{}, err
+	}
+	var in types.Inode
+	err := s.write(func(w *txw) error {
+		parent, err := getInodeTx(w.tx, parentID)
+		if err != nil {
+			return err
+		}
+		if parent.Type != types.TypeDir {
+			return ErrNotDir
+		}
+		id, err := w.nextStagingID()
+		if err != nil {
+			return err
+		}
+		// Name/ParentID 记在 inode 上供 commit 时解析旧同名文件；但不写 children 桶，
+		// 故不与旧文件冲突、旧文件仍可解析。
+		in = types.Inode{
+			ID:       id,
+			ParentID: parentID,
+			Name:     name,
+			Type:     types.TypeFile,
+			Mtime:    time.Now(),
+			Staging:  true,
+			Replicas: replicas,
+		}
+		return w.putInode(&in)
+	})
+	if err != nil {
+		return types.Inode{}, err
+	}
+	return in, nil
+}
+
+// CommitLegacyStagingFile 提交一个 legacy（非分块）staging 文件：原子替换同名旧文件。
+// 单事务内：按 inode 上记的 (ParentID, Name) 解析旧文件 → 删旧 inode/child（若有）→ 挂
+// staging inode 到该名 → 设大小/校验和/主副本 Done/清 Staging。返回新 inode、被替换旧
+// inode、hadOld。事务前读者看到旧版本，事务后看到新版本，不存在中间态。
+func (s *Store) CommitLegacyStagingFile(inodeID uint64, size int64, checksum uint32) (types.Inode, types.Inode, bool, error) {
+	var out, old types.Inode
+	var hadOld bool
+	err := s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, inodeID)
+		if err != nil {
+			return err
+		}
+		if !in.Staging || in.Chunked {
+			return ErrNotStaging
+		}
+		parent, err := getInodeTx(w.tx, in.ParentID)
+		if err != nil {
+			return err
+		}
+		if parent.Type != types.TypeDir {
+			return ErrNotDir
+		}
+		// 同名旧 inode：目录则拒绝覆盖，文件则同事务删除（原子替换）。
+		if oldID := w.tx.Bucket(bucketChildren).Get(childKey(in.ParentID, in.Name)); oldID != nil {
+			old, err = getInodeTx(w.tx, beU64(oldID))
+			if err != nil {
+				return err
+			}
+			if old.Type == types.TypeDir {
+				return ErrExist
+			}
+			if err := w.delInode(old.ID); err != nil {
+				return err
+			}
+			hadOld = true
+		}
+		in.Size = size
+		in.Checksum = checksum
+		in.Staging = false
+		in.Mtime = time.Now()
+		if len(in.Replicas) > 0 {
+			in.DoneReplicas = appendUnique(in.DoneReplicas, in.Replicas[0])
+		}
+		if err := w.putInode(&in); err != nil {
+			return err
+		}
+		if err := w.putChild(in.ParentID, in.Name, in.ID); err != nil {
+			return err
+		}
+		out = in
+		return nil
+	})
+	if err != nil {
+		return types.Inode{}, types.Inode{}, false, err
+	}
+	return out, old, hadOld, nil
+}
 // 用于确定性地把 staging 回退到过去，避免 TTL 测试依赖 wall-clock sleep 而在 CI/-race 下偶发）。
 func (s *Store) SetInodeMtimeForTest(id uint64, mt time.Time) error {
 	return s.write(func(w *txw) error {

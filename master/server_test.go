@@ -213,6 +213,97 @@ func TestLegacyOverwriteInsufficientNodesKeepsOld(t *testing.T) {
 	}
 }
 
+// TestLegacyOverwriteDefersOldDeletionUntilCommit 覆盖写失败不得丢旧数据：
+// POST /files?overwrite 只建 staging 新版本、绝不在此刻删旧；旧文件必须一直可解析，
+// 直到新版本 commit 成功才原子替换。此前 create 阶段就 DeleteFile+回收旧对象，
+// 上传若随后失败（节点拒收/掉线）旧数据即永久丢失（本测试在修复前必失败）。
+func TestLegacyOverwriteDefersOldDeletionUntilCommit(t *testing.T) {
+	ts := newTestServer(t)
+	registerNode(t, ts.URL, 1)
+
+	// 先放一个已提交的旧版本。
+	var oldCreate struct {
+		Inode struct {
+			ID uint64 `json:"id"`
+		} `json:"inode"`
+	}
+	postJSON(t, ts.URL+"/files", map[string]any{"path": "/a.txt", "replicas": 1}, &oldCreate)
+	oldID := oldCreate.Inode.ID
+	if resp := postJSON(t, ts.URL+"/files/commit", map[string]any{"inode_id": oldID, "size": 1024}, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("旧版本 commit 状态码 = %d", resp.StatusCode)
+	}
+
+	// 覆盖写：只建 staging 新版本，返回的 inode ID 应不同于旧版本。
+	var ow struct {
+		Inode struct {
+			ID      uint64 `json:"id"`
+			Staging bool   `json:"staging"`
+		} `json:"inode"`
+	}
+	if resp := postJSON(t, ts.URL+"/files", map[string]any{"path": "/a.txt", "replicas": 1, "overwrite": true}, &ow); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("覆盖写建 staging 状态码 = %d", resp.StatusCode)
+	}
+	newID := ow.Inode.ID
+	if newID == oldID {
+		t.Fatalf("覆盖写应分配新的 staging inode，仍是旧 ID %d", oldID)
+	}
+
+	// 关键断言：commit 之前，/a.txt 必须仍解析到旧版本（旧数据未被动过）。
+	var mid struct {
+		Inode struct {
+			ID   uint64 `json:"id"`
+			Size int64  `json:"size"`
+		} `json:"inode"`
+	}
+	if r := getJSON(t, ts.URL+"/meta?path=/a.txt", &mid); r.StatusCode != http.StatusOK {
+		t.Fatalf("覆盖写 commit 前旧文件应仍在, /meta 状态码 = %d", r.StatusCode)
+	}
+	if mid.Inode.ID != oldID || mid.Inode.Size != 1024 {
+		t.Fatalf("commit 前应仍是旧版本 (ID=%d size=1024)，实际 ID=%d size=%d", oldID, mid.Inode.ID, mid.Inode.Size)
+	}
+
+	// 模拟上传失败 → 放弃 staging。旧文件必须原样幸存。
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/files/staging/"+fmt.Sprintf("%d", newID), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("abort staging: %v", err)
+	}
+	resp.Body.Close()
+	var afterAbort struct {
+		Inode struct {
+			ID   uint64 `json:"id"`
+			Size int64  `json:"size"`
+		} `json:"inode"`
+	}
+	if r := getJSON(t, ts.URL+"/meta?path=/a.txt", &afterAbort); r.StatusCode != http.StatusOK {
+		t.Fatalf("覆盖失败后旧文件应仍在, /meta 状态码 = %d", r.StatusCode)
+	}
+	if afterAbort.Inode.ID != oldID || afterAbort.Inode.Size != 1024 {
+		t.Fatalf("覆盖失败后应完好保留旧版本 (ID=%d size=1024)，实际 ID=%d size=%d", oldID, afterAbort.Inode.ID, afterAbort.Inode.Size)
+	}
+
+	// 成功路径：再覆盖一次并 commit，此时才原子替换为新版本。
+	var ow2 struct {
+		Inode struct {
+			ID uint64 `json:"id"`
+		} `json:"inode"`
+	}
+	postJSON(t, ts.URL+"/files", map[string]any{"path": "/a.txt", "replicas": 1, "overwrite": true}, &ow2)
+	if resp := postJSON(t, ts.URL+"/files/commit", map[string]any{"inode_id": ow2.Inode.ID, "size": 2048}, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("覆盖 commit 状态码 = %d", resp.StatusCode)
+	}
+	var final struct {
+		Inode struct {
+			ID   uint64 `json:"id"`
+			Size int64  `json:"size"`
+		} `json:"inode"`
+	}
+	getJSON(t, ts.URL+"/meta?path=/a.txt", &final)
+	if final.Inode.ID != ow2.Inode.ID || final.Inode.Size != 2048 {
+		t.Fatalf("commit 后应替换为新版本 (ID=%d size=2048)，实际 ID=%d size=%d", ow2.Inode.ID, final.Inode.ID, final.Inode.Size)
+	}
+}
+
 func TestCommitUpdatesSize(t *testing.T) {
 	ts := newTestServer(t)
 	registerNode(t, ts.URL, 1)
@@ -363,7 +454,8 @@ func TestReplicaTargetsAndReplicated(t *testing.T) {
 }
 
 func TestCreateFileOverwrite(t *testing.T) {
-	// 场景 1：覆盖成功 — 创建 /a.txt → 覆写 → 验证 /meta 返回新 inode / 新 size。
+	// 场景 1：覆盖成功 — 创建 /a.txt → 覆写建 staging → commit 后 /meta 返回新 inode / 新 size。
+	// 覆盖语义已改：新版本先进 staging，commit 才原子替换旧版本（防覆盖失败丢旧数据）。
 	t.Run("OverwriteSuccess", func(t *testing.T) {
 		ts := newTestServer(t)
 		registerNode(t, ts.URL, 1)
@@ -387,7 +479,7 @@ func TestCreateFileOverwrite(t *testing.T) {
 			"inode_id": oldID, "size": 100,
 		}, nil)
 
-		// 覆写。
+		// 覆写：得到一个新的 staging inode（此刻旧版本仍在）。
 		var overwritten struct {
 			Inode struct {
 				ID   uint64 `json:"id"`
@@ -404,7 +496,14 @@ func TestCreateFileOverwrite(t *testing.T) {
 			t.Fatalf("覆写后 inode ID 应变化: 旧 %d == 新 %d", oldID, overwritten.Inode.ID)
 		}
 
-		// 验证 /meta 返回的是新 inode，且 size 重置为 0。
+		// commit 新版本，原子替换旧版本。
+		if resp = postJSON(t, ts.URL+"/files/commit", map[string]any{
+			"inode_id": overwritten.Inode.ID, "size": 42,
+		}, nil); resp.StatusCode != http.StatusOK {
+			t.Fatalf("覆写 commit 状态码 = %d", resp.StatusCode)
+		}
+
+		// 验证 /meta 返回的是新 inode 与新 size。
 		var out struct {
 			Inode struct {
 				ID   uint64 `json:"id"`
@@ -418,8 +517,8 @@ func TestCreateFileOverwrite(t *testing.T) {
 		if out.Inode.ID != overwritten.Inode.ID {
 			t.Fatalf("meta 返回旧 inode: got %d, want %d", out.Inode.ID, overwritten.Inode.ID)
 		}
-		if out.Inode.Size != 0 {
-			t.Fatalf("覆写后 size 应为 0, got %d", out.Inode.Size)
+		if out.Inode.Size != 42 {
+			t.Fatalf("覆写 commit 后 size 应为 42, got %d", out.Inode.Size)
 		}
 	})
 
@@ -442,6 +541,7 @@ func TestCreateFileOverwrite(t *testing.T) {
 	})
 
 	// 场景 3：覆写后旧 inode 在元数据中不存在。
+	// 场景 3：覆写并 commit 后，旧 inode 在元数据中不存在（commit 前旧 inode 仍在）。
 	t.Run("OldInodeGone", func(t *testing.T) {
 		store, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
 		if err != nil {
@@ -466,15 +566,25 @@ func TestCreateFileOverwrite(t *testing.T) {
 		}, &first)
 		oldID := first.Inode.ID
 
-		// 覆写。
+		// 覆写建 staging。commit 前旧 inode 必须仍在（覆盖失败不丢旧数据）。
+		var ow struct {
+			Inode struct {
+				ID uint64 `json:"id"`
+			} `json:"inode"`
+		}
 		postJSON(t, ts.URL+"/files", map[string]any{
 			"path": "/a.txt", "overwrite": true, "replicas": 1,
-		}, nil)
+		}, &ow)
+		if _, err = store.GetInode(oldID); err != nil {
+			t.Fatalf("commit 前旧 inode %d 应仍在: %v", oldID, err)
+		}
 
-		// 直接查询旧 inode，应不存在。
-		_, err = store.GetInode(oldID)
-		if err == nil {
-			t.Fatalf("旧 inode %d 应已被删除", oldID)
+		// commit 新版本 → 原子替换，旧 inode 应被删除。
+		postJSON(t, ts.URL+"/files/commit", map[string]any{
+			"inode_id": ow.Inode.ID, "size": 7,
+		}, nil)
+		if _, err = store.GetInode(oldID); err == nil {
+			t.Fatalf("commit 后旧 inode %d 应已被删除", oldID)
 		}
 	})
 }

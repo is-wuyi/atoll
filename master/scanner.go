@@ -821,6 +821,10 @@ func (s *Scanner) sweepStaging() {
 		for _, c := range in.Chunks {
 			s.notifyDeleteAsync(types.ChunkID(in.ID, c.Index), c.Replicas)
 		}
+		// legacy staging（覆盖写未完成）：单对象按 inode ID 命名，一并回收。
+		if !in.Chunked && len(in.Replicas) > 0 {
+			s.notifyDeleteAsync(in.ID, in.Replicas)
+		}
 		log.Printf("staging 清扫: 回收超时上传 %d（%d 块）", in.ID, len(in.Chunks))
 	}
 }
