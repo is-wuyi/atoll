@@ -827,6 +827,8 @@ type writeHandle struct {
 	dirty   bool
 	created bool // 经 Create 新建：即使 0 字节也要上传（否则 Finder 建的空占位文件凭空消失→-43）
 	dropped bool
+	refs    int   // 引用计数：并发写同一路径共享一个句柄，最后一个 Release 才清理
+	size    int64 // 缓冲的逻辑大小；attr 在本地文件已被删/关时用它兜底，避免误报 0 字节
 
 	// 流式上传会话（仅新建/截断写入时启用；trunc=false 就地编辑为 nil 走旧整传）。
 	// 整块从本地缓冲文件按"连续写入水位"读出后推入，对 FUSE 并发/乱序写鲁棒
@@ -851,6 +853,9 @@ var (
 func (w *writeHandle) Read(_ context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.dropped {
+		return nil, syscall.EIO
+	}
 	nr, err := w.f.ReadAt(dest, off)
 	if err != nil && err != io.EOF {
 		return nil, syscall.EIO
@@ -858,8 +863,23 @@ func (w *writeHandle) Read(_ context.Context, dest []byte, off int64) (fuse.Read
 	return fuse.ReadResultData(dest[:nr]), 0
 }
 
+// dropStreamingLocked 放弃流式会话、回退整传（调用方须持 w.mu）。并发写同一路径共享句柄时，
+// 多写者交错让"连续写入水位"不再可靠，故降级为 Flush 整传；已推 staging 块由 GC/TTL 回收。
+func (w *writeHandle) dropStreamingLocked() {
+	if w.stream != nil {
+		_ = w.stream.Close()
+		w.stream = nil
+	}
+	w.streamOn = false
+	w.sentIdx = 0
+	w.contigEnd = 0
+	w.ooo = nil
+}
+
 // newWriteHandle 建立写缓冲。trunc=true 从空文件开始（启用流式）；
-// 否则先下载现有内容（就地编辑，走旧整传）。
+// 否则先下载现有内容（就地编辑，走旧整传）。同一路径已有活跃写句柄时共享它（引用计数），
+// 而非覆盖 registry——否则旧句柄从 registry 消失：Getattr/Readdir 读到新空缓冲 size 归零、
+// 两句柄各自 commit 后写静默丢失、旧临时文件/staging 泄漏。
 func (m *Mount) newWriteHandle(remote string, trunc bool) (*writeHandle, error) {
 	tmp, err := os.CreateTemp(m.cacheDir, "w-*")
 	if err != nil {
@@ -892,6 +912,28 @@ func (m *Mount) newWriteHandle(remote string, trunc bool) (*writeHandle, error) 
 		}
 	}
 	m.mu.Lock()
+	if existing, ok := m.writes[remote]; ok {
+		existing.mu.Lock()
+		if !existing.dropped {
+			existing.refs++
+			existing.dropStreamingLocked() // 共享后降级整传，交错写不漏块
+			if trunc {
+				_ = existing.f.Truncate(0)
+				existing.size = 0
+				existing.dirty = true
+			}
+			existing.mu.Unlock()
+			m.mu.Unlock()
+			w.f.Close()
+			os.Remove(w.local) // 丢弃本次多建的临时文件
+			return existing, nil
+		}
+		existing.mu.Unlock()
+	}
+	w.refs = 1
+	if st, serr := w.f.Stat(); serr == nil {
+		w.size = st.Size()
+	}
 	m.writes[remote] = w
 	m.mu.Unlock()
 	return w, nil
@@ -918,11 +960,17 @@ func (w *writeHandle) startStream() error {
 func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.dropped {
+		return 0, syscall.EIO // 句柄已被 Unlink/Release 丢弃：拒绝对已关闭 fd 写入
+	}
 	n, err := w.f.WriteAt(data, off)
 	if err != nil {
 		return 0, syscall.EIO
 	}
 	w.dirty = true
+	if off+int64(n) > w.size {
+		w.size = off + int64(n)
+	}
 	// 回写到"已作为整块推送过"的区域（off < sentIdx）：推出去的块内容已过期、且无法
 	// 重推 → 放弃流式，回退整传（Flush 从完整本地文件重传），绝不提交旧数据。
 	if w.streamOn && w.stream != nil && off < w.sentIdx {
@@ -1059,11 +1107,17 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	return 0
 }
 
-// Release 清理本地缓冲与注册表（只执行一次）。流式会话若未 Finish（异常关闭）
-// 则 abort——staging 由 master TTL 兜底回收，已传块对象由 GC 两轮确认清理。
+// Release 清理本地缓冲与注册表。并发写共享句柄时用引用计数：仅最后一个 Release 真正清理；
+// 流式会话若未 Finish（异常关闭）则 abort——staging 由 master TTL 兜底回收，已传块对象由
+// GC 两轮确认清理。关文件与删临时文件在 w.mu 内完成，避免与并发 Write/attr 竞争已关 fd。
 func (w *writeHandle) Release(_ context.Context) syscall.Errno {
 	w.mu.Lock()
 	if w.dropped {
+		w.mu.Unlock()
+		return 0
+	}
+	if w.refs > 1 {
+		w.refs-- // 还有其他 fd 共享该句柄，暂不清理
 		w.mu.Unlock()
 		return 0
 	}
@@ -1072,9 +1126,9 @@ func (w *writeHandle) Release(_ context.Context) syscall.Errno {
 		_ = w.stream.Close() // 未 Finish 的会话：abort staging
 		w.stream = nil
 	}
-	w.mu.Unlock()
 	w.f.Close()
 	os.Remove(w.local)
+	w.mu.Unlock()
 	w.m.mu.Lock()
 	if cur, ok := w.m.writes[w.remote]; ok && cur == w {
 		delete(w.m.writes, w.remote)
@@ -1083,7 +1137,8 @@ func (w *writeHandle) Release(_ context.Context) syscall.Errno {
 	return 0
 }
 
-// discard 丢弃缓冲（Unlink 写入中文件时用），不触发上传。
+// discard 丢弃缓冲（Unlink 写入中文件时用），不触发上传。unlink 是破坏性意图，
+// 无视引用计数直接丢弃；其他共享 fd 的后续读写会被 dropped 守卫挡回 EIO。
 func (w *writeHandle) discard() {
 	w.mu.Lock()
 	if w.dropped {
@@ -1096,14 +1151,17 @@ func (w *writeHandle) discard() {
 		_ = w.stream.Close() // abort staging（预建 staging 后被 unlink：别泄漏）
 		w.stream = nil
 	}
-	w.mu.Unlock()
 	w.f.Close()
 	os.Remove(w.local)
+	w.mu.Unlock()
 }
 
 func (w *writeHandle) truncate(size uint64) syscall.Errno {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.dropped {
+		return syscall.EIO
+	}
 	sz := int64(size)
 	// Finder 拷贝会先 ftruncate 到完整大小做预分配，再顺序写。这属于"增长/预分配"，
 	// 与流式并不冲突——若在此放弃流式，整份文件就退回 close 时整传、大文件必然把
@@ -1127,6 +1185,7 @@ func (w *writeHandle) truncate(size uint64) syscall.Errno {
 	if err := w.f.Truncate(sz); err != nil {
 		return syscall.EIO
 	}
+	w.size = sz
 	w.dirty = true
 	return 0
 }
@@ -1157,18 +1216,21 @@ func (h *localReadHandle) Release(_ context.Context) syscall.Errno {
 }
 
 // attr 把本地缓冲文件的属性填入 fuse.Attr。st_ino 用 inoFor（与远端 ID 解耦）。
+// 在 w.mu 内取属性：本地文件已被并发 Release/discard 关闭删除时，退回记录的逻辑大小 w.size，
+// 而不是让 os.Stat 失败后误报 0 字节（Finder "文件突然变 0 字节" 的来源）。
 func (w *writeHandle) attr(a *fuse.Attr) {
-	st, err := os.Stat(w.local)
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	a.Uid = uint32(os.Getuid())
 	a.Gid = uint32(os.Getgid())
 	a.Ino = w.m.inoFor(w.remote)
-	if err != nil {
-		a.Mode = fuse.S_IFREG | 0o644
-		return
-	}
-	a.Size = uint64(st.Size())
 	a.Mode = fuse.S_IFREG | 0o644
-	a.Mtime = uint64(st.ModTime().Unix())
+	if st, err := os.Stat(w.local); err == nil && !w.dropped {
+		a.Size = uint64(st.Size())
+		a.Mtime = uint64(st.ModTime().Unix())
+	} else {
+		a.Size = uint64(w.size)
+	}
 }
 
 // ---- DirStream 简单切片实现 ----
