@@ -12,8 +12,8 @@ package mount
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"math/rand"
 	"net/http"
@@ -56,6 +56,11 @@ type Mount struct {
 	statfsAt   time.Time
 	statfsTot  int64
 	statfsUsed int64
+
+	// st_ino 注册表：路径 → 稳定本地 inode 号（与远端 ID 解耦，见 inode.go）。
+	inoMu     sync.Mutex
+	inoByPath map[string]uint64
+	nextIno   uint64
 }
 
 type attrCacheEntry struct {
@@ -86,6 +91,8 @@ func NewWithTLS(c *client.Client, cacheDir string, replicas int, token auth.Toke
 		writes:   make(map[string]*writeHandle),
 		attrTTL:  2 * time.Second,
 		attrs:    make(map[string]attrCacheEntry),
+		inoByPath: make(map[string]uint64),
+		nextIno:   localInoBase,
 	}, nil
 }
 
@@ -176,25 +183,16 @@ func (n *node) newChildNode(ctx context.Context, ino uint64, mode uint32) *fs.In
 	return n.NewInode(ctx, &node{m: n.m}, fs.StableAttr{Ino: ino, Mode: mode})
 }
 
-// syntheticIno 为"写入中、尚无 master inode ID"的文件生成稳定且不与真实 ID 冲突的号。
-// 最高位置 1：真实 atoll ID（legacy < 2^32、块对象 ≈ staging<<8）都远低于 2^63，
-// 故这个高位区间专属于 in-progress 文件，既稳定（同路径恒定）又避免与真实 ID 碰撞。
-// 此前这些文件报 Ino=0，由 go-fuse 自增分配——号会在 lookup 间变化，且与真实 ID 同域可能撞。
-func syntheticIno(path string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(path))
-	return (1 << 63) | (h.Sum64() >> 1)
-}
-
-// fillEntry 把 master 的 inode 属性填入 EntryOut/AttrOut。
-func fillEntry(a *fuse.Attr, in *types.Inode) {
+// fillEntry 把 master 的 inode 属性填入 EntryOut/AttrOut。st_ino 由调用方传入（inoFor，
+// 与远端 ID 解耦，覆盖写/改名不翻转，见 inode.go）；远端 ID 只用于数据寻址、不作 st_ino。
+func fillEntry(a *fuse.Attr, in *types.Inode, ino uint64) {
 	if in.Type == types.TypeDir {
 		a.Mode = fuse.S_IFDIR | 0o755
 	} else {
 		a.Mode = fuse.S_IFREG | 0o644
 		a.Size = uint64(in.Size)
 	}
-	a.Ino = in.ID
+	a.Ino = ino
 	a.Mtime = uint64(in.Mtime.Unix())
 	// 报告挂载进程的 uid/gid：否则内核视为 root 所有，
 	// 普通用户在挂载点上无写权限（曾导致 mac 上写入 permission denied）。
@@ -216,9 +214,9 @@ func (n *node) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) sy
 	}
 	in, err := n.m.lookupCached(remote)
 	if err != nil {
-		return syscall.ENOENT
+		return mapErrno(err)
 	}
-	fillEntry(&out.Attr, &in)
+	fillEntry(&out.Attr, &in, n.m.inoFor(remote))
 	return 0
 }
 
@@ -231,25 +229,28 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	n.m.mu.Unlock()
 	if w != nil {
 		w.attr(&out.Attr)
-		return n.newChildNode(ctx, w.inoOrSynthetic(), fuse.S_IFREG), 0
+		return n.newChildNode(ctx, n.m.inoFor(remote), fuse.S_IFREG), 0
 	}
 	in, err := n.m.lookupCached(remote)
 	if err != nil {
-		return nil, syscall.ENOENT
+		return nil, mapErrno(err)
 	}
-	fillEntry(&out.Attr, &in)
+	fillEntry(&out.Attr, &in, n.m.inoFor(remote))
 	mode := uint32(fuse.S_IFREG)
 	if in.Type == types.TypeDir {
 		mode = fuse.S_IFDIR
 	}
-	return n.newChildNode(ctx, in.ID, mode), 0
+	return n.newChildNode(ctx, n.m.inoFor(remote), mode), 0
 }
 
 func (n *node) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 	dir := n.path()
 	kids, err := n.m.client.Ls(dir)
 	if err != nil {
-		return nil, syscall.ENOENT
+		// 网络抖动/瞬时故障不是"目录不存在"。此前一律返回 ENOENT，会让内核把目录
+		// 判为消失（并对 ENOENT 走负缓存），复制中的目录内容整段变空。按错误类型映射：
+		// 真 404 才 ENOENT，传输错误/5xx → EIO（可重试），语义正确。
+		return nil, mapErrno(err)
 	}
 	// 关键优化：/dirs/children 已返回每个子项的完整 inode，趁机批量填进属性缓存。
 	// 内核紧接着对每个条目发的 Lookup/Getattr 就直接命中，省掉 N 次跨网 /meta 往返。
@@ -262,7 +263,7 @@ func (n *node) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 		if k.Type == types.TypeDir {
 			mode = fuse.S_IFDIR
 		}
-		entries = append(entries, fuse.DirEntry{Name: k.Name, Mode: mode, Ino: k.ID})
+		entries = append(entries, fuse.DirEntry{Name: k.Name, Mode: mode, Ino: n.m.inoFor(strings.TrimSuffix(dir, "/") + "/" + k.Name)})
 		n.m.attrPut(strings.TrimSuffix(dir, "/")+"/"+k.Name, k)
 	}
 	// 流式上传中的文件（活跃写句柄）合并进目录列表：staging 在 master 目录里
@@ -271,7 +272,7 @@ func (n *node) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 	// 内核对它的后续 Lookup/Getattr 走 writes 表，属性=本地缓冲实时大小。
 	prefix := strings.TrimSuffix(dir, "/") + "/"
 	n.m.mu.Lock()
-	for remote, w := range n.m.writes {
+	for remote := range n.m.writes {
 		if !strings.HasPrefix(remote, prefix) {
 			continue
 		}
@@ -282,7 +283,7 @@ func (n *node) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 		if seen[name] {
 			continue
 		}
-		entries = append(entries, fuse.DirEntry{Name: name, Mode: fuse.S_IFREG, Ino: w.inoOrSynthetic()})
+		entries = append(entries, fuse.DirEntry{Name: name, Mode: fuse.S_IFREG, Ino: n.m.inoFor(remote)})
 	}
 	n.m.mu.Unlock()
 	return &sliceDirStream{entries: entries}, 0
@@ -294,8 +295,8 @@ func (n *node) Mkdir(ctx context.Context, name string, _ uint32, out *fuse.Entry
 		return nil, mapErrno(err)
 	}
 	n.m.attrPut(n.remotePath(name), dir)
-	fillEntry(&out.Attr, &dir)
-	return n.newChildNode(ctx, dir.ID, fuse.S_IFDIR), 0
+	fillEntry(&out.Attr, &dir, n.m.inoFor(n.remotePath(name)))
+	return n.newChildNode(ctx, n.m.inoFor(n.remotePath(name)), fuse.S_IFDIR), 0
 }
 
 func (n *node) Unlink(_ context.Context, name string) syscall.Errno {
@@ -312,6 +313,7 @@ func (n *node) Unlink(_ context.Context, name string) syscall.Errno {
 		return errno
 	}
 	n.m.attrInvalidate(remote)
+	n.m.dropIno(remote) // 删后重建视为新文件（新 inode 号，符合 POSIX）
 	n.m.mu.Lock()
 	if cur, ok := n.m.writes[remote]; ok && cur == w {
 		delete(n.m.writes, remote)
@@ -328,6 +330,7 @@ func (n *node) Rmdir(_ context.Context, name string) syscall.Errno {
 		return mapErrno(err)
 	}
 	n.m.attrInvalidate(n.remotePath(name))
+	n.m.dropIno(n.remotePath(name))
 	return 0
 }
 
@@ -350,6 +353,7 @@ func (n *node) Rename(_ context.Context, name string, newParent fs.InodeEmbedder
 	}
 	n.m.attrInvalidate(oldRemote)
 	n.m.attrInvalidate(newRemote)
+	n.m.renameIno(oldRemote, newRemote) // inode 号随文件迁到新路径，改名不翻转 st_ino
 	// 写入中的缓冲文件跟随改名。
 	n.m.mu.Lock()
 	if w, ok := n.m.writes[oldRemote]; ok {
@@ -393,18 +397,18 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 	if writeIntent {
 		if w == nil {
 			if _, _, err := n.m.client.Lookup(remote); err != nil {
-				return nil, 0, syscall.ENOENT
+				return nil, 0, mapErrno(err)
 			}
 		}
 		w, err := n.m.newWriteHandle(remote, flags&syscall.O_TRUNC != 0)
 		if err != nil {
-			return nil, 0, syscall.EIO
+			return nil, 0, mapErrno(err)
 		}
 		return w, 0, 0
 	}
 	in, reps, err := n.m.client.Lookup(remote)
 	if err != nil {
-		return nil, 0, syscall.ENOENT
+		return nil, 0, mapErrno(err)
 	}
 	hc := &http.Client{
 		Timeout:   30 * time.Second,
@@ -452,16 +456,11 @@ func (n *node) Create(ctx context.Context, name string, _ uint32, _ uint32, out 
 	// 这个空文件不存在（我们没上传 0 字节文件）就判定失败弹 -43。故新建的空文件也要上传。
 	w.created = true
 	w.streamOn = true
-	// 立即建 staging，用它的 ID 作节点 st_ino。commit 走原子换名保留该 ID，
-	// 故写入中与提交后 ino 一致——否则合成 ino≠提交后真实 ID，go-fuse 把 GETATTR
-	// 的 ino 强制成建节点时的合成值，Finder 认不出这个文件、拷贝一直不收尾（⊗）。
-	// 建 staging 失败（网络抖动）只退化用合成 ino，不阻断创建。
-	ino := syntheticIno(n.remotePath(name))
-	if err := w.startStream(); err == nil {
-		ino = w.ino
-	}
+	// 预建 staging：其 ID 供数据寻址/流式上传用；staging 失败（网络抖动）只记 nil，不阻断创建。
+	// st_ino 一律用 inoFor（与远端 ID 解耦），故建 staging 成功与否都不影响 inode 稳定性。
+	_ = w.startStream()
 	w.attr(&out.Attr)
-	return n.newChildNode(ctx, ino, fuse.S_IFREG), w, 0, 0
+	return n.newChildNode(ctx, n.m.inoFor(n.remotePath(name)), fuse.S_IFREG), w, 0, 0
 }
 
 // Setattr 处理 truncate（打开的写句柄）；其余属性修改忽略。
@@ -501,7 +500,7 @@ func (n *node) Setattr(_ context.Context, f fs.FileHandle, in *fuse.SetAttrIn, o
 		return 0
 	}
 	if in2, err := n.m.lookupCached(remote); err == nil {
-		fillEntry(&out.Attr, &in2)
+		fillEntry(&out.Attr, &in2, n.m.inoFor(remote))
 	}
 	return 0
 }
@@ -584,21 +583,37 @@ func candidateAddrs(reps []client.Replica) []string {
 }
 
 // mapErrno 把 client 错误映射为 errno。
+// mapErrno 把 client 错误映射成 errno。优先按 HTTP 状态码判定（权威），传输层/未知错误
+// 一律 EIO——绝不臆断成 ENOENT：网络瞬断报 ENOENT 会让内核对该路径走负缓存、文件"消失"。
 func mapErrno(err error) syscall.Errno {
 	if err == nil {
 		return 0
 	}
-	msg := err.Error()
-	switch {
-	case strings.Contains(msg, "not found"):
-		return syscall.ENOENT
-	case strings.Contains(msg, "already exists"):
-		return syscall.EEXIST
-	case strings.Contains(msg, "not empty"):
-		return syscall.ENOTEMPTY
-	default:
-		return syscall.EIO
+	var he *client.HTTPError
+	if errors.As(err, &he) {
+		switch he.StatusCode {
+		case http.StatusNotFound:
+			return syscall.ENOENT
+		case http.StatusConflict:
+			if strings.Contains(he.Message, "not empty") {
+				return syscall.ENOTEMPTY
+			}
+			return syscall.EEXIST
+		case http.StatusBadRequest:
+			if strings.Contains(he.Message, "not empty") {
+				return syscall.ENOTEMPTY
+			}
+			return syscall.EIO
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return syscall.EACCES
+		case http.StatusInsufficientStorage:
+			return syscall.ENOSPC
+		default:
+			return syscall.EIO
+		}
 	}
+	// 传输层错误（超时/dial 失败/连接重置等）：瞬时故障，EIO 让内核可重试，不负缓存。
+	return syscall.EIO
 }
 
 // ---- 读句柄：按 Range 请求读取，故障切换 ----
@@ -1141,12 +1156,12 @@ func (h *localReadHandle) Release(_ context.Context) syscall.Errno {
 	return 0
 }
 
-// attr 把本地缓冲文件的属性填入 fuse.Attr。
+// attr 把本地缓冲文件的属性填入 fuse.Attr。st_ino 用 inoFor（与远端 ID 解耦）。
 func (w *writeHandle) attr(a *fuse.Attr) {
 	st, err := os.Stat(w.local)
 	a.Uid = uint32(os.Getuid())
 	a.Gid = uint32(os.Getgid())
-	a.Ino = w.inoOrSynthetic()
+	a.Ino = w.m.inoFor(w.remote)
 	if err != nil {
 		a.Mode = fuse.S_IFREG | 0o644
 		return
@@ -1154,14 +1169,6 @@ func (w *writeHandle) attr(a *fuse.Attr) {
 	a.Size = uint64(st.Size())
 	a.Mode = fuse.S_IFREG | 0o644
 	a.Mtime = uint64(st.ModTime().Unix())
-}
-
-// inoOrSynthetic 优先用 staging ID（= 提交后 ID），未建 staging 时退化为合成 ino。
-func (w *writeHandle) inoOrSynthetic() uint64 {
-	if w.ino != 0 {
-		return w.ino
-	}
-	return syntheticIno(w.remote)
 }
 
 // ---- DirStream 简单切片实现 ----

@@ -717,6 +717,19 @@ func (c *Client) getJSON(path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// HTTPError 保留 HTTP 状态码，调用方不必从错误文案猜测错误类型。
+type HTTPError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *HTTPError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("http %d: %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("http %d", e.StatusCode)
+}
+
 // statusError 把非 2xx 响应转成带 master 错误信息的 error。
 func statusError(resp *http.Response) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -726,9 +739,9 @@ func statusError(resp *http.Response) error {
 		Error string `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&e); err == nil && e.Error != "" {
-		return fmt.Errorf("http %d: %s", resp.StatusCode, e.Error)
+		return &HTTPError{StatusCode: resp.StatusCode, Message: e.Error}
 	}
-	return fmt.Errorf("http %d", resp.StatusCode)
+	return &HTTPError{StatusCode: resp.StatusCode}
 }
 
 // queryPath 构造 path=... 查询串。

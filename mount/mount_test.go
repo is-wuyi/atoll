@@ -78,20 +78,24 @@ func TestCandidateAddrs(t *testing.T) {
 	}
 }
 
-// 纯函数：mapErrno 错误映射。
+// 纯函数：mapErrno 按 HTTP 状态码映射（传输层错误一律 EIO，不臆断 ENOENT）。
 func TestMapErrno(t *testing.T) {
 	cases := []struct {
-		msg  string
+		err  error
 		want syscall.Errno
 	}{
-		{"http 404: path not found", syscall.ENOENT},
-		{"http 409: already exists", syscall.EEXIST},
-		{"http 400: directory not empty", syscall.ENOTEMPTY},
-		{"http 500: boom", syscall.EIO},
+		{&client.HTTPError{StatusCode: 404, Message: "path not found"}, syscall.ENOENT},
+		{&client.HTTPError{StatusCode: 409, Message: "already exists"}, syscall.EEXIST},
+		{&client.HTTPError{StatusCode: 400, Message: "directory not empty"}, syscall.ENOTEMPTY},
+		{&client.HTTPError{StatusCode: 401, Message: "unauthorized"}, syscall.EACCES},
+		{&client.HTTPError{StatusCode: 507, Message: "no space"}, syscall.ENOSPC},
+		{&client.HTTPError{StatusCode: 500, Message: "boom"}, syscall.EIO},
+		{fmt.Errorf("dial tcp: i/o timeout"), syscall.EIO},         // 传输错误 → EIO
+		{fmt.Errorf("lookup host: server not found"), syscall.EIO}, // 含 "not found" 也不误判 ENOENT
 	}
 	for _, c := range cases {
-		if got := mapErrno(fmt.Errorf("%s", c.msg)); got != c.want {
-			t.Errorf("mapErrno(%q) = %v, want %v", c.msg, got, c.want)
+		if got := mapErrno(c.err); got != c.want {
+			t.Errorf("mapErrno(%v) = %v, want %v", c.err, got, c.want)
 		}
 	}
 }
