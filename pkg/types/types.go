@@ -69,11 +69,19 @@ type Inode struct {
 	// Target 仅符号链接（Type=TypeSymlink）使用：链接目标原样存储（可为相对/悬空）。
 	// 符号链接无副本无对象，Size 恒 0，FUSE 层用 len(Target) 作 st_size。
 	Target string `json:"target,omitempty"`
+	// Generation 是内容版本计数（v2 文件模型：身份与内容分离）：
+	// 0 = v1 时代写入的旧内容；首次 chunked 提交置 1；此后每次覆盖写（采纳式替换）+1。
+	// FileID 在覆盖写/rename 间保持稳定，Generation 是区分"同一文件的哪一版内容"的依据。
+	Generation uint64 `json:"generation,omitempty"`
 }
 
 // ChunkInfo 是分块文件的一个块。
 type ChunkInfo struct {
 	Index int `json:"index"`
+	// ID 是块对象的实际存储 ID。v2 采纳式替换后文件 ID 不再是块 ID 前缀
+	// （覆盖写保留 FileID，新内容的块对象挂在 staging 派生的 ID 上），
+	// 故块表必须自描述；0 = 旧数据，按 (所属inodeID<<8)|Index 派生（v1 兼容）。
+	ID uint64 `json:"id,omitempty"`
 	// Size 块实际字节数（末块可以小于 ChunkSize）。
 	Size int64 `json:"size"`
 	// Replicas 该块的目标副本节点 ID（第一个为主副本）。
@@ -117,6 +125,16 @@ func ChunkID(inodeID uint64, index int) uint64 {
 // ParseChunkID 从对象 ID 反解出 inode ID 与块下标。
 func ParseChunkID(id uint64) (inodeID uint64, index int) {
 	return id >> chunkIndexBits, int(id & ((1 << chunkIndexBits) - 1))
+}
+
+// ChunkObjID 返回块的实际对象 ID：显式 ID 优先（v2 块表自描述），
+// 否则按 v1 规则从所属 inode ID 派生（旧数据兼容）。所有读/校验/回收路径统一走这里，
+// 不得自行 ChunkID(inodeID, index) 派生——采纳式替换后两者不再相等。
+func ChunkObjID(c ChunkInfo, ownerInodeID uint64) uint64 {
+	if c.ID != 0 {
+		return c.ID
+	}
+	return ChunkID(ownerInodeID, c.Index)
 }
 
 // NodeInfo 是一个存储节点的注册信息与运行状态。

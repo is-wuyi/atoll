@@ -432,15 +432,17 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 			if !ok || time.Since(n.LastHeartbeat) > s.nodeMaxAge {
 				continue
 			}
-			chunkID := types.ChunkID(in.ID, c.Index)
+			chunkID := types.ChunkObjID(c, in.ID)
 			if s.probeChunkObject(n.Addr, chunkID) {
-				_ = s.store.MarkChunkDone(chunkID, id)
+				// 采纳式替换后对象 ID 前缀不再是文件 ID，必须按文件记录补标
+				//（MarkChunkDone 的对象 ID 反查在此处查不到已删除的 staging）。
+				_ = s.store.MarkChunkDoneAt(in.ID, c.Index, id)
 				log.Printf("inode %d chunk %d: 探测兜底——副本 %d 对象在而未标 Done，补标", in.ID, c.Index, id)
 			}
 		}
 	}
 	for _, c := range in.Chunks {
-		chunkID := types.ChunkID(in.ID, c.Index)
+		chunkID := types.ChunkObjID(c, in.ID)
 		// 单副本窗口告警（改进项2）：块存活副本数（Done 且节点 alive）< len(Replicas)
 		// 持续超过阈值 → WARN 一次；恢复 → INFO + 清记录。失败告警期间用户至少知道
 		// 哪些块在裸奔（27472 宕机事故的教训：3 块单副本裸奔近 1 小时无人知晓）。
@@ -469,7 +471,7 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 		}
 		s.bumpRepairBackoff(chunkID)
 		for _, t := range tasks {
-			s.executeChunkRepair(in.ID, c.Index, t)
+			s.executeChunkRepair(chunkID, in.ID, c.Index, t)
 		}
 	}
 }
@@ -537,14 +539,14 @@ func (s *Scanner) trackDegraded(id uint64, healthy, want int, now time.Time, des
 }
 
 // executeChunkRepair 执行单个块的修复任务（与 executeRepair 同构，写路径换块级 API）。
-func (s *Scanner) executeChunkRepair(inodeID uint64, index int, t repairTask) {
+// chunkID 由调用方按 ChunkObjID 解析（显式 ID 优先）——采纳式替换后不能从文件 ID 派生。
+func (s *Scanner) executeChunkRepair(chunkID, inodeID uint64, index int, t repairTask) {
 	switch t.Action {
 	case repairSkipNoSource:
 		log.Printf("inode %d chunk %d: 无可用源节点，跳过", inodeID, index)
 	case repairSkipNoTarget:
 		log.Printf("inode %d chunk %d: 无合格新目标（dead node %d），跳过", inodeID, index, t.OldNodeID)
 	case repairReplaceDead:
-		chunkID := types.ChunkID(inodeID, index)
 		if !s.probeSource(t.SourceAddr, chunkID) {
 			log.Printf("inode %d chunk %d: 源 %s 上对象缺失（404），跳过修复", inodeID, index, t.SourceAddr)
 			return
@@ -559,7 +561,6 @@ func (s *Scanner) executeChunkRepair(inodeID uint64, index int, t repairTask) {
 		log.Printf("inode %d chunk %d: 替换 dead node %d → %d，触发 pull", inodeID, index, t.OldNodeID, t.NewNodeID)
 		s.triggerPull(t.NewNodeAddr, chunkID, t.SourceAddr, t.Checksum)
 	case repairTriggerPull:
-		chunkID := types.ChunkID(inodeID, index)
 		if !s.probeSource(t.SourceAddr, chunkID) {
 			log.Printf("inode %d chunk %d: 源 %s 上对象缺失（404），跳过 pull", inodeID, index, t.SourceAddr)
 			return
@@ -732,12 +733,14 @@ func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
 	}
 	cutoff := time.Now().Add(-s.nodeMaxAge)
 
-	// 收集全部有效对象 ID：legacy 文件自身 ID + 分块文件的块 ID（含 staging 块）。
+	// 收集全部有效对象 ID：legacy 文件自身 ID + 分块文件的块对象 ID（含 staging 块）。
+	// 块 ID 必须走 ChunkObjID（显式 ID 优先）——采纳式替换后文件 ID 不再是块 ID 前缀，
+	// 按文件 ID 派生会标错对象：现役块不被保护（GC 误删）+ 已回收块被误保护。
 	validIDs := make(map[uint64]bool)
 	if err := s.store.ForEachFile(func(in types.Inode) error {
 		if in.Chunked {
 			for _, c := range in.Chunks {
-				validIDs[types.ChunkID(in.ID, c.Index)] = true
+				validIDs[types.ChunkObjID(c, in.ID)] = true
 			}
 		} else {
 			validIDs[in.ID] = true
@@ -819,7 +822,7 @@ func (s *Scanner) sweepStaging() {
 			continue
 		}
 		for _, c := range in.Chunks {
-			s.notifyDeleteAsync(types.ChunkID(in.ID, c.Index), c.Replicas)
+			s.notifyDeleteAsync(types.ChunkObjID(c, in.ID), c.Replicas)
 		}
 		// legacy staging（覆盖写未完成）：单对象按 inode ID 命名，一并回收。
 		if !in.Chunked && len(in.Replicas) > 0 {

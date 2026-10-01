@@ -580,7 +580,7 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 	rand.Shuffle(len(primary), func(i, j int) { primary[i], primary[j] = primary[j], primary[i] })
 	candidates := append(append([]uint64{}, primary...), fallback...)
 
-	chunkID := types.ChunkID(inodeID, ch.Index)
+	chunkID := types.ChunkObjID(ch, inodeID) // v2 块表自描述 ID 优先（采纳式替换后不可派生）
 	var lastErr error
 	for _, id := range candidates {
 		a, ok := addr[id]

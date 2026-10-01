@@ -759,7 +759,7 @@ func (ch *chunkedReadHandle) readChunkRange(c types.ChunkInfo, start, end int64)
 	rand.Shuffle(len(primary), func(i, j int) { primary[i], primary[j] = primary[j], primary[i] })
 	candidates := append(append([]uint64{}, primary...), pending...)
 
-	chunkID := types.ChunkID(ch.ino, c.Index)
+	chunkID := types.ChunkObjID(c, ch.ino) // v2 块表自描述 ID 优先（采纳式替换后不可派生）
 	ch.mu.Lock()
 	next := ch.next[c.Index]
 	ch.mu.Unlock()

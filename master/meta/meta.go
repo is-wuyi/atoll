@@ -639,7 +639,13 @@ func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []ui
 				return nil
 			}
 		}
-		in.Chunks = append(in.Chunks, types.ChunkInfo{Index: index, Size: size, Replicas: replicas, Checksum: checksum})
+		in.Chunks = append(in.Chunks, types.ChunkInfo{
+			ID:       types.ChunkID(inodeID, index), // v2：块表自描述对象 ID
+			Index:    index,
+			Size:     size,
+			Replicas: replicas,
+			Checksum: checksum,
+		})
 		// 并发 Assign 可能乱序插入，保持块表按 Index 升序。
 		sort.Slice(in.Chunks, func(i, j int) bool { return in.Chunks[i].Index < in.Chunks[j].Index })
 		// 刷新 Mtime：staging TTL 据此判"多久没活动"。此前锚定创建时间，
@@ -677,6 +683,9 @@ func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64, chec
 			if in.Chunks[i].Index == index {
 				in.Chunks[i].Replicas = replicas
 				in.Chunks[i].Done = nil
+				if in.Chunks[i].ID == 0 {
+					in.Chunks[i].ID = types.ChunkID(inodeID, index) // v1 数据补齐自描述 ID
+				}
 				if checksum != 0 {
 					in.Chunks[i].Checksum = checksum
 				}
@@ -695,6 +704,9 @@ func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64, chec
 
 // MarkChunkDone 把 nodeID 记入块 Done 集合（块对象落盘完成上报，幂等）。
 // chunkID 由 types.ChunkID 编码；commit 前后调用均合法。
+// 注意：采纳式替换后块对象 ID 的前缀（staging ID）不再是文件 ID——此接口按对象 ID
+// 反查所属 inode，适用于"staging 仍存在"的窗口；staging 已被采纳删除的迟到上报会返回
+// ErrChunkNotExist（无害，scanner 的探测兜底按文件记录补标，见 MarkChunkDoneAt）。
 func (s *Store) MarkChunkDone(chunkID, nodeID uint64) error {
 	inodeID, index := types.ParseChunkID(chunkID)
 	return s.write(func(w *txw) error {
@@ -716,6 +728,32 @@ func (s *Store) MarkChunkDone(chunkID, nodeID uint64) error {
 				in.Chunks[i].Done = appendUnique(in.Chunks[i].Done, nodeID)
 				return w.putInode(&in)
 			}
+		}
+		return ErrChunkNotExist
+	})
+}
+
+// MarkChunkDoneAt 按文件记录直接把 nodeID 记入指定块的 Done 集合（scanner 探测兜底用）。
+// 与 MarkChunkDone 的区别：不依赖"对象 ID 前缀 = 所属 inode ID"的推导——采纳式替换后
+// 块对象挂在 staging 派生的 ID 上，对象 ID 反查不到文件，必须持有文件记录原地补标。
+func (s *Store) MarkChunkDoneAt(inodeID uint64, index int, nodeID uint64) error {
+	return s.write(func(w *txw) error {
+		in, err := getInodeTx(w.tx, inodeID)
+		if err != nil {
+			return err
+		}
+		if !in.Chunked {
+			return ErrChunkNotExist
+		}
+		for i := range in.Chunks {
+			if in.Chunks[i].Index != index {
+				continue
+			}
+			if !types.ContainsUint64(in.Chunks[i].Replicas, nodeID) {
+				return nil // 成员资格校验同 MarkChunkDone
+			}
+			in.Chunks[i].Done = appendUnique(in.Chunks[i].Done, nodeID)
+			return w.putInode(&in)
 		}
 		return ErrChunkNotExist
 	})
@@ -823,10 +861,16 @@ func (s *Store) ReplaceChunkReplica(inodeID uint64, index int, oldNodeID, newNod
 	})
 }
 
-// CommitStagingFile 校验并单事务原子提交：
-// 每块主副本 Done 且 Σ块大小 = size → 同名旧 inode 一并删除 → staging 换名挂 children。
-// 事务前读者看到旧版本，事务后看到新版本——不存在中间态（审计 #1）。
-// 返回提交后的 inode 与被替换的旧 inode（ok=false 表示无旧版本）。
+// CommitStagingFile 校验并单事务原子提交（v2 采纳式替换）：
+// 每块主副本 Done 且 Σ块大小 = size → 原子发布内容。
+//   - 目标无同名条目：staging 转正为新文件（FileID = staging ID，Generation=1）。
+//   - 同名是文件（TypeFile）：**采纳式替换**——保留旧文件的 FileID/children 条目，
+//     原子换入 staging 的块表（Size/Mtime/Generation++），删除 staging。覆盖写不再
+//     "删旧建新"，文件身份跨覆盖稳定（FUSE st_ino、打开句柄、外部引用不再被换掉）。
+//     返回的 old 是被替换前的旧内容快照，供调用方回收旧块对象。
+//   - 同名是目录：拒绝；是符号链接等其他条目：保留旧替换语义（删旧、staging 占名）。
+//
+// 事务前读者看到旧版本，事务后看到新版本——不存在中间态。
 func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (types.Inode, types.Inode, bool, error) {
 	if err := validateName(name); err != nil {
 		return types.Inode{}, types.Inode{}, false, err
@@ -867,24 +911,50 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 		if parent.Type != types.TypeDir {
 			return ErrNotDir
 		}
-		// 同名旧 inode：目录则拒绝覆盖，文件则同事务删除（原子替换）。
+		// 同名旧条目：按类型分派替换语义。
 		if oldID := w.tx.Bucket(bucketChildren).Get(childKey(in.ParentID, name)); oldID != nil {
 			old, err = getInodeTx(w.tx, beU64(oldID))
 			if err != nil {
 				return err
 			}
-			if old.Type == types.TypeDir {
+			switch {
+			case old.Type == types.TypeDir:
 				return ErrExist
+			case old.Type == types.TypeFile:
+				// 采纳式替换：身份保留，内容换成 staging 的块表。
+				// old 保持为替换前快照（调用方回收旧对象用），不在此处修改。
+				adopted := old
+				adopted.Chunked = true
+				adopted.Chunks = in.Chunks
+				adopted.Size = size
+				adopted.Checksum = 0 // chunked 内容校验和在每块的 ChunkInfo 里
+				adopted.Replicas = nil
+				adopted.DoneReplicas = nil
+				adopted.Mtime = time.Now()
+				adopted.Generation++
+				if err := w.putInode(&adopted); err != nil {
+					return err
+				}
+				if err := w.delInode(in.ID); err != nil {
+					return err
+				}
+				out = adopted
+				hadOld = true
+				return nil
+			default:
+				// 符号链接等非文件条目：删除旧条目，staging 以新身份占名。
+				if err := w.delInode(old.ID); err != nil {
+					return err
+				}
+				hadOld = true
 			}
-			if err := w.delInode(old.ID); err != nil {
-				return err
-			}
-			hadOld = true
 		}
+		// 新文件路径（含非文件条目替换）：staging 转正。
 		in.Name = name
 		in.Size = size
 		in.Staging = false
 		in.Mtime = time.Now()
+		in.Generation = 1
 		if err := w.putInode(&in); err != nil {
 			return err
 		}

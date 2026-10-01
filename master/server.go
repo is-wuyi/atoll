@@ -657,11 +657,11 @@ func (s *Server) handleAbortStaging(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// reclaimChunkObjects 异步通知各节点删除 inode 全部块对象（abort/删除回收用）。
+// reclaimChunkObjects 异步通知各节点删除 inode 全部块对象（abort/删除/覆盖替换回收用）。
+// 块对象 ID 走 ChunkObjID（显式优先）——采纳式替换后不能按文件 ID 派生。
 func (s *Server) reclaimChunkObjects(in types.Inode) {
 	for _, c := range in.Chunks {
-		chunkID := types.ChunkID(in.ID, c.Index)
-		go s.notifyObjectDelete(chunkID, c.Replicas)
+		go s.notifyObjectDelete(types.ChunkObjID(c, in.ID), c.Replicas)
 	}
 }
 

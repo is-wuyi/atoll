@@ -45,8 +45,14 @@ func TestChunkedUploadFlow(t *testing.T) {
 	registerNode(t, ts.URL, 1)
 	registerNode(t, ts.URL, 2)
 
-	// 先放一个旧版本（legacy 整文件模型）。
-	postJSON(t, ts.URL+"/files", map[string]any{"path": "/f.bin", "replicas": 1}, nil)
+	// 先放一个旧版本（legacy 整文件模型），记住它的文件 ID：v2 采纳式替换下
+	// 覆盖写必须保留文件身份（FileID 稳定），只换内容。
+	var legacyFile struct {
+		Inode struct {
+			ID uint64 `json:"id"`
+		} `json:"inode"`
+	}
+	postJSON(t, ts.URL+"/files", map[string]any{"path": "/f.bin", "replicas": 1}, &legacyFile)
 
 	// staging + 两块。
 	st := stagingCreate(t, ts.URL, "/f.bin", true)
@@ -101,8 +107,12 @@ func TestChunkedUploadFlow(t *testing.T) {
 		} `json:"nodes"`
 	}
 	getJSON(t, ts.URL+"/meta?path=/f.bin", &after)
-	if !after.Inode.Chunked || after.Inode.ID != st.ID || after.Inode.Size != (64<<20)+1000 {
-		t.Fatalf("commit 后 lookup 不符: %+v", after.Inode)
+	if !after.Inode.Chunked || after.Inode.ID != legacyFile.Inode.ID || after.Inode.Size != (64<<20)+1000 {
+		t.Fatalf("commit 后 lookup 不符（应保留旧文件身份）: id=%d want=%d %+v",
+			after.Inode.ID, legacyFile.Inode.ID, after.Inode)
+	}
+	if after.Inode.Generation != 1 {
+		t.Fatalf("legacy 内容被 chunked 覆盖后 Generation 应为 1, got %d", after.Inode.Generation)
 	}
 	// 两块副本节点（去重后）都应在地址表里（客户端靠它把块表的 nodeID 解析成 addr）。
 	if len(after.Nodes) != 2 {

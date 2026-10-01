@@ -549,30 +549,125 @@ func TestCommitStagingAtomicReplace(t *testing.T) {
 		t.Fatalf("大小不符应返回 ErrCommitFailed: %v", err)
 	}
 
-	committed, _, hadOld, err := s.CommitStagingFile(st.ID, "data.bin", (64<<20)+(36<<20))
+	committed, oldSnap, hadOld, err := s.CommitStagingFile(st.ID, "data.bin", (64<<20)+(36<<20))
 	if err != nil {
 		t.Fatalf("CommitStagingFile: %v", err)
 	}
 	if !hadOld {
 		t.Fatal("本次提交应替换了旧版本（hadOld 应为 true）")
 	}
-	if committed.Staging || committed.Size != (64<<20)+(36<<20) || len(committed.Chunks) != 2 {
+	// v2 采纳式替换：文件身份保留（committed.ID == old.ID），内容原子换成 staging 的块表。
+	if committed.ID != old.ID {
+		t.Fatalf("覆盖写应保留文件身份: committed.ID=%d != old.ID=%d", committed.ID, old.ID)
+	}
+	if committed.Staging || committed.Size != (64<<20)+(36<<20) || len(committed.Chunks) != 2 || !committed.Chunked {
 		t.Fatalf("提交后字段不符: %+v", committed)
 	}
-	// 路径现在指向新 inode；旧 inode 已消失。
+	if committed.Generation != 1 {
+		t.Fatalf("v1 legacy 内容被 chunked 覆盖后 Generation 应为 1, got %d", committed.Generation)
+	}
+	// oldSnap 是被替换前的旧内容快照（供调用方回收旧对象）：仍是 legacy 形态。
+	if oldSnap.Chunked || oldSnap.Size != 100 || oldSnap.ID != old.ID {
+		t.Fatalf("旧内容快照不符: %+v", oldSnap)
+	}
+	// 路径仍指向同一文件（身份未变），内容已是新块表。
 	after, err := s.ResolvePath("/data.bin")
-	if err != nil || after.ID != st.ID {
-		t.Fatalf("commit 后应看到新版本: %+v %v", after, err)
+	if err != nil || after.ID != old.ID || !after.Chunked {
+		t.Fatalf("commit 后应仍是同一文件（新内容）: %+v %v", after, err)
 	}
-	if _, err := s.GetInode(old.ID); !errors.Is(err, ErrNotExist) {
-		t.Fatalf("旧 inode 应已删除: %v", err)
+	// staging inode 已删除。
+	if _, err := s.GetInode(st.ID); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("staging inode 应已删除: %v", err)
 	}
-	// 已提交的 inode 不能再 commit/abort。
-	if _, _, _, err := s.CommitStagingFile(st.ID, "data.bin", 1); !errors.Is(err, ErrNotStaging) {
-		t.Fatalf("已提交 inode 再 commit 应报错: %v", err)
+	// 已提交的 inode 不能再 commit；abort 幂等（staging 已不存在 → no-op）。
+	if _, _, _, err := s.CommitStagingFile(st.ID, "data.bin", 1); err == nil {
+		t.Fatal("已提交 staging 再 commit 应报错")
 	}
-	if err := s.AbortStaging(st.ID); !errors.Is(err, ErrNotStaging) {
-		t.Fatalf("已提交 inode 再 abort 应报错: %v", err)
+	if err := s.AbortStaging(st.ID); err != nil {
+		t.Fatalf("对已删除 staging 的 abort 应幂等成功: %v", err)
+	}
+}
+
+// TestCommitStagingOverwriteChunkedKeepsIdentity chunked→chunked 覆盖：FileID 与 Generation
+// 稳定递进，children 条目不动，旧内容快照（v1 块表）返回供回收。这是 v2“文件身份与内容
+// 分离”的核心契约：覆盖写不再是“删旧建新”。
+func TestCommitStagingOverwriteChunkedKeepsIdentity(t *testing.T) {
+	s := newTestStore(t)
+
+	// v1：新建 chunked 文件。
+	st1, _ := s.CreateStagingFile(RootID)
+	s.AssignChunk(st1.ID, 0, 100, []uint64{7}, 0)
+	s.MarkChunkDone(types.ChunkID(st1.ID, 0), 7)
+	v1, _, _, err := s.CommitStagingFile(st1.ID, "f.bin", 100)
+	if err != nil {
+		t.Fatalf("首次 commit: %v", err)
+	}
+	if v1.Generation != 1 {
+		t.Fatalf("首次提交 Generation 应为 1, got %d", v1.Generation)
+	}
+
+	// v2：覆盖写。
+	st2, _ := s.CreateStagingFile(RootID)
+	s.AssignChunk(st2.ID, 0, 200, []uint64{8}, 0)
+	s.MarkChunkDone(types.ChunkID(st2.ID, 0), 8)
+	v2, oldSnap, hadOld, err := s.CommitStagingFile(st2.ID, "f.bin", 200)
+	if err != nil {
+		t.Fatalf("覆盖 commit: %v", err)
+	}
+	if !hadOld {
+		t.Fatal("覆盖应 hadOld")
+	}
+	if v2.ID != v1.ID {
+		t.Fatalf("覆盖写必须保留 FileID: %d != %d", v2.ID, v1.ID)
+	}
+	if v2.Generation != 2 {
+		t.Fatalf("覆盖后 Generation 应为 2, got %d", v2.Generation)
+	}
+	if v2.Chunks[0].Size != 200 {
+		t.Fatalf("内容应为 v2 块表: %+v", v2.Chunks)
+	}
+	// 块表必须自描述：显式记录对象 ID（v2 后文件 ID ≠ 块 ID 前缀，派生失效）。
+	if v2.Chunks[0].ID != types.ChunkID(st2.ID, 0) {
+		t.Fatalf("v2 块表应显式携带对象 ID: got %d want %d", v2.Chunks[0].ID, types.ChunkID(st2.ID, 0))
+	}
+	if oldSnap.ID != v1.ID || oldSnap.Chunks[0].Size != 100 {
+		t.Fatalf("旧内容快照应为 v1 块表（供回收）: %+v", oldSnap)
+	}
+	// children 条目未变，路径解析仍是同一 FileID。
+	after, err := s.ResolvePath("/f.bin")
+	if err != nil || after.ID != v1.ID || after.Generation != 2 {
+		t.Fatalf("路径应指向同一 FileID/Generation: %+v %v", after, err)
+	}
+	// v2 staging 已删。
+	if _, err := s.GetInode(st2.ID); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("staging 应已删除: %v", err)
+	}
+}
+
+// TestCommitStagingReplaceSymlink 覆盖符号链接：链接不是"文件内容"，保留旧替换语义——
+// 链接被删、staging 以自己的身份占名（POSIX rename-over-symlink 语义）。
+func TestCommitStagingReplaceSymlink(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.CreateSymlink(RootID, "lnk", "../x"); err != nil {
+		t.Fatalf("CreateSymlink: %v", err)
+	}
+	st, _ := s.CreateStagingFile(RootID)
+	s.AssignChunk(st.ID, 0, 100, []uint64{7}, 0)
+	s.MarkChunkDone(types.ChunkID(st.ID, 0), 7)
+
+	committed, old, hadOld, err := s.CommitStagingFile(st.ID, "lnk", 100)
+	if err != nil {
+		t.Fatalf("CommitStagingFile: %v", err)
+	}
+	if !hadOld || old.Type != types.TypeSymlink {
+		t.Fatalf("应替换了符号链接: hadOld=%v old=%+v", hadOld, old)
+	}
+	if committed.ID != st.ID {
+		t.Fatalf("非文件条目替换应保留旧语义（新文件用 staging 身份）: %d != %d", committed.ID, st.ID)
+	}
+	after, err := s.ResolvePath("/lnk")
+	if err != nil || after.ID != st.ID || after.Type != types.TypeFile {
+		t.Fatalf("路径应变为文件: %+v %v", after, err)
 	}
 }
 
