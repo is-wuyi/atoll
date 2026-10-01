@@ -113,6 +113,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /files/replica-targets", s.handleReplicaTargets) // node 查询推送目标
 	mux.HandleFunc("POST /files/replicated", s.handleReplicated)         // 从副本上报同步完成
 	mux.HandleFunc("POST /files/corrupt", s.handleReportCorrupt)         // 读端上报副本内容损坏
+	mux.HandleFunc("POST /files/symlink", s.handleCreateSymlink) // 创建符号链接
 	mux.HandleFunc("POST /entry/rename", s.handleRename)                 // 同目录改名
 	mux.HandleFunc("DELETE /entry", s.handleDelete)                      // ?path=/a/b
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
@@ -797,9 +798,10 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "path not found")
 		return
 	}
-	if in.Type == types.TypeFile {
+	if in.Type == types.TypeFile || in.Type == types.TypeSymlink {
 		// 先删元数据（客户端立刻看不到该文件），再异步通知各副本节点回收对象。
 		// 回收失败不阻塞删除请求；残留对象由 GC 两轮确认兜底清理。
+		// 符号链接无副本：notifyObjectDelete 遍历空列表为 no-op。
 		if err := s.store.DeleteFile(in.ID); err != nil {
 			httpErrorFromMeta(w, err)
 			return
@@ -816,6 +818,41 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleCreateSymlink 创建符号链接：POST /files/symlink {"path":"/dir/name","target":"../x"}
+// Finder 拷贝含符号链接的目录（真实项目树几乎必有）必走此路径。target 原样存储。
+func (s *Server) handleCreateSymlink(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path   string `json:"path"`
+		Target string `json:"target"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	parentPath, name := splitPath(req.Path)
+	if name == "" || name == "." || name == ".." {
+		httpError(w, http.StatusBadRequest, "invalid path")
+		return
+	}
+	if req.Target == "" || len(req.Target) > 4096 {
+		httpError(w, http.StatusBadRequest, "invalid symlink target")
+		return
+	}
+	parent, err := s.store.ResolvePath(parentPath)
+	if err != nil {
+		httpError(w, http.StatusNotFound, "parent not found")
+		return
+	}
+	sl, err := s.store.CreateSymlink(parent.ID, name, req.Target)
+	if err != nil {
+		httpErrorFromMeta(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, struct {
+		Inode types.Inode `json:"inode"`
+	}{Inode: sl})
 }
 
 // handleRename 同目录内改名：POST /entry/rename {"path":..., "new_name":...}

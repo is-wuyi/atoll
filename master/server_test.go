@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"atoll/master/meta"
+	"atoll/pkg/types"
 )
 
 // newTestServer 启动一个内存态 master（临时 bbolt + httptest）。
@@ -587,6 +588,67 @@ func TestCreateFileOverwrite(t *testing.T) {
 			t.Fatalf("commit 后旧 inode %d 应已被删除", oldID)
 		}
 	})
+}
+
+// TestSymlinkEndpoint 符号链接 API：POST /files/symlink 创建（201、元数据含 target）、
+// 重复 409、父目录缺失 404、DELETE /entry 删除。Finder 拷贝含符号链接的目录必走此路径
+//（rustfs 事故：.claude/skills -> ../.agents/skills）。
+func TestSymlinkEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+
+	var out struct {
+		Inode struct {
+			ID     uint64 `json:"id"`
+			Type   int    `json:"type"`
+			Target string `json:"target"`
+		} `json:"inode"`
+	}
+	resp := postJSON(t, ts.URL+"/files/symlink", map[string]any{"path": "/lnk", "target": "../d/file.txt"}, &out)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("创建符号链接状态码 = %d", resp.StatusCode)
+	}
+	if out.Inode.Target != "../d/file.txt" {
+		t.Fatalf("响应 target = %q", out.Inode.Target)
+	}
+
+	// /meta 能查到，类型为符号链接且带 target。
+	var meta struct {
+		Inode struct {
+			Type   int    `json:"type"`
+			Target string `json:"target"`
+		} `json:"inode"`
+	}
+	getJSON(t, ts.URL+"/meta?path=/lnk", &meta)
+	if meta.Inode.Type != int(types.TypeSymlink) || meta.Inode.Target != "../d/file.txt" {
+		t.Fatalf("meta 不符: type=%d target=%q", meta.Inode.Type, meta.Inode.Target)
+	}
+
+	// 重复创建 → 409。
+	if resp := postJSON(t, ts.URL+"/files/symlink", map[string]any{"path": "/lnk", "target": "x"}, nil); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("重复创建应 409, got %d", resp.StatusCode)
+	}
+	// 父目录缺失 → 404。
+	if resp := postJSON(t, ts.URL+"/files/symlink", map[string]any{"path": "/no/such/lnk", "target": "x"}, nil); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("父目录缺失应 404, got %d", resp.StatusCode)
+	}
+	// 空 target → 400。
+	if resp := postJSON(t, ts.URL+"/files/symlink", map[string]any{"path": "/lnk2", "target": ""}, nil); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("空 target 应 400, got %d", resp.StatusCode)
+	}
+
+	// 删除（DELETE /entry 与文件同路径）→ 200，随后 404。
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/entry?path=/lnk", nil)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("删除符号链接状态码 = %d", resp2.StatusCode)
+	}
+	if r := getJSON(t, ts.URL+"/meta?path=/lnk", nil); r.StatusCode != http.StatusNotFound {
+		t.Fatalf("删除后应 404, got %d", r.StatusCode)
+	}
 }
 
 func TestSplitPath(t *testing.T) {

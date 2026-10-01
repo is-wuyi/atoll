@@ -199,3 +199,25 @@ func TestFinderReadWriteOpenCanRead(t *testing.T) {
 		t.Fatalf("O_RDWR 读回不符: n=%d want %d", nr, len(content))
 	}
 }
+
+// 真内核符号链接往返：os.Symlink 创建（SYMLINK op）→ Lstat 报 symlink 模式
+// → os.Readlink 读回目标。rustfs 拷贝事故的内核级回归：缺符号链接支持时
+// Finder 整个拷贝以「不支持此操作」中止。
+func TestFinderSymlinkRoundTrip(t *testing.T) {
+	mnt := mountForTest(t, 1)
+	p := filepath.Join(mnt, "lnk")
+	if err := os.Symlink("../target-file.txt", p); err != nil {
+		t.Fatalf("os.Symlink 应成功（曾 ENOTSUP 中止 Finder 拷贝）: %v", err)
+	}
+	fi, err := os.Lstat(p)
+	if err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("Lstat 应报符号链接, got mode=%v", fi.Mode())
+	}
+	got, err := os.Readlink(p)
+	if err != nil || got != "../target-file.txt" {
+		t.Fatalf("Readlink = %q err=%v, want ../target-file.txt", got, err)
+	}
+}

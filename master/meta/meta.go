@@ -268,14 +268,52 @@ func (s *Store) ListChildren(dirID uint64) ([]types.Inode, error) {
 	return out, nil
 }
 
-// DeleteFile 删除一个文件记录。
+// CreateSymlink 创建符号链接：Type=TypeSymlink、Target 原样存储（相对/绝对/悬空皆可）。
+// 无副本无对象——修复扫描对空 Replicas 天然跳过，GC 的 validIDs 含其 ID（无对象可回收）。
+func (s *Store) CreateSymlink(parentID uint64, name, target string) (types.Inode, error) {
+	if err := validateName(name); err != nil {
+		return types.Inode{}, err
+	}
+	if target == "" || len(target) > 4096 {
+		return types.Inode{}, errors.New("invalid symlink target")
+	}
+	var in types.Inode
+	err := s.write(func(w *txw) error {
+		parent, err := getInodeTx(w.tx, parentID)
+		if err != nil {
+			return err
+		}
+		if parent.Type != types.TypeDir {
+			return ErrNotDir
+		}
+		if hasChild(w.tx, parentID, name) {
+			return ErrExist
+		}
+		id, err := w.nextID(keyNextInode)
+		if err != nil {
+			return err
+		}
+		in = types.Inode{ID: id, ParentID: parentID, Name: name, Type: types.TypeSymlink, Mtime: time.Now(), Target: target}
+		if err := w.putInode(&in); err != nil {
+			return err
+		}
+		return w.putChild(parentID, name, id)
+	})
+	if err != nil {
+		return types.Inode{}, err
+	}
+	return in, nil
+}
+
+// DeleteFile 删除一个文件记录。符号链接（TypeSymlink）与文件同路径：删元数据即可，
+// 无对象需回收。
 func (s *Store) DeleteFile(id uint64) error {
 	return s.write(func(w *txw) error {
 		in, err := getInodeTx(w.tx, id)
 		if err != nil {
 			return err
 		}
-		if in.Type != types.TypeFile {
+		if in.Type != types.TypeFile && in.Type != types.TypeSymlink {
 			return ErrNotFile
 		}
 		if err := w.delInode(id); err != nil {

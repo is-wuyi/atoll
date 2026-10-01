@@ -375,6 +375,45 @@ func TestStagingInvisibleByPath(t *testing.T) {
 
 // TestMarkUndoneClearsDone 读端上报副本损坏后，Done 被清、Replicas 不动（自愈前置）。
 // legacy 走 RemoveReplicaDone、分块走 MarkChunkUndone；均幂等（未 Done 无操作）。
+// TestSymlinkMetaLifecycle 符号链接元数据：创建（Type=TypeSymlink+Target）→ Lookup 查回
+// → 改名 → 删除（与文件同 DeleteFile 路径）。重名拒绝、父非目录拒绝。
+func TestSymlinkMetaLifecycle(t *testing.T) {
+	s := newTestStore(t)
+
+	sl, err := s.CreateSymlink(RootID, "lnk", "../d/file.txt")
+	if err != nil {
+		t.Fatalf("CreateSymlink: %v", err)
+	}
+	if sl.Type != types.TypeSymlink || sl.Target != "../d/file.txt" {
+		t.Fatalf("inode 不符: type=%d target=%q", sl.Type, sl.Target)
+	}
+	got, err := s.Lookup(RootID, "lnk")
+	if err != nil || got.ID != sl.ID || got.Target != "../d/file.txt" {
+		t.Fatalf("Lookup: %v %+v", err, got)
+	}
+
+	// 重名拒绝。
+	if _, err := s.CreateSymlink(RootID, "lnk", "x"); !errors.Is(err, ErrExist) {
+		t.Fatalf("重名应 ErrExist, got %v", err)
+	}
+
+	// 改名（与文件同路径）。
+	if err := s.Rename(sl.ID, "lnk2"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if _, err := s.Lookup(RootID, "lnk2"); err != nil {
+		t.Fatalf("改名后应可查: %v", err)
+	}
+
+	// 删除走文件路径（DeleteFile 不应因非 TypeFile 拒绝符号链接）。
+	if err := s.DeleteFile(sl.ID); err != nil {
+		t.Fatalf("DeleteFile(symlink): %v", err)
+	}
+	if _, err := s.Lookup(RootID, "lnk2"); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("删除后应 ErrNotExist, got %v", err)
+	}
+}
+
 func TestMarkUndoneClearsDone(t *testing.T) {
 	s := newTestStore(t)
 

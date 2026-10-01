@@ -35,8 +35,9 @@ const ChecksumHeader = "X-Atoll-Crc32c"
 type EntryType uint8
 
 const (
-	TypeDir  EntryType = 0
-	TypeFile EntryType = 1
+	TypeDir     EntryType = 0
+	TypeFile    EntryType = 1
+	TypeSymlink EntryType = 2
 )
 
 // Inode 是元数据的核心单元：目录树中的一个节点。
@@ -65,6 +66,9 @@ type Inode struct {
 	// Checksum 是 legacy 整对象文件内容的 CRC32C（0 = 未记录）。
 	// 分块文件不用此字段（校验和在每块的 ChunkInfo.Checksum 里）。
 	Checksum uint32 `json:"checksum,omitempty"`
+	// Target 仅符号链接（Type=TypeSymlink）使用：链接目标原样存储（可为相对/悬空）。
+	// 符号链接无副本无对象，Size 恒 0，FUSE 层用 len(Target) 作 st_size。
+	Target string `json:"target,omitempty"`
 }
 
 // ChunkInfo 是分块文件的一个块。

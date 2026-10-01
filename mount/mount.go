@@ -157,6 +157,8 @@ var (
 	_ fs.NodeCreater   = (*node)(nil)
 	_ fs.NodeOpener    = (*node)(nil)
 	_ fs.NodeSetattrer = (*node)(nil)
+	_ fs.NodeSymlinker  = (*node)(nil)
+	_ fs.NodeReadlinker = (*node)(nil)
 	_ fs.NodeGetxattrer  = (*node)(nil)
 	_ fs.NodeSetxattrer  = (*node)(nil)
 	_ fs.NodeListxattrer = (*node)(nil)
@@ -186,9 +188,15 @@ func (n *node) newChildNode(ctx context.Context, ino uint64, mode uint32) *fs.In
 // fillEntry 把 master 的 inode 属性填入 EntryOut/AttrOut。st_ino 由调用方传入（inoFor，
 // 与远端 ID 解耦，覆盖写/改名不翻转，见 inode.go）；远端 ID 只用于数据寻址、不作 st_ino。
 func fillEntry(a *fuse.Attr, in *types.Inode, ino uint64) {
-	if in.Type == types.TypeDir {
+	switch in.Type {
+	case types.TypeDir:
 		a.Mode = fuse.S_IFDIR | 0o755
-	} else {
+	case types.TypeSymlink:
+		// 符号链接：S_IFLNK + 0777（POSIX 对链接权限不敏感），st_size=目标长度，
+		// 内核 readlink 用它分配缓冲。链接本体无数据对象。
+		a.Mode = fuse.S_IFLNK | 0o777
+		a.Size = uint64(len(in.Target))
+	default:
 		a.Mode = fuse.S_IFREG | 0o644
 		a.Size = uint64(in.Size)
 	}
@@ -239,6 +247,8 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	mode := uint32(fuse.S_IFREG)
 	if in.Type == types.TypeDir {
 		mode = fuse.S_IFDIR
+	} else if in.Type == types.TypeSymlink {
+		mode = fuse.S_IFLNK
 	}
 	return n.newChildNode(ctx, n.m.inoFor(remote), mode), 0
 }
@@ -262,6 +272,8 @@ func (n *node) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 		mode := uint32(fuse.S_IFREG)
 		if k.Type == types.TypeDir {
 			mode = fuse.S_IFDIR
+		} else if k.Type == types.TypeSymlink {
+			mode = fuse.S_IFLNK
 		}
 		entries = append(entries, fuse.DirEntry{Name: k.Name, Mode: mode, Ino: n.m.inoFor(strings.TrimSuffix(dir, "/") + "/" + k.Name)})
 		n.m.attrPut(strings.TrimSuffix(dir, "/")+"/"+k.Name, k)
@@ -363,6 +375,32 @@ func (n *node) Rename(_ context.Context, name string, newParent fs.InodeEmbedder
 	}
 	n.m.mu.Unlock()
 	return 0
+}
+
+// Symlink 创建符号链接（Finder 拷贝含链接的目录必走；此前未实现回 ENOTSUP 导致整个
+// 拷贝以「不支持此操作」中止——rustfs 事故）。target 原样存 master。
+func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	remote := n.remotePath(name)
+	in, err := n.m.client.CreateSymlink(remote, target)
+	if err != nil {
+		return nil, mapErrno(err)
+	}
+	n.m.attrPut(remote, in)
+	fillEntry(&out.Attr, &in, n.m.inoFor(remote))
+	return n.newChildNode(ctx, n.m.inoFor(remote), fuse.S_IFLNK), 0
+}
+
+// Readlink 读取符号链接目标。内核解析路径时先 LOOKUP（得 S_IFLNK）再 READLINK，
+// 跟随动作在 VFS 完成——master 无需支持"穿过符号链接"的路径解析。
+func (n *node) Readlink(_ context.Context) ([]byte, syscall.Errno) {
+	in, err := n.m.lookupCached(n.path())
+	if err != nil {
+		return nil, mapErrno(err)
+	}
+	if in.Type != types.TypeSymlink {
+		return nil, syscall.EINVAL
+	}
+	return []byte(in.Target), 0
 }
 
 func parentOf(p string) string {
@@ -1248,6 +1286,17 @@ func (s *sliceDirStream) Next() (fuse.DirEntry, syscall.Errno) {
 	e := s.entries[s.pos]
 	s.pos++
 	return e, 0
+}
+
+// Seekdir 实现 fs.FileSeekdirer：内核对已读过的目录回卷/跳位（Finder 刷新窗口实测
+// 会发 offset 回 0 的 READDIR）时按偏移重定位。此前未实现 → go-fuse 回 ENOTSUP。
+// 偏移语义 = 已消费条目数（bridge 为每个条目分配 1 起的递增 Off）。
+func (s *sliceDirStream) Seekdir(_ context.Context, off uint64) syscall.Errno {
+	if off > uint64(len(s.entries)) {
+		off = uint64(len(s.entries)) // 越界按 EOF，下一次 Next 即 HasNext=false
+	}
+	s.pos = int(off)
+	return 0
 }
 
 func (s *sliceDirStream) Close() {}

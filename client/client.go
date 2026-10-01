@@ -651,6 +651,15 @@ func (c *Client) reportCorrupt(objectID, nodeID uint64) {
 	resp.Body.Close()
 }
 
+// CreateSymlink 创建符号链接（挂载层 SYMLINK op 用）。target 原样存储。
+func (c *Client) CreateSymlink(remotePath, target string) (types.Inode, error) {
+	var out struct {
+		Inode types.Inode `json:"inode"`
+	}
+	err := c.postJSON("/files/symlink", map[string]any{"path": remotePath, "target": target}, &out)
+	return out.Inode, err
+}
+
 // putObject 向节点写入对象数据。
 func (c *Client) putObject(nodeAddr string, inodeID uint64, r io.Reader, size int64) error {
 	// io.NopCloser 包裹：http transport 上传完成后会关闭 req.Body，
