@@ -2,6 +2,7 @@
 package master
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -113,6 +114,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /files/replica-targets", s.handleReplicaTargets) // node 查询推送目标
 	mux.HandleFunc("POST /files/replicated", s.handleReplicated)         // 从副本上报同步完成
 	mux.HandleFunc("POST /files/corrupt", s.handleReportCorrupt)         // 读端上报副本内容损坏
+	mux.HandleFunc("POST /files/small", s.handleCreateSmall)             // 小文件单请求通道（v2-2a）
 	mux.HandleFunc("POST /files/symlink", s.handleCreateSymlink) // 创建符号链接
 	mux.HandleFunc("POST /entry/rename", s.handleRename)                 // 同目录改名
 	mux.HandleFunc("DELETE /entry", s.handleDelete)                      // ?path=/a/b
@@ -853,6 +855,168 @@ func (s *Server) handleCreateSymlink(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, struct {
 		Inode types.Inode `json:"inode"`
 	}{Inode: sl})
+}
+
+// handleCreateSmall 小文件单请求通道（v2-2a）：POST /files/small?path=&replicas=&overwrite=
+// body = 文件内容（≤ types.SmallFileMax）。master 服务端把数据写到主副本节点（带 CRC 头，
+// 节点落盘即校验），成功后单事务提交元数据——客户端 1 次往返，完全绕开 staging/分块协议。
+// 数据流 client→master→主副本 共 2 腿（对比分块路径 4-5 腿）；其余副本由节点
+// replicateToPeers 异步推送（复用现有机制）。落库 legacy 单对象模型（content=inode ID），
+// 覆盖写保留 inode（Generation++）；符号链接占名时保留旧替换语义（删旧、新建）。
+// 失败窗口：节点写成功但元数据事务失败 → 孤儿对象，GC 两轮确认清理。
+func (s *Server) handleCreateSmall(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	remote := q.Get("path")
+	overwrite := q.Get("overwrite") == "true"
+	replicas := 1
+	if n, err := strconv.Atoi(q.Get("replicas")); err == nil && n > 0 {
+		replicas = n
+	}
+	parentPath, name := splitPath(remote)
+	if name == "" || name == "." || name == ".." {
+		httpError(w, http.StatusBadRequest, "invalid path")
+		return
+	}
+	if r.ContentLength > types.SmallFileMax {
+		httpError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("body %d > small limit %d", r.ContentLength, types.SmallFileMax))
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, types.SmallFileMax+1))
+	if err != nil || int64(len(data)) == 0 || int64(len(data)) > types.SmallFileMax {
+		httpError(w, http.StatusBadRequest, "empty or oversize body")
+		return
+	}
+	parent, err := s.store.ResolvePath(parentPath)
+	if err != nil {
+		httpError(w, http.StatusNotFound, "parent not found")
+		return
+	}
+	crc := types.CRC32C(data)
+
+	// 解析目标：新建 / 覆盖文件（in-place 内容替换）/ 目录冲突 / 非文件条目替换。
+	existing, lookupErr := s.store.ResolvePath(remote)
+	var targetID uint64
+	var replicaIDs []uint64
+	var replaceOther bool
+	switch {
+	case lookupErr == nil && existing.Type == types.TypeDir:
+		httpError(w, http.StatusConflict, meta.ErrExist.Error())
+		return
+	case lookupErr == nil && existing.Type == types.TypeFile:
+		if !overwrite {
+			httpError(w, http.StatusConflict, meta.ErrExist.Error())
+			return
+		}
+		targetID = existing.ID
+		if existing.Chunked {
+			// 采纳式记录的副本位置在块表里；小内容覆盖改写为 legacy 单对象并重新
+			// 挑选副本（旧块对象在提交成功后回收）。
+			replicaIDs = nil
+		} else if len(existing.Replicas) > 0 {
+			replicaIDs = existing.Replicas
+		} else {
+			httpError(w, http.StatusInternalServerError, "existing file has no replicas")
+			return
+		}
+	case lookupErr == nil:
+		// 符号链接等非文件条目：删旧、新建（旧替换语义）。
+		if !overwrite {
+			httpError(w, http.StatusConflict, meta.ErrExist.Error())
+			return
+		}
+		replaceOther = true
+	}
+
+	// 主副本：覆盖 legacy 文件沿用旧副本集的主副本（内容原子 in-place）；
+	// 新建/替换/chunked 转 legacy 走现有选节点（含健康探测）。
+	var primary types.NodeInfo
+	if targetID != 0 && len(replicaIDs) > 0 {
+		if n, err := s.store.GetNode(replicaIDs[0]); err == nil && time.Since(n.LastHeartbeat) <= s.nodeMaxAge {
+			primary = n
+		}
+	}
+	if primary.ID == 0 {
+		alive, err := s.pickAliveNodes(replicas, int64(len(data)), nil)
+		if err != nil {
+			httpError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		primary = alive[0]
+		replicaIDs = make([]uint64, len(alive))
+		for i, nd := range alive {
+			replicaIDs[i] = nd.ID
+		}
+	}
+
+	// 新建/替换：先持久分配对象 ID（= 新 inode ID，保持 legacy content=ID 不变式）。
+	if targetID == 0 {
+		id, err := s.store.AllocateFileID()
+		if err != nil {
+			httpError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		targetID = id
+	}
+
+	// 数据落主副本（节点侧 tmp+fsync+rename 原子写，CRC 头即时校验）。
+	nodeClient := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: auth.HTTPTransport(s.token, s.tlsCfg, nil),
+	}
+	putReq, perr := http.NewRequest(http.MethodPut,
+		fmt.Sprintf("%s://%s/objects/%d", s.nodeScheme(), primary.Addr, targetID), bytes.NewReader(data))
+	if perr != nil {
+		httpError(w, http.StatusInternalServerError, perr.Error())
+		return
+	}
+	putReq.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", crc))
+	putResp, perr := nodeClient.Do(putReq)
+	if perr != nil {
+		httpError(w, http.StatusServiceUnavailable, fmt.Sprintf("write to node %s: %v", primary.Addr, perr))
+		return
+	}
+	io.Copy(io.Discard, putResp.Body)
+	putResp.Body.Close()
+	if putResp.StatusCode != http.StatusCreated && putResp.StatusCode != http.StatusOK {
+		httpError(w, http.StatusServiceUnavailable, fmt.Sprintf("node %s: %d", primary.Addr, putResp.StatusCode))
+		return
+	}
+
+	// 单事务提交元数据（节点已落盘，这里失败只留孤儿对象，GC 兜底）。
+	now := time.Now()
+	wasChunked := lookupErr == nil && existing.Type == types.TypeFile && existing.Chunked
+	terr := s.store.WriteSmallFile(meta.SmallFileTarget{
+		ParentID: parent.ID, Name: name, FileID: targetID,
+		Size: int64(len(data)), Checksum: crc,
+		Replicas: replicaIDs, PrimaryID: primary.ID,
+		ReplaceOtherID: replaceOtherInodeID(existing, lookupErr, replaceOther),
+		Mtime:          now,
+	})
+	if terr != nil {
+		httpErrorFromMeta(w, terr)
+		return
+	}
+	// 小内容覆盖了 chunked 文件：记录已转 legacy，旧块对象回收（GC 兜底）。
+	if wasChunked {
+		s.reclaimChunkObjects(existing)
+	}
+	out, gerr := s.store.GetInode(targetID)
+	if gerr != nil {
+		httpError(w, http.StatusInternalServerError, gerr.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, struct {
+		Inode types.Inode `json:"inode"`
+	}{Inode: out})
+}
+
+// replaceOtherInodeID 提取被替换的非文件条目 ID（symlink 等）；无则 0。
+func replaceOtherInodeID(existing types.Inode, lookupErr error, replaceOther bool) uint64 {
+	if replaceOther && lookupErr == nil {
+		return existing.ID
+	}
+	return 0
 }
 
 // handleRename 同目录内改名：POST /entry/rename {"path":..., "new_name":...}

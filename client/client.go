@@ -651,6 +651,44 @@ func (c *Client) reportCorrupt(objectID, nodeID uint64) {
 	resp.Body.Close()
 }
 
+// PutSmall 小文件单请求通道（v2-2a）：数据内联进一个 POST，master 服务端写主副本并
+// 单事务提交元数据，客户端 1 次往返完成整个文件（分块路径要 4-5 次往返）。
+// 落库为 legacy 单对象模型（非 chunked、content=inode ID）；覆盖写保留 inode（Generation++）。
+// 上限 types.SmallFileMax，超出报错（调用方走分块路径）。
+func (c *Client) PutSmall(remotePath string, data []byte, replicas int, overwrite bool) (types.Inode, error) {
+	if int64(len(data)) == 0 {
+		return types.Inode{}, fmt.Errorf("empty file not supported in small path")
+	}
+	if int64(len(data)) > types.SmallFileMax {
+		return types.Inode{}, fmt.Errorf("文件 %d 字节超过小文件通道上限 %d", len(data), types.SmallFileMax)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), c.ioTimeout(int64(len(data))))
+	defer cancel()
+	u := fmt.Sprintf("%s/files/small?path=%s&replicas=%d&overwrite=%t",
+		c.MasterURL, url.QueryEscape(remotePath), replicas, overwrite)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(data))
+	if err != nil {
+		return types.Inode{}, err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = int64(len(data))
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return types.Inode{}, err
+	}
+	defer resp.Body.Close()
+	if err := statusError(resp); err != nil {
+		return types.Inode{}, err
+	}
+	var out struct {
+		Inode types.Inode `json:"inode"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return types.Inode{}, err
+	}
+	return out.Inode, nil
+}
+
 // CreateSymlink 创建符号链接（挂载层 SYMLINK op 用）。target 原样存储。
 func (c *Client) CreateSymlink(remotePath, target string) (types.Inode, error) {
 	var out struct {

@@ -125,6 +125,7 @@ func TestChunkedWriteFlushRelease(t *testing.T) {
 	if _, err := c.Mkdir("/wr"); err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
+	m.NoSmallPath = true // 分块 Flush 流水线专项测试：禁用小文件单请求通道
 	w, err := m.newWriteHandle("/wr/big.bin", true)
 	if err != nil {
 		t.Fatalf("newWriteHandle: %v", err)

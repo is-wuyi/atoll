@@ -256,6 +256,9 @@ func TestMountCreateKeepsInodeAcrossFallback(t *testing.T) {
 					(r.URL.Path == "/files/commit" && failCommit.Swap(false)))
 			})
 			root, raw := namespaceFS(m)
+			if scenario == "commit_retry" {
+				m.NoSmallPath = true // 该场景专测 chunked commit 重试的 inode 稳定性
+			}
 			f := createNamespaceFile(t, raw, "file")
 			want := []byte{}
 			if scenario != "empty" {

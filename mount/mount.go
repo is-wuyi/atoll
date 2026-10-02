@@ -39,6 +39,10 @@ type Mount struct {
 	token    auth.Token
 	tlsCfg   *tls.Config // 读句柄直连节点的 TLS 配置（nil = 普通 HTTP）
 
+	// NoSmallPath 测试钩子：禁用小文件单请求通道，强制走 chunked/流式路径。
+	// 专测分块/流式机制的测试用（真实负载恒为 false）。
+	NoSmallPath bool
+
 	mu     sync.Mutex
 	writes map[string]*writeHandle // 远程路径 → 进行中的本地写入
 
@@ -1067,8 +1071,9 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 	return uint32(n), 0
 }
 
-// Flush 完成上传。流式会话：传尾巴 + commit（秒级）；旧路径（就地编辑/空文件）：
-// 整传。可能被多次调用（每次 close），成功后幂等。
+// Flush 完成上传。小文件通道（v2-2a）：≤ SmallFileMax 的内容单请求完成（1 次往返）；
+// 流式会话：传尾巴 + commit；旧路径（就地编辑/空文件）：整传。可能被多次调用
+//（每次 close），成功后幂等。
 func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1078,6 +1083,27 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	st, err := w.f.Stat()
 	if err != nil {
 		return syscall.EIO
+	}
+
+	// v2-2a 小文件单请求通道：数据内联进一个 POST，master 服务端写节点+提交，
+	// 客户端 1 次往返（对比流式/整传的 4-5 次）。先放弃流式会话（未推块，abort 无副作用）；
+	// 失败则落回下方通用路径重试（网络抖动不放弃写入）。
+	if !w.m.NoSmallPath && st.Size() > 0 && st.Size() <= types.SmallFileMax {
+		if w.stream != nil {
+			_ = w.stream.Close()
+			w.stream = nil
+		}
+		w.streamOn = false
+		data, rerr := os.ReadFile(w.local)
+		if rerr == nil {
+			if _, serr := w.m.client.PutSmall(w.remote, data, w.m.replicas, true); serr == nil {
+				w.dirty = false
+				w.created = false
+				w.m.attrInvalidate(w.remote)
+				return 0
+			}
+		}
+		// 失败 → 继续走原路径（该路径自会 abort/重建会话）。
 	}
 
 	// 流式路径：整块已在 WRITE 期间陆续上传，这里只读尾巴 + commit。

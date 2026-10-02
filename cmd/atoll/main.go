@@ -25,6 +25,7 @@ import (
 	"atoll/client"
 	"atoll/console"
 	"atoll/master"
+	"atoll/pkg/types"
 	"atoll/mount"
 	"atoll/node"
 	"atoll/pkg/auth"
@@ -368,15 +369,23 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "用法: atoll put [-replicas N] [-min-copies N] [-f] <本地文件> <远程路径>")
 			return 2
 		}
-		// 分块上传（64MB 块流水线）：覆盖写由 commit 单事务原子换名，
-		// 中断时旧版本/新版本必居其一；空文件回退 legacy 单对象路径。
+		// 上传路由：≤ SmallFileMax 且未显式要求 min-copies>1 → 小文件单请求通道
+		//（1 次往返，master 服务端写节点+提交）；大文件 → 64MB 块流水线；
+		// 空文件 → legacy 单对象路径。
 		st, statErr := os.Stat(fs.Arg(0))
 		if statErr != nil {
 			fmt.Fprintf(stderr, "put 失败: %v\n", statErr)
 			return 1
 		}
 		var err error
-		if st.Size() > 0 {
+		if st.Size() > 0 && st.Size() <= types.SmallFileMax && *minCopies <= 1 {
+			data, rerr := os.ReadFile(fs.Arg(0))
+			if rerr != nil {
+				fmt.Fprintf(stderr, "put 失败: %v\n", rerr)
+				return 1
+			}
+			_, err = c.PutSmall(fs.Arg(1), data, *replicas, *force)
+		} else if st.Size() > 0 {
 			err = c.PutChunkedWithMinCopies(fs.Arg(0), fs.Arg(1), *replicas, *minCopies, *force)
 		} else {
 			if *force {

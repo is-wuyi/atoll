@@ -651,6 +651,47 @@ func TestSymlinkEndpoint(t *testing.T) {
 	}
 }
 
+// TestPutSmallValidation 小文件单请求通道的服务端校验（无需真实节点，仅错误路径）：
+// 空 body 400、超限 413、父目录缺失 404、已存在且未 overwrite 409、目录占名 409。
+func TestPutSmallValidation(t *testing.T) {
+	ts := newTestServer(t)
+	registerNode(t, ts.URL, 1)
+
+	postSmall := func(path string, overwrite bool, body []byte) *http.Response {
+		url := ts.URL + "/files/small?path=" + path + "&replicas=1&overwrite=" + map[bool]string{true: "true", false: "false"}[overwrite]
+		resp, err := http.Post(url, "application/octet-stream", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	// 空 body。
+	if r := postSmall("/a.txt", false, nil); r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("空 body 应 400, got %d", r.StatusCode)
+	}
+	// 超限。
+	if r := postSmall("/a.txt", false, make([]byte, types.SmallFileMax+1)); r.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超限应 413, got %d", r.StatusCode)
+	}
+	// 父目录缺失。
+	if r := postSmall("/no/such/a.txt", false, []byte("x")); r.StatusCode != http.StatusNotFound {
+		t.Fatalf("父目录缺失应 404, got %d", r.StatusCode)
+	}
+	// 先建一个文件（元数据操作，桩节点即可）。
+	postJSON(t, ts.URL+"/files", map[string]any{"path": "/b.txt", "replicas": 1}, nil)
+	// 已存在且未 overwrite → 409。
+	if r := postSmall("/b.txt", false, []byte("x")); r.StatusCode != http.StatusConflict {
+		t.Fatalf("重名应 409, got %d", r.StatusCode)
+	}
+	// 目录占名 → 409。
+	postJSON(t, ts.URL+"/dirs", map[string]any{"path": "/d"}, nil)
+	if r := postSmall("/d", true, []byte("x")); r.StatusCode != http.StatusConflict {
+		t.Fatalf("目录占名应 409, got %d", r.StatusCode)
+	}
+}
+
 func TestSplitPath(t *testing.T) {
 	cases := []struct{ in, parent, name string }{
 		{"/a/b/c.txt", "/a/b", "c.txt"},

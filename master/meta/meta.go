@@ -305,6 +305,91 @@ func (s *Store) CreateSymlink(parentID uint64, name, target string) (types.Inode
 	return in, nil
 }
 
+// SmallFileTarget 描述小文件单请求通道的一次元数据提交（master 已把数据写到主副本后调用）。
+type SmallFileTarget struct {
+	ParentID uint64
+	Name     string
+	FileID   uint64 // 新建：预分配的 inode ID；覆盖：已存在的文件 ID
+	Size     int64
+	Checksum uint32
+	Replicas []uint64
+	PrimaryID uint64
+	// ReplaceOtherID 被替换的非文件条目（symlink 等），0=无。
+	ReplaceOtherID uint64
+	Mtime          time.Time
+}
+
+// WriteSmallFile 单事务提交小文件元数据（v2-2a）：
+//   - FileID 不存在 → 新建（TypeFile、legacy 单对象模型、Generation=1、挂 children）
+//   - FileID 存在且是文件 → in-place 内容替换（转 legacy、Size/Checksum/Generation++）
+//   - ReplaceOtherID 非 0 → 同事务删除被替换的非文件条目
+//
+// 数据已由调用方先行写到主副本（节点侧 fsync）；本事务失败留下孤儿对象由 GC 兜底。
+// legacy content=ID 不变式保持：对象 ID 即 FileID（新建预分配 / 覆盖沿用）。
+func (s *Store) WriteSmallFile(t SmallFileTarget) error {
+	if err := validateName(t.Name); err != nil {
+		return err
+	}
+	return s.write(func(w *txw) error {
+		if t.ReplaceOtherID != 0 {
+			other, err := getInodeTx(w.tx, t.ReplaceOtherID)
+			if err != nil {
+				return err
+			}
+			if other.Type == types.TypeDir {
+				return ErrExist
+			}
+			if err := w.delInode(other.ID); err != nil {
+				return err
+			}
+		}
+		in, err := getInodeTx(w.tx, t.FileID)
+		if err != nil && !errors.Is(err, ErrNotExist) {
+			return err
+		}
+		if errors.Is(err, ErrNotExist) {
+			in = types.Inode{
+				ID: t.FileID, ParentID: t.ParentID, Name: t.Name, Type: types.TypeFile,
+				Size: t.Size, Checksum: t.Checksum, Mtime: t.Mtime,
+				Replicas: t.Replicas, DoneReplicas: []uint64{t.PrimaryID},
+				Generation: 1,
+			}
+			if err := w.putInode(&in); err != nil {
+				return err
+			}
+			return w.putChild(t.ParentID, t.Name, t.FileID)
+		}
+		if in.Type != types.TypeFile {
+			return ErrNotFile
+		}
+		// in-place 内容替换：转 legacy 单对象模型，身份保留。
+		in.Chunked = false
+		in.Chunks = nil
+		in.Size = t.Size
+		in.Checksum = t.Checksum
+		in.Mtime = t.Mtime
+		in.Generation++
+		in.Replicas = t.Replicas // chunked 转 legacy 时重挑副本；legacy 覆盖与原值一致
+		in.DoneReplicas = []uint64{t.PrimaryID} // 其余副本由 replicateToPeers 补齐后重新上报
+		return w.putInode(&in)
+	})
+}
+
+// AllocateFileID 预分配一个文件 ID（小文件单请求通道需要在写节点数据前确定对象 ID）。
+// 分配即持久（记 WAL）；分配后未使用留下的 ID 空洞无害（与计数器语义一致）。
+func (s *Store) AllocateFileID() (uint64, error) {
+	var id uint64
+	err := s.write(func(w *txw) error {
+		nid, err := w.nextID(keyNextInode)
+		if err != nil {
+			return err
+		}
+		id = nid
+		return nil
+	})
+	return id, err
+}
+
 // DeleteFile 删除一个文件记录。符号链接（TypeSymlink）与文件同路径：删元数据即可，
 // 无对象需回收。
 func (s *Store) DeleteFile(id uint64) error {

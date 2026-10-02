@@ -117,6 +117,11 @@ const (
 // 生产运行时不修改。单文件容量上限 = ChunkSize × MaxChunksPerFile（默认 16 GiB）。
 var ChunkSize int64 = 64 << 20
 
+// SmallFileMax 是"小文件单请求通道"的尺寸上限：≤此值的文件走 POST /files/single
+//（数据内联进一个请求，master 服务端落节点+单事务提交，客户端 1 次往返），
+// 完全绕开 staging/分块协议。> 此值走分块流水线。
+const SmallFileMax int64 = 256 << 10
+
 // ChunkID 把 staging inode ID 与块下标编码为 node 侧的对象 ID。
 func ChunkID(inodeID uint64, index int) uint64 {
 	return (inodeID << chunkIndexBits) | uint64(index)

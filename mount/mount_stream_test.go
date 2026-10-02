@@ -24,6 +24,7 @@ func withChunkSize(t *testing.T, sz int64) {
 // pieces 是 [off,len) 段列表，按其顺序调用 Write，模拟 FUSE 的顺序/乱序投递。
 func streamWriteAndVerify(t *testing.T, cc *chunkCluster, remote string, content []byte, order [][2]int) {
 	t.Helper()
+	cc.m.NoSmallPath = true // 流式机制专项测试：禁用小文件单请求通道
 	w, err := cc.m.newWriteHandle(remote, true)
 	if err != nil {
 		t.Fatalf("newWriteHandle: %v", err)
@@ -118,6 +119,7 @@ func TestStreamInoMatchesCommittedID(t *testing.T) {
 	if _, err := cc.client.Mkdir("/s"); err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
+	cc.m.NoSmallPath = true
 	w, err := cc.m.newWriteHandle("/s/ino.bin", true)
 	if err != nil {
 		t.Fatalf("newWriteHandle: %v", err)
@@ -160,6 +162,7 @@ func TestStreamWritePreallocatedThenWrite(t *testing.T) {
 	content := make([]byte, 3584) // 3×1024 + 512 → 4 块
 	rand.New(rand.NewSource(23)).Read(content)
 
+	cc.m.NoSmallPath = true
 	w, err := cc.m.newWriteHandle("/s/prealloc.bin", true)
 	if err != nil {
 		t.Fatalf("newWriteHandle: %v", err)
@@ -213,6 +216,7 @@ func TestStreamRewriteBelowPushedFallsBack(t *testing.T) {
 	if _, err := cc.client.Mkdir("/rw"); err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
+	cc.m.NoSmallPath = true
 	w, err := cc.m.newWriteHandle("/rw/f.bin", true)
 	if err != nil {
 		t.Fatalf("newWriteHandle: %v", err)
