@@ -158,6 +158,12 @@ func (s *Scanner) runGCLoop(ctx context.Context) {
 		case <-ticker.C:
 			s.gcScanOnce()
 			s.sweepStaging()
+			// v2-3a：过期 op 结果清理（客户端重试去重凭据只需分钟级窗口）。
+			if n, err := s.store.SweepOpsOlderThan(24 * time.Hour); err != nil {
+				log.Printf("op 结果清理: %v", err)
+			} else if n > 0 {
+				log.Printf("op 结果清理: 移除 %d 条过期记录", n)
+			}
 		}
 	}
 }

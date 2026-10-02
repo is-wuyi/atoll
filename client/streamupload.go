@@ -13,6 +13,7 @@
 package client
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -29,6 +30,7 @@ type StreamUploader struct {
 	name     string
 	replicas int
 	minCopies int
+	opID     string // v2-3a：commit 幂等凭据（响应丢失重试回放原结果）
 
 	mu       sync.Mutex
 	nextIdx  int   // 下一个待分配的块号
@@ -66,6 +68,7 @@ func (c *Client) BeginStreamUpload(remotePath string, replicas int) (*StreamUplo
 		name:      name,
 		replicas:  replicas,
 		minCopies: minCopies,
+		opID:      newOpID(),
 		sem:       make(chan struct{}, 2),
 	}, nil
 }
@@ -137,6 +140,7 @@ func (u *StreamUploader) Finish(tail []byte, totalSize int64) error {
 	chunkCount := int((totalSize + types.ChunkSize - 1) / types.ChunkSize)
 	commitBody := map[string]any{
 		"inode_id": u.staging, "name": u.name, "size": totalSize, "chunk_count": chunkCount,
+		"op_id": u.opID, // v2-3a：响应丢失后同 op_id 重试，服务端幂等回放
 	}
 	if u.minCopies > 0 {
 		commitBody["min_copies"] = u.minCopies
@@ -144,11 +148,21 @@ func (u *StreamUploader) Finish(tail []byte, totalSize int64) error {
 	// min_copies=1 且主副本 PUT 已同步落盘（uploadChunkOnce 收到 201），commit
 	// 通常首次即成功；这里只为吸收 master 标 Done 的短暂滞后做有限轮询，60s 内
 	// 仍 409 则判失败返回（不再死等 15 分钟拖垮 Finder）。
+	// 网络错误（非 HTTP 状态答复）：服务端可能已提交，同 op_id 重试回放原结果。
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		err := u.c.postJSON("/files/commit", commitBody, nil)
 		if err == nil {
 			return nil
+		}
+		var he *HTTPError
+		if !errors.As(err, &he) {
+			if time.Now().After(deadline) {
+				u.abort()
+				return fmt.Errorf("commit: %w", err)
+			}
+			time.Sleep(time.Second)
+			continue
 		}
 		if u.minCopies <= 0 || !strings.Contains(err.Error(), "http 409") || time.Now().After(deadline) {
 			u.abort()

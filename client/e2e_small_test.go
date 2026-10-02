@@ -2,8 +2,14 @@ package client
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"atoll/pkg/types"
@@ -69,6 +75,89 @@ func TestPutSmallEndToEnd(t *testing.T) {
 	// 父目录不存在 → 报错。
 	if _, err := c.PutSmall("/no/such/x.txt", data, 1, false); err == nil {
 		t.Fatal("父目录缺失应报错")
+	}
+}
+
+// dropSmallResponseOnce 丢掉 /files/small 的第一个响应（服务端已处理、客户端没收到），
+// 模拟响应丢失。PutSmall 应凭 op_id 内部重试拿到幂等结果。
+type dropSmallResponseOnce struct {
+	base     http.RoundTripper
+	dropped  bool
+	dropNext atomic.Bool
+}
+
+func (d *dropSmallResponseOnce) RoundTrip(r *http.Request) (*http.Response, error) {
+	if d.dropNext.CompareAndSwap(true, false) && strings.Contains(r.URL.Path, "/files/small") {
+		resp, err := d.base.RoundTrip(r)
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		return nil, fmt.Errorf("simulated: response lost (server had processed)")
+	}
+	return d.base.RoundTrip(r)
+}
+
+// TestPutSmallResponseLostRetriesIdempotently 响应丢失 → PutSmall 内部以同一 op_id 重试 →
+// 服务端回放原结果 → 客户端拿到成功且文件只创建一份（v2-3a）。
+func TestPutSmallResponseLostRetriesIdempotently(t *testing.T) {
+	c, _ := newClusterV2(t, 1)
+	if _, err := c.Mkdir("/sm"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+
+	hc := *c.HTTP
+	hc.Transport = &dropSmallResponseOnce{base: http.DefaultTransport, dropNext: *new(atomic.Bool)}
+	hc.Transport.(*dropSmallResponseOnce).dropNext.Store(true)
+	c.HTTP = &hc
+
+	data := bytes.Repeat([]byte("lost-response-"), 64)
+	in, err := c.PutSmall("/sm/lost.txt", data, 1, false)
+	if err != nil {
+		t.Fatalf("响应丢失后 PutSmall 应凭 op_id 重试成功: %v", err)
+	}
+	if in.Generation != 1 {
+		t.Fatalf("Generation 应为 1: %+v", in)
+	}
+	// 文件存在且内容正确（服务端第一次就已成功，重试只是拿回结果）。
+	out := filepath.Join(t.TempDir(), "out")
+	if err := c.Get("/sm/lost.txt", out); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got, _ := os.ReadFile(out); !bytes.Equal(got, data) {
+		t.Fatal("内容不符")
+	}
+}
+
+// TestPutSmallFullCycleIdempotency 真节点全链路：首次执行 201 → 同 op_id 重试 200
+// 回放同一 inode（服务端不重复创建）。raw HTTP 以固定 op_id 驱动。
+func TestPutSmallFullCycleIdempotency(t *testing.T) {
+	c, _ := newClusterV2(t, 1)
+	if _, err := c.Mkdir("/sm"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	post := func(opID string) (int, uint64) {
+		u := fmt.Sprintf("%s/files/small?path=/sm/idem.txt&replicas=1&overwrite=false&op_id=%s", c.MasterURL, opID)
+		resp, err := http.Post(u, "application/octet-stream", bytes.NewReader([]byte("payload")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Inode struct {
+				ID uint64 `json:"id"`
+			} `json:"inode"`
+		}
+		json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out.Inode.ID
+	}
+	code1, id1 := post("op-e2e-fixed")
+	if code1 != 201 {
+		t.Fatalf("首次应 201, got %d", code1)
+	}
+	code2, id2 := post("op-e2e-fixed")
+	if code2 != 200 || id2 != id1 {
+		t.Fatalf("重试应 200 且返回原 inode: code=%d id=%d (want 200/%d)", code2, id2, id1)
 	}
 }
 

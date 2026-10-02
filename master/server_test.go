@@ -692,6 +692,91 @@ func TestPutSmallValidation(t *testing.T) {
 	}
 }
 
+// TestPutSmallIdempotentViaOpID op 回放（v2-3a）：预置 op 结果后，同 op_id 的请求
+// 在写节点之前即回放原结果（200 + 原 inode），不重复执行。首执行→存结果的全链路
+// 由 client 包 e2e（真实节点）覆盖。
+func TestPutSmallIdempotentViaOpID(t *testing.T) {
+	store, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	srv := NewServer(store, time.Hour)
+	srv.SetHealthProbe(func(string) bool { return true })
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { ts.Close() })
+
+	// 预置一次"已执行"的结果。
+	want := types.Inode{ID: 99, ParentID: 1, Name: "idem.txt", Type: types.TypeFile, Size: 42, Generation: 1}
+	if err := store.PutOpResult("op-x1", "small", want); err != nil {
+		t.Fatal(err)
+	}
+
+	url := ts.URL + "/files/small?path=/idem.txt&replicas=1&overwrite=false&op_id=op-x1"
+	resp, err := http.Post(url, "application/octet-stream", bytes.NewReader([]byte("ignored")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("同 op_id 应 200 回放, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Atoll-Replay") != "true" {
+		t.Error("回放应带 X-Atoll-Replay 头")
+	}
+	var out struct {
+		Inode types.Inode `json:"inode"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.Inode.ID != 99 || out.Inode.Size != 42 {
+		t.Fatalf("回放结果不符: %+v", out.Inode)
+	}
+	// 未创建任何东西（回放不落盘）。
+	if _, err := store.GetInode(99); err == nil {
+		t.Fatal("回放不应创建 inode（99 是预置结果里的假 ID）")
+	}
+}
+
+// TestCommitOpIdempotentViaOpID chunked commit 同 op_id 重试返回原结果（v2-3a）：
+// 修复"commit 响应丢失→服务端已提交→重试报 ErrNotStaging"的误报（审计 F3）。
+func TestCommitOpIdempotentViaOpID(t *testing.T) {
+	ts := newTestServer(t)
+	registerNode(t, ts.URL, 1)
+	registerNode(t, ts.URL, 2)
+
+	st := stagingCreate(t, ts.URL, "/idem.bin", false)
+	c0, _ := assignChunk(t, ts.URL, st.ID, 0, 100, false)
+	postJSON(t, ts.URL+"/files/replicated", map[string]any{
+		"inode_id": types.ChunkID(st.ID, 0), "node_id": c0.Replicas[0]}, nil)
+
+	commit := func() (int, types.Inode) {
+		var out types.Inode
+		resp := postJSON(t, ts.URL+"/files/commit", map[string]any{
+			"inode_id": st.ID, "name": "idem.bin", "size": 100, "chunk_count": 1, "op_id": "op-c1",
+		}, &out)
+		return resp.StatusCode, out
+	}
+	code1, in1 := commit()
+	if code1 != http.StatusOK {
+		t.Fatalf("首次 commit 应 200, got %d", code1)
+	}
+	code2, in2 := commit()
+	if code2 != http.StatusOK {
+		t.Fatalf("同 op_id 重试应 200 回放（此前误报 ErrNotStaging）, got %d", code2)
+	}
+	if in2.ID != in1.ID || in2.Generation != in1.Generation {
+		t.Fatalf("重试应返回原结果: %+v vs %+v", in2, in1)
+	}
+	// 幂等不改变状态：文件仍可读、Generation 不变。
+	var meta struct {
+		Inode types.Inode `json:"inode"`
+	}
+	getJSON(t, ts.URL+"/meta?path=/idem.bin", &meta)
+	if meta.Inode.ID != in1.ID || meta.Inode.Size != 100 {
+		t.Fatalf("重试后状态不符: %+v", meta.Inode)
+	}
+}
+
 func TestSplitPath(t *testing.T) {
 	cases := []struct{ in, parent, name string }{
 		{"/a/b/c.txt", "/a/b", "c.txt"},

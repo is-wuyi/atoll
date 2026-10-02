@@ -28,6 +28,7 @@ var (
 	bucketChildren = []byte("children")
 	bucketNodes    = []byte("nodes")
 	bucketMeta     = []byte("meta")
+	bucketOps      = []byte("ops") // v2-3a：写操作幂等结果表（op_id → OpRecord）
 
 	keyNextInode = []byte("next_inode")
 	keyNextNode  = []byte("next_node")
@@ -91,7 +92,7 @@ func (s *Store) DBPath() string { return s.db.Path() }
 
 func (s *Store) init() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketInodes, bucketChildren, bucketNodes, bucketMeta, bucketWAL} {
+		for _, b := range [][]byte{bucketInodes, bucketChildren, bucketNodes, bucketMeta, bucketWAL, bucketOps} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}

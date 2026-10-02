@@ -5,11 +5,14 @@ package client
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
-	"crypto/tls"
 	"net/http"
 	"net/url"
 	"os"
@@ -440,8 +443,11 @@ func (c *Client) putChunkedCore(remotePath string, size int64, r io.Reader, repl
 	// minCopies>0：从副本仍在异步同步时 master 返回 409，轮询等待（改进项3）。
 	// 15 分钟超时：正常链路 64MB 块同步远快于此；超时说明从副本节点有问题，
 	// abort 后由用户决定重传（scanner 不会对 staging 做无意义修复）。
+	// v2-3a：commit 带 op_id——网络错误（响应丢失）时同 op_id 重试，服务端幂等回放
+	// 原结果，修复"已提交却误报失败"（审计 F3）。
+	opID := newOpID()
 	commitBody := map[string]any{
-		"inode_id": stagingID, "name": name, "size": size, "chunk_count": chunkCount,
+		"inode_id": stagingID, "name": name, "size": size, "chunk_count": chunkCount, "op_id": opID,
 	}
 	if minCopies > 0 {
 		commitBody["min_copies"] = minCopies
@@ -451,6 +457,13 @@ func (c *Client) putChunkedCore(remotePath string, size int64, r io.Reader, repl
 		err := c.postJSON("/files/commit", commitBody, nil)
 		if err == nil {
 			return nil
+		}
+		var he *HTTPError
+		isStatusErr := errors.As(err, &he)
+		if !isStatusErr && attempt < 2 {
+			// 网络错误：服务端可能已提交，同 op_id 重试拿回幂等结果。
+			time.Sleep(time.Second)
+			continue
 		}
 		if minCopies <= 0 || attempt >= 30 || !strings.Contains(err.Error(), "http 409") || time.Now().After(deadline) {
 			return fail(fmt.Errorf("commit: %w", err))
@@ -651,10 +664,20 @@ func (c *Client) reportCorrupt(objectID, nodeID uint64) {
 	resp.Body.Close()
 }
 
+// newOpID 生成写操作幂等凭据（v2-3a）：128 位随机十六进制。
+func newOpID() string {
+	b := make([]byte, 16)
+	crand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 // PutSmall 小文件单请求通道（v2-2a）：数据内联进一个 POST，master 服务端写主副本并
 // 单事务提交元数据，客户端 1 次往返完成整个文件（分块路径要 4-5 次往返）。
 // 落库为 legacy 单对象模型（非 chunked、content=inode ID）；覆盖写保留 inode（Generation++）。
 // 上限 types.SmallFileMax，超出报错（调用方走分块路径）。
+// 网络错误（响应丢失/连接中断）时以同一 op_id 自动重试一次：服务端按 op 幂等回放
+// 原结果——若首次实际已成功，重试拿回的是同一 inode 而非重复创建（v2-3a）。
+// HTTP 状态错误（409/404 等服务端明确答复）不重试，直接返回。
 func (c *Client) PutSmall(remotePath string, data []byte, replicas int, overwrite bool) (types.Inode, error) {
 	if int64(len(data)) == 0 {
 		return types.Inode{}, fmt.Errorf("empty file not supported in small path")
@@ -662,31 +685,47 @@ func (c *Client) PutSmall(remotePath string, data []byte, replicas int, overwrit
 	if int64(len(data)) > types.SmallFileMax {
 		return types.Inode{}, fmt.Errorf("文件 %d 字节超过小文件通道上限 %d", len(data), types.SmallFileMax)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), c.ioTimeout(int64(len(data))))
-	defer cancel()
-	u := fmt.Sprintf("%s/files/small?path=%s&replicas=%d&overwrite=%t",
-		c.MasterURL, url.QueryEscape(remotePath), replicas, overwrite)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(data))
-	if err != nil {
-		return types.Inode{}, err
+	opID := newOpID()
+	u := func() string {
+		return fmt.Sprintf("%s/files/small?path=%s&replicas=%d&overwrite=%t&op_id=%s",
+			c.MasterURL, url.QueryEscape(remotePath), replicas, overwrite, opID)
 	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = int64(len(data))
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return types.Inode{}, err
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(300 * time.Millisecond) // 响应丢失窗口：给服务端一点完成时间
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), c.ioTimeout(int64(len(data))))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u(), bytes.NewReader(data))
+		if err != nil {
+			cancel()
+			return types.Inode{}, err
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.ContentLength = int64(len(data))
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			cancel()
+			lastErr = err
+			continue // 网络错误：同 op_id 重试（服务端幂等回放）
+		}
+		if err := statusError(resp); err != nil {
+			resp.Body.Close()
+			cancel()
+			return types.Inode{}, err // 服务端明确答复：不重试
+		}
+		var out struct {
+			Inode types.Inode `json:"inode"`
+		}
+		derr := json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		cancel()
+		if derr != nil {
+			return types.Inode{}, derr
+		}
+		return out.Inode, nil
 	}
-	defer resp.Body.Close()
-	if err := statusError(resp); err != nil {
-		return types.Inode{}, err
-	}
-	var out struct {
-		Inode types.Inode `json:"inode"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return types.Inode{}, err
-	}
-	return out.Inode, nil
+	return types.Inode{}, lastErr
 }
 
 // CreateSymlink 创建符号链接（挂载层 SYMLINK op 用）。target 原样存储。

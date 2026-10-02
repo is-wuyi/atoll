@@ -678,10 +678,20 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 		Name       string `json:"name"`        // 分块提交的目标文件名
 		MinCopies  int    `json:"min_copies"`  // >0 = commit 前每块需 ≥N 个 Done 且存活的副本（改进项3）
 		Checksum   uint32 `json:"checksum"`    // legacy 整对象 CRC32C（0 = 未提供）
+		OpID       string `json:"op_id"`       // v2-3a：幂等凭据（响应丢失后重试回放）
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
+	}
+	// v2-3a 幂等回放：commit 是最终写，响应丢失后重试必须返回原结果而非
+	// ErrNotStaging 误报（审计 F3）。回放发生在一切校验之前——原结果即真相。
+	if req.OpID != "" && req.ChunkCount > 0 {
+		if rec, ok, err := s.store.GetOpResult(req.OpID); err == nil && ok {
+			w.Header().Set("X-Atoll-Replay", "true")
+			writeJSON(w, http.StatusOK, rec.Inode)
+			return
+		}
 	}
 	if req.ChunkCount > 0 {
 		if req.InodeID == 0 || req.Name == "" || req.Size <= 0 {
@@ -757,6 +767,10 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 			} else if len(old.Replicas) > 0 {
 				go s.notifyObjectDelete(old.ID, old.Replicas)
 			}
+		}
+		// v2-3a：记录 op 结果供重试回放（仅分块提交路径；legacy commit 天然幂等安全）。
+		if req.OpID != "" {
+			_ = s.store.PutOpResult(req.OpID, "commit", in)
 		}
 		writeJSON(w, http.StatusOK, in)
 		return
@@ -868,6 +882,17 @@ func (s *Server) handleCreateSmall(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	remote := q.Get("path")
 	overwrite := q.Get("overwrite") == "true"
+	opID := q.Get("op_id")
+	// v2-3a 幂等回放：同 op_id 的重试直接返回原结果（响应丢失后客户端重试不去重执行）。
+	if opID != "" {
+		if rec, ok, err := s.store.GetOpResult(opID); err == nil && ok {
+			w.Header().Set("X-Atoll-Replay", "true")
+			writeJSON(w, http.StatusOK, struct {
+				Inode types.Inode `json:"inode"`
+			}{Inode: rec.Inode})
+			return
+		}
+	}
 	replicas := 1
 	if n, err := strconv.Atoi(q.Get("replicas")); err == nil && n > 0 {
 		replicas = n
@@ -1005,6 +1030,10 @@ func (s *Server) handleCreateSmall(w http.ResponseWriter, r *http.Request) {
 	if gerr != nil {
 		httpError(w, http.StatusInternalServerError, gerr.Error())
 		return
+	}
+	// v2-3a：记录 op 结果供重试回放。
+	if opID != "" {
+		_ = s.store.PutOpResult(opID, "small", out)
 	}
 	writeJSON(w, http.StatusCreated, struct {
 		Inode types.Inode `json:"inode"`
