@@ -99,16 +99,25 @@ func (c *Client) Ls(path string) ([]types.Inode, error) {
 }
 
 // ClusterCapacity 返回集群总容量与已用字节（供挂载层 Statfs 报告可用空间）。
-// 数据源 /admin/overview 的聚合值（所有存活节点容量之和）。
+// 只累计**存活**节点：此前用 /admin/overview 的全量求和，死节点的声明容量也被计入，
+// 虚报可用空间 → Finder 放行必然中途失败的拷贝（审计 #7）。控制台的全局视图仍走
+// /admin/overview（"名义容量"语义保留在那里）。
 func (c *Client) ClusterCapacity() (total, used int64, err error) {
-	var ov struct {
+	var nodes []struct {
 		TotalBytes int64 `json:"total_bytes"`
 		UsedBytes  int64 `json:"used_bytes"`
+		Alive      bool  `json:"alive"`
 	}
-	if err := c.getJSON("/admin/overview", &ov); err != nil {
+	if err := c.getJSON("/admin/nodes", &nodes); err != nil {
 		return 0, 0, err
 	}
-	return ov.TotalBytes, ov.UsedBytes, nil
+	for _, n := range nodes {
+		if n.Alive {
+			total += n.TotalBytes
+			used += n.UsedBytes
+		}
+	}
+	return total, used, nil
 }
 
 // Rm 删除文件或空目录。
@@ -303,7 +312,9 @@ func (c *Client) getFromReplicas(in types.Inode, candidates []Replica, localPath
 		// 校验和：元数据有记录（非 0）且不符 → 该副本内容损坏，换下一个副本。
 		if in.Checksum != 0 && h.Sum32() != in.Checksum {
 			lastErr = fmt.Errorf("节点 %s: 校验和不符 %08x != %08x", n.Addr, h.Sum32(), in.Checksum)
-			go c.reportCorrupt(in.ID, n.ID) // 尽力上报：master 删坏对象并清 Done → 修复重拉
+			go func() {
+				_ = c.ReportSuspect(context.Background(), in, n.ID)
+			}()
 			continue
 		}
 		return nil
@@ -630,7 +641,7 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 		}
 		if ch.Checksum != 0 && types.CRC32C(buf) != ch.Checksum {
 			lastErr = fmt.Errorf("节点 %s: 块 %d 校验和不符", a, ch.Index)
-			go c.reportCorrupt(chunkID, id) // 尽力上报：master 删坏对象并清 Done → 修复重拉
+			go c.ReportCorrupt(chunkID, id) // 尽力上报：master 删坏对象并清 Done → 修复重拉
 			continue
 		}
 		if _, err := w.Write(buf); err != nil {
@@ -641,11 +652,11 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 	return fmt.Errorf("全部副本失败: %w", lastErr)
 }
 
-// reportCorrupt 读端发现某副本内容校验和不符时，尽力上报 master（失败静默）。
+// ReportCorrupt 读端发现某副本内容校验和不符时上报 master（失败静默）。
 // objectID 对分块传块对象 ID（ChunkID），对 legacy 传文件 inode ID（与 /files/replicated
 // 同编码）。master 会删该节点坏对象并清其 Done，使修复扫描重新拉取覆盖，自愈闭环闭合。
 // 调用方以 goroutine 触发：读路径已完成故障转移，上报不得阻塞或影响读结果。
-func (c *Client) reportCorrupt(objectID, nodeID uint64) {
+func (c *Client) ReportCorrupt(objectID, nodeID uint64) {
 	body, err := json.Marshal(map[string]uint64{"inode_id": objectID, "node_id": nodeID})
 	if err != nil {
 		return

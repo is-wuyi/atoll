@@ -38,6 +38,7 @@ type Mount struct {
 	cacheDir string // 写缓冲临时文件目录
 	token    auth.Token
 	tlsCfg   *tls.Config // 读句柄直连节点的 TLS 配置（nil = 普通 HTTP）
+	readHTTP *http.Client // 读句柄共享的 HTTP 客户端（连接池复用；此前每次 Open 新建）
 
 	// NoSmallPath 测试钩子：禁用小文件单请求通道，强制走 chunked/流式路径。
 	// 专测分块/流式机制的测试用（真实负载恒为 false）。
@@ -92,6 +93,7 @@ func NewWithTLS(c *client.Client, cacheDir string, replicas int, token auth.Toke
 		cacheDir: cacheDir,
 		token:    token,
 		tlsCfg:   tlsCfg,
+		readHTTP: &http.Client{Timeout: 30 * time.Second, Transport: auth.HTTPTransport(token, tlsCfg, nil)},
 		writes:   make(map[string]*writeHandle),
 		attrTTL:  2 * time.Second,
 		attrs:    make(map[string]attrCacheEntry),
@@ -452,10 +454,7 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 	if err != nil {
 		return nil, 0, mapErrno(err)
 	}
-	hc := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: auth.HTTPTransport(n.m.token, n.m.tlsCfg, nil),
-	}
+	hc := n.m.readHTTP
 	scheme := n.m.scheme()
 	if in.Chunked {
 		addr := make(map[uint64]string)
@@ -475,16 +474,19 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 			scheme: scheme,
 		}, 0, 0
 	}
-	addrs := candidateAddrs(reps)
-	if len(addrs) == 0 {
+	cands := candidateReplicas(reps)
+	if len(cands) == 0 {
 		return nil, 0, syscall.EIO
 	}
 	return &readHandle{
-		ino:    in.ID,
-		size:   in.Size,
-		addrs:  addrs,
-		http:   hc,
-		scheme: scheme,
+		ino:        in.ID,
+		size:       in.Size,
+		checksum:   in.Checksum,
+		generation: in.Generation,
+		cands:      cands,
+		http:       hc,
+		scheme:     scheme,
+		m:          n.m,
 	}, 0, 0
 }
 
@@ -571,35 +573,30 @@ func (n *node) Listxattr(_ context.Context, _ []byte) (uint32, syscall.Errno) {
 	return 0, 0 // 空属性列表
 }
 
-// Statfs 报告集群容量。默认(未实现时)全 0，Finder 会认为磁盘满、拒绝拷贝并报「空间不足」。
-// 这里用 /admin/overview 的集群总量/已用换算成块数报给内核。上游不可达时给一个非零兜底，
-// 避免因一次网络抖动就让 Finder 判定无空间。
-// clusterCapacityCached 返回集群容量，带 ~2s 缓存，避免 Finder 的密集 STATFS
-// 每次都打 master /admin/overview。出错时兜底报一个很大的容量（别让 Finder 误判满盘）。
-func (m *Mount) clusterCapacityCached() (total, used int64) {
+// clusterCapacityCached 缓存存活节点的物理容量。取不到数据就返回错误，不能把
+// 零个存活节点或请求失败转换成凭空存在的可用空间。
+func (m *Mount) clusterCapacityCached() (total, used int64, err error) {
 	m.statfsMu.Lock()
+	defer m.statfsMu.Unlock()
 	if !m.statfsAt.IsZero() && time.Since(m.statfsAt) < 2*time.Second {
-		total, used = m.statfsTot, m.statfsUsed
-		m.statfsMu.Unlock()
-		return total, used
+		return m.statfsTot, m.statfsUsed, nil
 	}
-	m.statfsMu.Unlock()
-	t, u, err := m.client.ClusterCapacity()
-	if err != nil || t <= 0 {
-		return 1 << 50, 0 // 兜底：乐观报大容量，不缓存（下次再试真值）
+	total, used, err = m.client.ClusterCapacity()
+	if err != nil {
+		return 0, 0, err
 	}
-	m.statfsMu.Lock()
-	m.statfsTot, m.statfsUsed, m.statfsAt = t, u, time.Now()
-	m.statfsMu.Unlock()
-	return t, u
+	m.statfsTot, m.statfsUsed, m.statfsAt = total, used, time.Now()
+	return total, used, nil
 }
 
 func (n *node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
 	const bsize = 4096
-	total, used := n.m.clusterCapacityCached()
-	if used > total {
-		used = total
+	total, used, err := n.m.clusterCapacityCached()
+	if err != nil {
+		return mapErrno(err)
 	}
+	total = max(total, 0)
+	used = min(max(used, 0), total)
 	out.Bsize = bsize
 	out.Frsize = bsize
 	out.Blocks = uint64(total / bsize)
@@ -610,14 +607,15 @@ func (n *node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
 	return 0
 }
 
-// candidateAddrs 从副本列表构造读取候选：done 优先，组内随机打散做负载均衡。
-func candidateAddrs(reps []client.Replica) []string {
-	var done, pending []string
+// candidateReplicas 从副本列表构造读取候选：done 优先，组内随机打散做负载均衡。
+// 保留节点 ID（读端发现内容损坏时上报自愈用）。
+func candidateReplicas(reps []client.Replica) []client.Replica {
+	var done, pending []client.Replica
 	for _, r := range reps {
 		if r.Done {
-			done = append(done, r.Addr)
+			done = append(done, r)
 		} else {
-			pending = append(pending, r.Addr)
+			pending = append(pending, r)
 		}
 	}
 	rand.Shuffle(len(done), func(i, j int) { done[i], done[j] = done[j], done[i] })
@@ -656,78 +654,6 @@ func mapErrno(err error) syscall.Errno {
 	}
 	// 传输层错误（超时/dial 失败/连接重置等）：瞬时故障，EIO 让内核可重试，不负缓存。
 	return syscall.EIO
-}
-
-// ---- 读句柄：按 Range 请求读取，故障切换 ----
-
-type readHandle struct {
-	ino    uint64
-	size   int64
-	addrs  []string
-	next   int
-	http   *http.Client
-	scheme string
-}
-
-var _ fs.FileReader = (*readHandle)(nil)
-
-// readRange 读取 [start, end] 闭区间；失败轮换地址重试一轮。
-func (rh *readHandle) readRange(start, end int64) ([]byte, syscall.Errno) {
-	want := end - start + 1
-	var lastErr error
-	for i := 0; i < len(rh.addrs); i++ {
-		addr := rh.addrs[(rh.next+i)%len(rh.addrs)]
-		req, err := http.NewRequest(http.MethodGet,
-			fmt.Sprintf("%s://%s/objects/%d", rh.scheme, addr, rh.ino), nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-		resp, err := rh.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("node %s: status %d", addr, resp.StatusCode)
-			continue
-		}
-		buf := make([]byte, want)
-		n, err := io.ReadFull(resp.Body, buf)
-		resp.Body.Close()
-		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-			lastErr = err
-			continue
-		}
-		// 长度校验：请求区间 [start,end] 完全落在文件大小内（调用方已按 size 收口），
-		// 所以短读 = 该副本内容被截断/不完整。此前 legacy 路径直接 return buf[:n]，
-		// 会把截断数据当完整内容返回（cat 正常退出、文件却短了）。改为轮换下一个副本。
-		if int64(n) != want {
-			lastErr = fmt.Errorf("node %s: 短读 %d != %d", addr, n, want)
-			continue
-		}
-		rh.next = (rh.next + i + 1) % len(rh.addrs) // 记住可用地址
-		return buf[:n], 0
-	}
-	_ = lastErr
-	return nil, syscall.EIO
-}
-
-func (rh *readHandle) Read(_ context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	if off >= rh.size {
-		return fuse.ReadResultData(nil), 0 // EOF
-	}
-	end := off + int64(len(dest)) - 1
-	if end >= rh.size {
-		end = rh.size - 1
-	}
-	data, errno := rh.readRange(off, end)
-	if errno != 0 {
-		return nil, errno
-	}
-	return fuse.ReadResultData(data), 0
 }
 
 // ---- 分块读句柄：按块表定位 → 块内 Range 读取 ----

@@ -58,22 +58,25 @@ func newTestCluster(t *testing.T, numNodes int) (*client.Client, *Mount) {
 	return c, m
 }
 
-// 纯函数：candidateAddrs 的 done 优先语义。
-func TestCandidateAddrs(t *testing.T) {
+// 纯函数：candidateReplicas 的 done 优先语义（保留节点 ID 供损坏上报）。
+func TestCandidateReplicas(t *testing.T) {
 	reps := []client.Replica{
-		{Addr: "a", Done: false},
-		{Addr: "b", Done: true},
-		{Addr: "c", Done: true},
-		{Addr: "d", Done: false},
+		{ID: 1, Addr: "a", Done: false},
+		{ID: 2, Addr: "b", Done: true},
+		{ID: 3, Addr: "c", Done: true},
+		{ID: 4, Addr: "d", Done: false},
 	}
 	for i := 0; i < 20; i++ { // 随机打散下 done 组内顺序会变，但组间次序不变
-		got := candidateAddrs(reps)
+		got := candidateReplicas(reps)
 		if len(got) != 4 {
 			t.Fatalf("长度: %v", got)
 		}
-		set := map[string]bool{got[0]: true, got[1]: true}
-		if !set["b"] || !set["c"] {
+		set := map[uint64]bool{got[0].ID: true, got[1].ID: true}
+		if !set[2] || !set[3] {
 			t.Fatalf("done 副本应排前: %v", got)
+		}
+		if got[0].ID == 0 {
+			t.Fatalf("候选必须保留节点 ID: %v", got)
 		}
 	}
 }

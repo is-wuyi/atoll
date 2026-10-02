@@ -114,6 +114,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /files/replica-targets", s.handleReplicaTargets) // node 查询推送目标
 	mux.HandleFunc("POST /files/replicated", s.handleReplicated)         // 从副本上报同步完成
 	mux.HandleFunc("POST /files/corrupt", s.handleReportCorrupt)         // 读端上报副本内容损坏
+	mux.HandleFunc("POST /files/suspect", s.handleReportSuspect)         // 版本校验后标记整对象副本待修
 	mux.HandleFunc("POST /files/small", s.handleCreateSmall)             // 小文件单请求通道（v2-2a）
 	mux.HandleFunc("POST /files/symlink", s.handleCreateSymlink) // 创建符号链接
 	mux.HandleFunc("POST /entry/rename", s.handleRename)                 // 同目录改名
