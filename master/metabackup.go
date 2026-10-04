@@ -63,7 +63,7 @@ type WALSegRef struct {
 
 // Manifest 是恢复的索引（宽复制到集群）。版本号单调递增，恢复时取 max。
 type Manifest struct {
-	Version       uint64      `json:"version"`      // 单调递增，= 快照批次号
+	Version       uint64      `json:"version"` // 单调递增，= 快照批次号
 	CreatedAt     time.Time   `json:"created_at"`
 	SnapshotSeq   uint64      `json:"snapshot_seq"` // 快照落地时刻的 WAL seq（WAL 重放起点）
 	Chunks        []ChunkRef  `json:"chunks"`       // 快照分块（按 idx 升序）
@@ -128,6 +128,18 @@ type MetaBackup struct {
 	// opMu 序列化备份操作（BackupOnce/ShipWAL/手动触发互斥，不重叠）。
 	opMu sync.Mutex
 
+	// —— 同步旋钮前缀确认状态（mu 保护）——
+	// syncBaseOK/syncBaseSeq：已确证的「同步基线」——最近一次成功备份的 manifest，
+	// 其每块快照与 manifest 本身都实际核验/补写到 ≥SyncMinCopies 份持有后承认；
+	// 基线锚点之下的前缀由该快照以 W 份耐久承接。
+	// syncSeq：逐帧确认水印——≤ 它的每一帧都已以 wal-sync-<seq> blob 取得
+	// ≥SyncMinCopies 确认。两者只前进不回退；进程内状态，重启/旋钮关→开/确认
+	// 要求提高一律作废重来（宁可重证、重补——PUT 幂等——不可复用不可靠旧值）。
+	// 注意：异步备份的 ≥1 份成功绝不能推进这两个值（一份异步副本 ≠ W 份同步保证）。
+	syncBaseOK  bool
+	syncBaseSeq uint64
+	syncSeq     uint64
+
 	// mu 保护下列状态字段（后台循环写、HTTP 状态查询读，短暂持有）。
 	mu           sync.Mutex
 	version      uint64    // 最近一次备份的版本号（进程内递增；恢复后由 manifest 校准）
@@ -151,7 +163,16 @@ func NewMetaBackup(store *meta.Store, nodeMaxAge time.Duration, cfg MetaBackupCo
 }
 
 // SetStore 设置元数据库（NewMetaBackup 可传 nil，恢复决策产出 store 后再注入）。
-func (b *MetaBackup) SetStore(s *meta.Store) { b.store = s }
+// 换库（恢复/重建）后旧的前缀确认状态一律作废：宁可重新确证基线、逐帧重补，
+// 不可复用可能不可靠的旧水印。
+func (b *MetaBackup) SetStore(s *meta.Store) {
+	b.mu.Lock()
+	b.store = s
+	b.syncBaseOK = false
+	b.syncBaseSeq = 0
+	b.syncSeq = 0
+	b.mu.Unlock()
+}
 
 // Config 返回当前配置快照（线程安全）。
 func (b *MetaBackup) Config() MetaBackupConfig {
@@ -162,6 +183,7 @@ func (b *MetaBackup) Config() MetaBackupConfig {
 
 // InstallSyncHook 把同步 ship 逻辑注册为 store 的 post-commit 钩子。
 // 应在 SetStore 之后、开始服务之前调用一次。钩子内部按当前配置决定是否真同步。
+// op 结果回放路径（store.EnsureDurable）复用同一钩子做确认，防止回放绕过同步前缀。
 func (b *MetaBackup) InstallSyncHook() {
 	if b.store == nil {
 		return
@@ -169,16 +191,75 @@ func (b *MetaBackup) InstallSyncHook() {
 	b.store.SetPostCommitHook(b.syncShipFrame)
 }
 
-// syncShipFrame 是 post-commit 钩子：同步旋钮开时，把刚提交的这一帧作为独立 WAL blob
-// 复制到 W 个负载最低节点，达不到 W 个确认则返回 error（write 透传给客户端）。
-// 旋钮关时空转（error=nil），完全走后台异步备份——零额外开销。
+// syncShipFrame 是 post-commit 钩子：把「该帧及其之前尚未确认的整段前缀」确认到
+// 集群后才放行 ack；旋钮关时空转（error=nil），完全走后台异步备份——零额外开销。
 //
-// blob key: wal-sync-<seq>，与后台成段的 wal-<ver>-<from>-<to> 区分。恢复时两者都会
-// 被 LIST 扫到重放（见 recovery），所以"落了盘但没进 manifest"的同步帧不会丢。
+// blob key: wal-sync-<seq>（每帧一个，幂等 PUT），与后台成段的 wal-<ver>-<from>-<to>
+// 区分。恢复时两者按 seq 合并去重重放（见 recovery.gatherAllFramesAfter）。
 func (b *MetaBackup) syncShipFrame(seq uint64, frame []byte) error {
-	cfg := b.Config()
+	return b.syncConfirmThrough(seq)
+}
+
+// syncState 读取同步确认状态快照。
+func (b *MetaBackup) syncState() (cfg MetaBackupConfig, baseOK bool, base, syncSeq uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cfg, b.syncBaseOK, b.syncBaseSeq, b.syncSeq
+}
+
+// syncConfirmThrough 把「seq 及其之前的全部 WAL 前缀」确认到集群，返回 nil 才允许
+// 对外 ack seq。流程：
+//  1. 基线未确证（进程启动/旋钮刚开/确认要求提高）→ 先确证基线
+//     （ensureSyncBaseline：核验/补写最近 manifest 的快照块与 manifest 至 ≥W 份）。
+//     无基准快照或核验补写不达 W → 报错 fail-closed。
+//  2. 逐帧补齐 (syncSeq, seq]：每帧以 wal-sync-<seq> 独立 blob 取得 ≥W 确认，任一帧
+//     失败立即报错——绝不 ack 出跳号状态；本地已被截断的缺口段必须被基线覆盖，
+//     否则报错，绝不静默跳过。
+//  3. 全部确认后推进 syncSeq。
+//
+// 调用方：post-commit 钩子（commitMu 内）与 store.EnsureDurable（自带 commitMu）。
+// 锁序：commitMu → b.mu / bbolt / opMu（基线确证只读集群不触发备份）；opMu 持有者
+// 从不反向等 commitMu，无环。
+func (b *MetaBackup) syncConfirmThrough(seq uint64) error {
+	if seq == 0 {
+		return nil
+	}
+	cfg, baseOK, base, syncSeq := b.syncState()
 	if !cfg.SyncBeforeAck {
-		return nil // 旋钮关：异步模式，钩子不介入
+		return nil // 旋钮关：异步模式，不介入
+	}
+	if b.store == nil {
+		return fmt.Errorf("同步复制: 元数据库未就绪")
+	}
+	if !baseOK {
+		if err := b.ensureSyncBaseline(cfg); err != nil {
+			return err
+		}
+		_, _, base, syncSeq = b.syncState()
+	}
+	if base >= seq || syncSeq >= seq {
+		return nil // 已确证基线（W 份快照）或逐帧确认已覆盖到 seq
+	}
+	frames, err := b.store.FramesSince(syncSeq)
+	if err != nil {
+		return fmt.Errorf("同步复制: 读取待补前缀失败: %w", err)
+	}
+	// 本地地板之下的缺口：只可能来自历史截断（截断只发生在成功备份之后）。
+	// 缺口段必须被已确证基线（W 份快照）承接，否则 fail-closed——绝不静默跳过。
+	if len(frames) == 0 || frames[0].Seq > syncSeq+1 {
+		gapEnd := seq
+		if len(frames) > 0 {
+			gapEnd = frames[0].Seq - 1
+		}
+		if gapEnd > base {
+			return fmt.Errorf("同步复制: 本地 WAL 缺口 (%d,%d] 超出已确证基线 %d——先完成一次达 W 的基准备份（启动首拍/控制台触发）再写", syncSeq, gapEnd, base)
+		}
+		if gapEnd >= seq {
+			return nil // 待确认段整体已被 W 基线快照覆盖
+		}
+	}
+	if len(frames) == 0 || frames[len(frames)-1].Seq < seq {
+		return fmt.Errorf("同步复制: 本地 WAL 前缀异常（应连续覆盖到 %d）", seq)
 	}
 	targets, err := b.pickLeastLoaded(cfg.Replicas)
 	if err != nil {
@@ -189,11 +270,106 @@ func (b *MetaBackup) syncShipFrame(seq uint64, frame []byte) error {
 		// 存活节点不足要求的 W → 写失败（决策点3：不偷偷降级，宁可写失败）。
 		return fmt.Errorf("同步复制: 需要 %d 个节点确认，仅 %d 个存活", need, len(targets))
 	}
-	key := fmt.Sprintf("wal-sync-%d", seq)
-	blob := meta.EncodeSyncBlob(seq, frame) // 补 seq 头，使 blob 可被 DecodeWALSegment 读回
-	holders := b.shipBlob(targets, key, blob)
-	if len(holders) < need {
-		return fmt.Errorf("同步复制: 帧 %d 仅 %d/%d 个节点确认", seq, len(holders), need)
+	for _, f := range frames {
+		if f.Seq <= syncSeq {
+			continue
+		}
+		if f.Seq > seq {
+			break // 更后的帧由它们自己的钩子/确认负责
+		}
+		holders := b.shipBlob(targets, fmt.Sprintf("wal-sync-%d", f.Seq), meta.EncodeFrameSyncBlob(f))
+		if len(holders) < need {
+			return fmt.Errorf("同步复制: 帧 %d 仅 %d/%d 个节点确认（前缀 %d..%d 未补齐，拒绝 ack %d）",
+				f.Seq, len(holders), need, syncSeq+1, seq, seq)
+		}
+	}
+	b.mu.Lock()
+	if seq > b.syncSeq {
+		b.syncSeq = seq
+	}
+	b.mu.Unlock()
+	return nil
+}
+
+// ensureSyncBaseline 确证「同步基线」：以最近一次成功备份的 manifest 为候选，实际
+// 向存活节点核验每块快照与 manifest 本身的持有份数（GET + CRC 校验才算数），不足
+// SyncMinCopies 的从完好副本读回补写；全部达标后才承认基线——其快照锚点之下的
+// 前缀由该快照以 W 份耐久承接。无法达成则报错：绝不静默拿 ≥1 份的异步基线冒充
+// W 份。
+// 不在钩子里另起全量快照给写放行：缺基准时 fail-closed 提示先完成一次基准备份
+// （服务启动 StartLoop 首拍 / 控制台手动触发），避免把任意未确认状态整库拍照。
+func (b *MetaBackup) ensureSyncBaseline(cfg MetaBackupConfig) error {
+	b.mu.Lock()
+	m := b.lastManifest
+	b.mu.Unlock()
+	if m.Version == 0 {
+		return fmt.Errorf("同步复制: 尚无基准快照可确证同步基线——先完成一次全量备份（启动首拍或控制台触发）再接受同步写")
+	}
+	need := cfg.SyncMinCopies
+	alive, err := b.store.ListAliveNodes(b.nodeMaxAge)
+	if err != nil {
+		return fmt.Errorf("同步复制: 基线确证失败: %w", err)
+	}
+	if need > len(alive) {
+		return fmt.Errorf("同步复制: 基线确证需要 ≥%d 个存活节点，仅 %d 个", need, len(alive))
+	}
+	for _, ch := range m.Chunks {
+		if err := b.topUpBlob(alive, ch.Key, ch.Size, ch.CRC32C, need); err != nil {
+			return fmt.Errorf("同步复制: 基线确证失败（快照块 %s）: %w", ch.Key, err)
+		}
+	}
+	mfJSON, err := marshalManifest(&m)
+	if err != nil {
+		return fmt.Errorf("同步复制: 基线确证失败: %w", err)
+	}
+	if err := b.topUpBlob(alive, ManifestKey, int64(len(mfJSON)), types.CRC32C(mfJSON), need); err != nil {
+		return fmt.Errorf("同步复制: 基线确证失败（manifest）: %w", err)
+	}
+	b.mu.Lock()
+	b.syncBaseOK = true
+	if m.SnapshotSeq > b.syncBaseSeq {
+		b.syncBaseSeq = m.SnapshotSeq
+	}
+	b.mu.Unlock()
+	return nil
+}
+
+// topUpBlob 核验 key 在存活节点上的持有份数（GET 回读 + CRC 校验通过才算持有），
+// 不足 need 时从任一完好副本读回、补写到缺失/损坏的节点，直到 ≥need。
+// 一个完好副本都找不到则报错（此时基线不可信，调用方 fail-closed）。
+func (b *MetaBackup) topUpBlob(alive []types.NodeInfo, key string, size int64, crc uint32, need int) error {
+	verified := 0
+	var good []byte
+	var lacking []types.NodeInfo
+	for _, n := range alive {
+		data, found, err := b.getBlob(n.Addr, key)
+		if err == nil && found && int64(len(data)) == size && types.CRC32C(data) == crc {
+			verified++
+			if good == nil {
+				good = data
+			}
+			continue
+		}
+		// 缺失或损坏：不计入持有，列入待补写（恢复端 fetchChunk 也有 CRC 兜底）。
+		lacking = append(lacking, n)
+	}
+	if verified >= need {
+		return nil
+	}
+	if good == nil {
+		return fmt.Errorf("所有存活节点上都取不到 CRC 完好的副本")
+	}
+	for _, n := range lacking {
+		if verified >= need {
+			return nil
+		}
+		if err := b.putBlob(n.Addr, key, good, crc); err != nil {
+			continue
+		}
+		verified++
+	}
+	if verified < need {
+		return fmt.Errorf("仅 %d/%d 个节点可确认持有（需 ≥%d）", verified, len(alive), need)
 	}
 	return nil
 }
@@ -202,7 +378,17 @@ func (b *MetaBackup) syncShipFrame(seq uint64, frame []byte) error {
 func (b *MetaBackup) SetConfig(c MetaBackupConfig) {
 	c = c.normalize()
 	b.mu.Lock()
+	old := b.cfg
 	b.cfg = c
+	// 同步确认状态不可跨「要求变化」复用：旋钮关→开（异步期的备份只承诺 ≥1 份）、
+	// 确认副本数提高（旧确认只代表旧要求）——基线与逐帧水印全部作废，下笔写重新
+	// 确证基线、逐帧重补（PUT 幂等，只多花带宽）。调低不撤销已成立的确认
+	// （≥旧要求即 ≥新要求）。
+	if c.SyncBeforeAck && (!old.SyncBeforeAck || c.SyncMinCopies > old.SyncMinCopies) {
+		b.syncBaseOK = false
+		b.syncBaseSeq = 0
+		b.syncSeq = 0
+	}
 	b.mu.Unlock()
 }
 
@@ -354,7 +540,7 @@ var metaChunkSize = 16 << 20 // 16MB
 
 // 备份错误。
 var (
-	ErrNoAliveNodes  = fmt.Errorf("metabackup: 无存活节点，无法备份")
+	ErrNoAliveNodes   = fmt.Errorf("metabackup: 无存活节点，无法备份")
 	ErrShipIncomplete = fmt.Errorf("metabackup: blob 未能复制到任何节点")
 )
 
@@ -388,6 +574,14 @@ func (b *MetaBackup) recordResult(err error) {
 // backupOnceLocked 是 BackupOnce 的实体（调用方已持 opMu）。
 func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
 	cfg := b.Config()
+	// 同步旋钮开：备份本身必须达到同步耐久标准——每块快照与 manifest 都要 ≥need
+	// 份持有，否则整体失败（不更新 manifest、不截断、不清理）。否则备份会把恢复
+	// 锚点换成不足 W 份的新快照，已 ack 写的 W 承诺被静默降级（一份异步快照
+	// ≠ W 份同步保证）。截断/清理只发生在达标成功之后，天然被新基线钳制。
+	need := 1
+	if cfg.SyncBeforeAck {
+		need = cfg.SyncMinCopies
+	}
 	// 选负载最低的 K 个节点放快照/WAL；manifest 稍后宽复制到全部存活节点。
 	targets, err := b.pickLeastLoaded(cfg.Replicas)
 	if err != nil {
@@ -435,8 +629,8 @@ func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
 		part := data[off:end]
 		key := fmt.Sprintf("snapshot-%d-%d", ver, idx)
 		holders := b.shipBlob(targets, key, part)
-		if len(holders) == 0 {
-			return Manifest{}, fmt.Errorf("%w: %s", ErrShipIncomplete, key)
+		if len(holders) < need {
+			return Manifest{}, fmt.Errorf("%w: %s 仅 %d/%d 份（同步模式要求 ≥%d）", ErrShipIncomplete, key, len(holders), len(targets), need)
 		}
 		m.Chunks = append(m.Chunks, ChunkRef{
 			Key: key, Size: int64(len(part)), CRC32C: types.CRC32C(part), Holders: holders,
@@ -458,15 +652,23 @@ func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
 		return Manifest{}, err
 	}
 	mfHolders := b.shipBlob(allAlive, ManifestKey, mfJSON)
-	if len(mfHolders) == 0 {
-		return Manifest{}, fmt.Errorf("%w: manifest", ErrShipIncomplete)
+	if len(mfHolders) < need {
+		return Manifest{}, fmt.Errorf("%w: manifest 仅 %d/%d 份（同步模式要求 ≥%d）", ErrShipIncomplete, len(mfHolders), len(allAlive), need)
 	}
 
 	// 备份成功：记住当前 manifest（供 ShipWAL 增量追加），截断已固化的 WAL（<= snapSeq）。
 	// 截断失败只记录不致命——多留些旧帧只是占点空间，不影响正确性。
+	// 旋钮开时此备份已逐块校验 ≥W（见上）：它就是新的 W 可靠同步基线，截断/清理
+	// 越过的前缀由这份 W 份快照承接。
 	b.mu.Lock()
 	b.lastManifest = m
 	b.lastBackupAt = time.Now()
+	if cfg.SyncBeforeAck {
+		b.syncBaseOK = true
+		if m.SnapshotSeq > b.syncBaseSeq {
+			b.syncBaseSeq = m.SnapshotSeq
+		}
+	}
 	b.mu.Unlock()
 	_ = b.store.TruncateWALThrough(snapSeq)
 
@@ -593,7 +795,14 @@ func (b *MetaBackup) ShipWAL() (Manifest, bool, error) {
 	seg := meta.EncodeWALSegment(frames)
 	key := fmt.Sprintf("wal-%d-%d-%d", base.Version, from+1, toSeq)
 
-	targets, err := b.pickLeastLoaded(b.Config().Replicas)
+	cfg := b.Config()
+	// 同步旋钮开：manifest 重写必须仍达 ≥W 份持有（它是恢复的入口索引），否则整体
+	// 失败、不更新内存 manifest——旧 manifest 继续生效。
+	need := 1
+	if cfg.SyncBeforeAck {
+		need = cfg.SyncMinCopies
+	}
+	targets, err := b.pickLeastLoaded(cfg.Replicas)
 	if err != nil {
 		return Manifest{}, false, err
 	}
@@ -619,8 +828,9 @@ func (b *MetaBackup) ShipWAL() (Manifest, bool, error) {
 	if err != nil {
 		return Manifest{}, false, err
 	}
-	if len(b.shipBlob(allAlive, ManifestKey, mfJSON)) == 0 {
-		return Manifest{}, false, fmt.Errorf("%w: manifest", ErrShipIncomplete)
+	mfHolders := b.shipBlob(allAlive, ManifestKey, mfJSON)
+	if len(mfHolders) < need {
+		return Manifest{}, false, fmt.Errorf("%w: manifest 仅 %d/%d 份（同步模式要求 ≥%d）", ErrShipIncomplete, len(mfHolders), len(allAlive), need)
 	}
 	b.mu.Lock()
 	b.lastManifest = m
@@ -681,21 +891,24 @@ func (b *MetaBackup) Wait() { b.wg.Wait() }
 
 // BackupStatus 是元数据备份的可观测状态（控制台展示用）。
 type BackupStatus struct {
-	Enabled      bool      `json:"enabled"`       // 是否配了种子、跑着备份循环
-	Version      uint64    `json:"version"`       // 当前 manifest 版本
-	SnapshotSeq  uint64    `json:"snapshot_seq"`  // 快照锚点 WAL seq
-	LatestSeq    uint64    `json:"latest_seq"`    // 含 WAL 段的最新 seq
-	SnapshotSize int64     `json:"snapshot_size"` // 快照总字节
-	Chunks       []ChunkRef  `json:"chunks"`
-	WALSegs      []WALSegRef `json:"wal_segs"`
-	LastBackupAt time.Time `json:"last_backup_at"`
-	LastError    string    `json:"last_error"`
-	Retention    int       `json:"retention"`
-	Replicas     int       `json:"replicas"`
-	IntervalSec  int       `json:"interval_sec"`   // 快照周期（秒），面板展示/编辑
-	SyncBeforeAck bool     `json:"sync_before_ack"` // 同步旋钮当前状态
-	SyncMinCopies int      `json:"sync_min_copies"`
-	Versions     []VersionInfo `json:"versions"` // 集群实际留存的各代版本（保留策略可视化）
+	Enabled       bool        `json:"enabled"`       // 是否配了种子、跑着备份循环
+	Version       uint64      `json:"version"`       // 当前 manifest 版本
+	SnapshotSeq   uint64      `json:"snapshot_seq"`  // 快照锚点 WAL seq
+	LatestSeq     uint64      `json:"latest_seq"`    // 含 WAL 段的最新 seq
+	SnapshotSize  int64       `json:"snapshot_size"` // 快照总字节
+	Chunks        []ChunkRef  `json:"chunks"`
+	WALSegs       []WALSegRef `json:"wal_segs"`
+	LastBackupAt  time.Time   `json:"last_backup_at"`
+	LastError     string      `json:"last_error"`
+	Retention     int         `json:"retention"`
+	Replicas      int         `json:"replicas"`
+	IntervalSec   int         `json:"interval_sec"`    // 快照周期（秒），面板展示/编辑
+	SyncBeforeAck bool        `json:"sync_before_ack"` // 同步旋钮当前状态
+	SyncMinCopies int         `json:"sync_min_copies"`
+	// SyncConfirmedSeq 已确认前缀：≤ 它的每一帧都已按同步策略在集群达到 W 份
+	// （逐帧 wal-sync 确认或达 W 的快照基线承接）。0 = 基线未确证（fail-closed 中）。
+	SyncConfirmedSeq uint64        `json:"sync_confirmed_seq"`
+	Versions         []VersionInfo `json:"versions"` // 集群实际留存的各代版本（保留策略可视化）
 }
 
 // Status 返回当前备份状态快照（线程安全）。
@@ -703,21 +916,26 @@ func (b *MetaBackup) Status() BackupStatus {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	m := b.lastManifest
+	confirmed := b.syncSeq
+	if b.syncBaseOK && b.syncBaseSeq > confirmed {
+		confirmed = b.syncBaseSeq
+	}
 	return BackupStatus{
-		Enabled:      b.version > 0 || m.Version > 0,
-		Version:      m.Version,
-		SnapshotSeq:  m.SnapshotSeq,
-		LatestSeq:    m.LatestSeq(),
-		SnapshotSize: m.SnapshotBytes,
-		Chunks:       m.Chunks,
-		WALSegs:      m.WALSegs,
-		LastBackupAt:  b.lastBackupAt,
-		LastError:     b.lastErr,
-		Retention:     b.cfg.Retention,
-		Replicas:      b.cfg.Replicas,
-		IntervalSec:   int(b.cfg.Interval / time.Second),
-		SyncBeforeAck: b.cfg.SyncBeforeAck,
-		SyncMinCopies: b.cfg.SyncMinCopies,
+		Enabled:          b.version > 0 || m.Version > 0,
+		Version:          m.Version,
+		SnapshotSeq:      m.SnapshotSeq,
+		LatestSeq:        m.LatestSeq(),
+		SnapshotSize:     m.SnapshotBytes,
+		Chunks:           m.Chunks,
+		WALSegs:          m.WALSegs,
+		LastBackupAt:     b.lastBackupAt,
+		LastError:        b.lastErr,
+		Retention:        b.cfg.Retention,
+		Replicas:         b.cfg.Replicas,
+		IntervalSec:      int(b.cfg.Interval / time.Second),
+		SyncBeforeAck:    b.cfg.SyncBeforeAck,
+		SyncMinCopies:    b.cfg.SyncMinCopies,
+		SyncConfirmedSeq: confirmed,
 	}
 }
 

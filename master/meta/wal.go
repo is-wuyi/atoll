@@ -177,6 +177,48 @@ type PostCommitHook func(seq uint64, frame []byte) error
 // SetPostCommitHook 注册提交后钩子（nil 清除）。非并发安全，应在服务启动、开始写之前设置。
 func (s *Store) SetPostCommitHook(h PostCommitHook) { s.postCommit = h }
 
+// EnsureDurable 把「当前 WAL seq 及其之前的全部前缀」按当前同步策略确认到集群。
+// op 结果回放路径在返回既有成功结果前必须调用它：幂等记录与业务变更同事务落库，
+// 若该事务的 post-commit 钩子曾失败，直接回放会绕过同步确认、把未达 W 的前缀当成
+// 已确认成功对外承诺。实现上复用提交后钩子（与新写完全相同的确认路径，含基线
+// 核验与前缀补齐）：
+//   - 异步模式：钩子内部按 cfg 判定，直接放行（空操作）；
+//   - 当前帧已被截断：帧体传 nil，由备份侧的基线/缺口规则裁决——缺口超出已确证
+//     基线则报错，绝不静默跳过。
+//
+// 持 commitMu 与写路径互斥：确认期间不会有新帧推进 seq。
+func (s *Store) EnsureDurable() error {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+	if s.postCommit == nil {
+		return nil // 未注册钩子 = 同步旋钮不可用，异步模式无操作
+	}
+	var seq uint64
+	var body []byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketMeta).Get(keyWALSeq)
+		if v == nil {
+			return nil
+		}
+		seq = beU64(v)
+		if seq == 0 {
+			return nil // 空 WAL，无前缀可确认
+		}
+		// 当前帧可能已被快照截断（body=nil）：交给钩子侧的基线/缺口规则处理。
+		if raw := tx.Bucket(bucketWAL).Get(u64be(seq)); raw != nil {
+			body = cloneBytes(raw)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if seq == 0 {
+		return nil
+	}
+	return s.postCommit(seq, body)
+}
+
 // write 执行一个记录型写事务：跑 fn，若产生了变更则把这一帧原子追加进 wal 桶。
 // 提交成功后，若注册了 post-commit 钩子且本次有变更，调用之——钩子 error 透传给调用方。
 func (s *Store) write(fn func(*txw) error) error {
@@ -316,6 +358,13 @@ func EncodeSyncBlob(seq uint64, frameBody []byte) []byte {
 	binary.BigEndian.PutUint32(buf[8:], uint32(len(frameBody)))
 	copy(buf[12:], frameBody)
 	return buf
+}
+
+// EncodeFrameSyncBlob 把一个已解码帧打成 wal-sync-<seq> 的单帧段 blob（与
+// EncodeSyncBlob(f.Seq, encodeFrame(f.Muts)) 等价）。前缀补齐钩子从 FramesSince
+// 拿回帧后用它落集群，无需保留原始帧体字节。
+func EncodeFrameSyncBlob(f Frame) []byte {
+	return EncodeSyncBlob(f.Seq, encodeFrame(f.Muts))
 }
 
 // EncodeWALSegment 把一批帧打包成一个段 blob。

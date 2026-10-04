@@ -13,6 +13,10 @@ import (
 // 同步旋钮开启：写元数据时钩子把帧同步 ship 到集群，写成功。
 func TestSyncKnobShipsFrameOnWrite(t *testing.T) {
 	store, b, addrs := newBackupCluster(t, 3)
+	// 同步基线前提：先做一次基准备份建立 manifest（否则同步模式 fail-closed 拒写）。
+	if _, err := b.BackupOnce(); err != nil {
+		t.Fatalf("BackupOnce: %v", err)
+	}
 	b.SetConfig(MetaBackupConfig{Replicas: 3, Retention: 3, Interval: time.Hour, SyncBeforeAck: true, SyncMinCopies: 2})
 	b.InstallSyncHook()
 
@@ -113,6 +117,10 @@ func TestRecoverPicksUpLooseSyncFrames(t *testing.T) {
 // prune 清理被快照覆盖的同步帧 blob。
 func TestPruneCleansSyncBlobsCoveredBySnapshot(t *testing.T) {
 	store, b, addrs := newBackupCluster(t, 2)
+	// 同步基线前提：先做一次基准备份建立 manifest（否则同步模式 fail-closed 拒写）。
+	if _, err := b.BackupOnce(); err != nil {
+		t.Fatalf("BackupOnce: %v", err)
+	}
 	b.SetConfig(MetaBackupConfig{Replicas: 2, Retention: 3, Interval: time.Hour, SyncBeforeAck: true, SyncMinCopies: 1})
 	b.InstallSyncHook()
 

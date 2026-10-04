@@ -755,6 +755,10 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 	// ErrNotStaging 误报（审计 F3）。回放发生在一切校验之前——原结果即真相。
 	if req.OpID != "" && req.ChunkCount > 0 {
 		if rec, ok, err := s.store.GetOpResult(req.OpID); err == nil && ok {
+			if err := s.store.EnsureDurable(); err != nil {
+				httpError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			w.Header().Set("X-Atoll-Replay", "true")
 			writeJSON(w, http.StatusOK, rec.Inode)
 			return
@@ -833,7 +837,10 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 		}
 		// v2-3a：记录 op 结果供重试回放（仅分块提交路径；legacy commit 天然幂等安全）。
 		if req.OpID != "" {
-			_ = s.store.PutOpResult(req.OpID, "commit", in)
+			if err := s.store.PutOpResult(req.OpID, "commit", in); err != nil {
+				httpErrorFromMeta(w, err)
+				return
+			}
 		}
 		writeJSON(w, http.StatusOK, in)
 		return
@@ -978,6 +985,10 @@ func (s *Server) handleCreateSmall(w http.ResponseWriter, r *http.Request) {
 				httpError(w, http.StatusConflict, meta.ErrOpConflict.Error())
 				return
 			}
+			if err := s.store.EnsureDurable(); err != nil {
+				httpError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			w.Header().Set("X-Atoll-Replay", "true")
 			writeJSON(w, http.StatusOK, struct {
 				Inode types.Inode `json:"inode"`
@@ -1030,6 +1041,10 @@ func (s *Server) handleCreateSmall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if replay != nil {
+		if err := s.store.EnsureDurable(); err != nil {
+			httpError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		w.Header().Set("X-Atoll-Replay", "true")
 		writeJSON(w, http.StatusOK, struct {
 			Inode types.Inode `json:"inode"`
@@ -1069,6 +1084,10 @@ func (s *Server) handleCreateSmall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if wasReplay {
+		if err := s.store.EnsureDurable(); err != nil {
+			httpError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		w.Header().Set("X-Atoll-Replay", "true")
 		// 提交期回放（并发同 op 的慢者）：返回 200 与原结果，语义同 prepare 期回放。
 		writeJSON(w, http.StatusOK, struct {

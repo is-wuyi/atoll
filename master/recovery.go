@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,7 +35,7 @@ func chunkKeyIdx(key string) int {
 // 两件事分开（见 HA 设计决策点 3）：
 //   - 成员发现"有哪些节点"：靠种子列表（配置里 ≥1 个已知节点地址）。完整 gossip 是后续
 //     优化；当前直接把种子当作可达节点集合查询。
-//   - 版本发现"哪个最新"：向种子收 manifest 取 max 版本（读写集合相交 R+W>N 保证看到最新）。
+//   - 版本发现：向可达种子收 manifest，选择最大日志水位；这不是多数派读取证明。
 //
 // fail-stop（决策点 4）：干净情形静默用本地；危险/歧义情形硬停等人，绝不自作主张覆盖。
 
@@ -51,10 +52,10 @@ const (
 type RecoverAction int
 
 const (
-	ActionUseLocal    RecoverAction = iota // 直接打开本地库
-	ActionRebuild                          // 从集群拉快照+WAL 重建
-	ActionFreshStart                       // 全新集群，无本地也无集群备份
-	ActionFailStop                         // 硬停，等人工裁决
+	ActionUseLocal   RecoverAction = iota // 直接打开本地库
+	ActionRebuild                         // 从集群拉快照+WAL 重建
+	ActionFreshStart                      // 全新集群，无本地也无集群备份
+	ActionFailStop                        // 硬停，等人工裁决
 )
 
 func (a RecoverAction) String() string {
@@ -72,12 +73,13 @@ func (a RecoverAction) String() string {
 
 // RecoverInput 是决策所需的全部事实（纯数据，便于单测决策逻辑）。
 type RecoverInput struct {
-	Mode          RecoverMode
-	LocalExists   bool
-	LocalSeq      uint64 // 本地库的 WAL seq（LocalExists=true 时有效）
-	ClusterFound  bool   // 是否从种子收到任何 manifest
-	ClusterSeq    uint64 // 集群 manifest 的 max LatestSeq（ClusterFound=true 时有效）
-	SeedsGiven    bool   // 是否配置了种子（未配置 = 不启用 HA 恢复，走 legacy 行为）
+	Mode           RecoverMode
+	LocalExists    bool
+	LocalSeq       uint64 // 本地库的 WAL seq（LocalExists=true 时有效）
+	ClusterFound   bool   // 是否从种子收到任何 manifest
+	ClusterUnknown bool   // 是否有种子不可达/响应损坏（无法确认"没有"）
+	ClusterSeq     uint64 // 集群 manifest 的 max LatestSeq（ClusterFound=true 时有效）
+	SeedsGiven     bool   // 是否配置了种子（未配置 = 不启用 HA 恢复，走 legacy 行为）
 }
 
 // decideRecovery 是纯决策函数：给定事实，返回动作与人类可读理由。
@@ -95,6 +97,10 @@ func decideRecovery(in RecoverInput) (RecoverAction, string) {
 			return ActionFailStop, "--recover-from=cluster 但集群没有可用 manifest"
 		}
 		return ActionRebuild, "人工指定从集群重建"
+	default:
+		if in.Mode != RecoverAuto && in.Mode != "" {
+			return ActionFailStop, fmt.Sprintf("未知恢复模式 %q", in.Mode)
+		}
 	}
 
 	// auto 模式。
@@ -118,8 +124,13 @@ func decideRecovery(in RecoverInput) (RecoverAction, string) {
 
 	// 本地不存在。
 	if !in.ClusterFound {
-		// 本地无、集群也无：全新集群首次启动。
-		return ActionFreshStart, "本地与集群均无元数据，全新集群启动"
+		if in.ClusterUnknown {
+			// 有种子答不上来："没查到 manifest"不等于"确认没有旧集群"——
+			// 若这是旧集群 master 换机，建空库开始写会制造脑裂/旧对象被 GC 误删。
+			return ActionFailStop, "本地库不存在且种子备份状态不可确认（不可达或响应无效）；请恢复种子连接并核对备份后重试，不能据此初始化空库"
+		}
+		// 全部种子明确回答无 manifest：全新集群首次启动。
+		return ActionFreshStart, "本地与集群均确认无元数据，全新集群启动"
 	}
 	// 本地没了但集群有备份：疑似换机/盘坏，硬停等人决定是否从集群重建。
 	return ActionFailStop, "本地库不存在但集群有元数据备份（疑似换机/盘损），硬停等人工决定（--recover-from=cluster 重建 / 确认全新则先清空集群备份）"
@@ -130,128 +141,261 @@ type ErrFailStop struct{ Reason string }
 
 func (e *ErrFailStop) Error() string { return "元数据恢复需人工裁决: " + e.Reason }
 
-// gatherClusterSeq 向种子收 manifest，返回 max LatestSeq 与承载它的 manifest。
-// 任一种子不可达/无 manifest 只跳过；全都没有则 found=false。
-func (b *MetaBackup) gatherClusterManifest(seeds []string) (best Manifest, found bool) {
+// gatherClusterManifest 向种子收 manifest，返回 max LatestSeq 的 manifest、是否找到、
+// 以及是否有种子"状态未知"（网络错误/损坏响应）。关键区分：found=false 且 unknown=false
+// 才是"所有种子都明确说没有"（可 fresh start）；只要有一个种子没答上来，
+// 本地库又不在，就绝不能把它当全新集群。
+func (b *MetaBackup) gatherClusterManifest(seeds []string) (best Manifest, found bool, unknown bool) {
 	for _, addr := range seeds {
 		raw, ok, err := b.getBlob(addr, ManifestKey)
-		if err != nil || !ok {
+		if err != nil {
+			unknown = true
+			log.Printf("恢复: 种子 %s 的 manifest 不可达: %v", addr, err)
+			continue
+		}
+		if !ok {
+			// 路由不存在也可能返回 404；必须确认节点有备份接口且清单为空。
+			blobs, listErr := b.listBlobs(addr)
+			if listErr != nil || blobs == nil || len(blobs) != 0 {
+				unknown = true
+				log.Printf("恢复: 种子 %s 缺 manifest，但不能确认备份为空（条目=%d，错误=%v）", addr, len(blobs), listErr)
+			}
 			continue
 		}
 		m, err := unmarshalManifest(raw)
+		if err == nil {
+			err = validateRecoveryManifest(m)
+		}
 		if err != nil {
+			unknown = true
+			log.Printf("恢复: 种子 %s 的 manifest 无效: %v", addr, err)
 			continue
 		}
-		if !found || m.LatestSeq() > best.LatestSeq() {
+		if !found || m.LatestSeq() > best.LatestSeq() ||
+			(m.LatestSeq() == best.LatestSeq() && m.Version > best.Version) {
 			best = m
 			found = true
 		}
 	}
-	return best, found
+	return best, found, unknown
 }
 
-// rebuildFromCluster 按 manifest 从种子拉快照块（CRC 校验）拼成快照字节，恢复到 dbPath。
-// holder ID 无法直接映射地址（成员表尚未持久化），故对每个块 key 遍历种子试取，取到 CRC
-// 符合的即用——块 key 全局唯一，任一持有者的副本都一样。
+func validateRecoveryManifest(m Manifest) error {
+	if m.Version == 0 || len(m.Chunks) == 0 || m.SnapshotBytes <= 0 || m.SnapshotSeq == ^uint64(0) {
+		return fmt.Errorf("missing snapshot identity, chunks or size")
+	}
+	seen := make(map[string]bool, len(m.Chunks))
+	var size int64
+	for _, ch := range m.Chunks {
+		if ch.Size <= 0 || ch.Size > m.SnapshotBytes-size || seen[ch.Key] {
+			return fmt.Errorf("invalid snapshot chunk %q", ch.Key)
+		}
+		size += ch.Size
+		seen[ch.Key] = true
+	}
+	if size != m.SnapshotBytes {
+		return fmt.Errorf("snapshot size %d != manifest %d", size, m.SnapshotBytes)
+	}
+	for i := range m.Chunks {
+		if !seen[fmt.Sprintf("snapshot-%d-%d", m.Version, i)] {
+			return fmt.Errorf("snapshot chunk index %d missing", i)
+		}
+	}
+	segs := append([]WALSegRef(nil), m.WALSegs...)
+	sort.Slice(segs, func(i, j int) bool { return segs[i].FromSeq < segs[j].FromSeq })
+	seq := m.SnapshotSeq
+	for _, seg := range segs {
+		if seg.FromSeq != seq+1 || seg.ToSeq < seg.FromSeq || seg.ToSeq == ^uint64(0) || seg.Size <= 0 {
+			return fmt.Errorf("invalid WAL range %d-%d after %d", seg.FromSeq, seg.ToSeq, seq)
+		}
+		if seg.Key != fmt.Sprintf("wal-%d-%d-%d", m.Version, seg.FromSeq, seg.ToSeq) {
+			return fmt.Errorf("WAL key %q does not match its range", seg.Key)
+		}
+		seq = seg.ToSeq
+	}
+	return nil
+}
+
+// rebuildFromCluster 只在快照与 WAL 全部校验成功后发布最终数据库。
 func (b *MetaBackup) rebuildFromCluster(dbPath string, m Manifest, seeds []string) (*meta.Store, error) {
-	// 块按 idx 数字升序拼接。manifest.Chunks 构造时即升序，但绝不能按 key 字符串
-	// 再排（idx≥10 会字典序错位、拼出静默损坏的快照）——按解析出的数字下标排。
+	if err := validateRecoveryManifest(m); err != nil {
+		return nil, fmt.Errorf("rebuild: manifest: %w", err)
+	}
+	if _, err := os.Lstat(dbPath); err == nil {
+		return nil, fmt.Errorf("rebuild: 目标 %s 已存在，拒绝覆盖", dbPath)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("rebuild: 检查目标 %s: %w", dbPath, err)
+	}
+
+	// 与目标同一文件系统、且只清理本次创建的目录，避免踩到中断恢复的残留文件。
+	workDir, err := os.MkdirTemp(filepath.Dir(dbPath), ".atoll-rebuild-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(workDir)
+	snapshotPath := filepath.Join(workDir, "snapshot.db")
+	snapshot, err := os.OpenFile(snapshotPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer snapshot.Close()
 	chunks := append([]ChunkRef(nil), m.Chunks...)
 	sort.Slice(chunks, func(i, j int) bool { return chunkKeyIdx(chunks[i].Key) < chunkKeyIdx(chunks[j].Key) })
-
-	var snapshot []byte
 	for _, ch := range chunks {
 		part, err := b.fetchChunk(ch, seeds)
 		if err != nil {
 			return nil, err
 		}
-		snapshot = append(snapshot, part...)
-	}
-	if len(snapshot) == 0 {
-		return nil, fmt.Errorf("rebuild: 快照为空")
-	}
-
-	// 落地重建（RestoreFromReader 拒绝覆盖，故先确保 dbPath 不存在）。
-	if _, err := os.Stat(dbPath); err == nil {
-		return nil, fmt.Errorf("rebuild: 目标 %s 已存在，拒绝覆盖（请人工确认后移除）", dbPath)
-	}
-	store, err := meta.RestoreFromReader(dbPath, bytes.NewReader(snapshot))
-	if err != nil {
-		return nil, err
-	}
-
-	// 重放快照之后的 WAL：既包括 manifest 记录的成段 WAL（后台异步 ship），也包括
-	// 散落的同步帧 blob（wal-sync-<seq>，同步旋钮直接落集群、可能还没进 manifest）。
-	// 两者按 seq 合并去重、升序重放——否则"同步落盘但没进 manifest"的帧会丢。
-	frames, err := b.gatherAllFramesAfter(m, store, seeds)
-	if err != nil {
-		store.Close()
-		return nil, err
-	}
-	if len(frames) > 0 {
-		if err := store.ApplyFrames(frames); err != nil {
-			store.Close()
+		if _, err := snapshot.Write(part); err != nil {
 			return nil, err
 		}
 	}
-	return store, nil
+	if err := snapshot.Sync(); err != nil {
+		return nil, err
+	}
+	if err := snapshot.Close(); err != nil {
+		return nil, err
+	}
+	if err := meta.ValidateSnapshotFile(snapshotPath); err != nil {
+		return nil, fmt.Errorf("rebuild: 快照无效: %w", err)
+	}
+
+	store, err := meta.Open(snapshotPath)
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+	snapshotSeq, err := store.WALSeq()
+	if err != nil {
+		return nil, err
+	}
+	// 旧版先取 WALSeq 再取快照，两者间的提交可令快照比 manifest 锚点更新。
+	if snapshotSeq < m.SnapshotSeq {
+		return nil, fmt.Errorf("rebuild: snapshot seq %d < manifest %d", snapshotSeq, m.SnapshotSeq)
+	}
+	frames, err := b.gatherAllFramesAfter(m, store, seeds)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.ApplyFrames(frames); err != nil {
+		return nil, err
+	}
+	seq, err := store.WALSeq()
+	if err != nil {
+		return nil, err
+	}
+	if seq < m.LatestSeq() {
+		return nil, fmt.Errorf("rebuild: restored seq %d < manifest %d", seq, m.LatestSeq())
+	}
+	if err := store.SetBackupVersionAtLeast(m.Version); err != nil {
+		return nil, err
+	}
+	if err := store.Close(); err != nil {
+		return nil, err
+	}
+	if err := meta.ValidateSnapshotFile(snapshotPath); err != nil {
+		return nil, fmt.Errorf("rebuild: 恢复库无效: %w", err)
+	}
+	file, err := os.OpenFile(snapshotPath, os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if syncErr != nil {
+		return nil, syncErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+
+	// Link 的 no-replace 语义保证并发出现的目标不会被 rename 覆盖。
+	if err := os.Link(snapshotPath, dbPath); err != nil {
+		return nil, fmt.Errorf("rebuild: 发布 %s: %w", dbPath, err)
+	}
+	dir, err := os.Open(filepath.Dir(dbPath))
+	if err != nil {
+		return nil, fmt.Errorf("rebuild: 完整库已发布，但打开父目录同步失败: %w", err)
+	}
+	syncErr = dir.Sync()
+	closeErr = dir.Close()
+	if syncErr != nil {
+		return nil, fmt.Errorf("rebuild: 完整库已发布，但目录同步失败: %w", syncErr)
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return meta.Open(dbPath)
 }
 
 // gatherAllFramesAfter 汇集快照点之后的所有 WAL 帧：manifest 成段 + 散落同步帧 blob。
 // 按 seq 去重升序，交给 ApplyFrames（它要求连续无缺口）。
 func (b *MetaBackup) gatherAllFramesAfter(m Manifest, store *meta.Store, seeds []string) ([]meta.Frame, error) {
 	bySeq := map[uint64]meta.Frame{}
-
-	// 1) manifest 记录的成段 WAL。
+	addFrame := func(f meta.Frame) error {
+		if previous, ok := bySeq[f.Seq]; ok &&
+			!bytes.Equal(meta.EncodeWALSegment([]meta.Frame{previous}), meta.EncodeWALSegment([]meta.Frame{f})) {
+			return fmt.Errorf("rebuild: conflicting WAL payloads at seq %d", f.Seq)
+		}
+		bySeq[f.Seq] = f
+		return nil
+	}
 	if len(m.WALSegs) > 0 {
 		segFrames, err := b.fetchWALFrames(m, seeds)
 		if err != nil {
 			return nil, err
 		}
 		for _, f := range segFrames {
-			bySeq[f.Seq] = f
+			if err := addFrame(f); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	// 2) 散落的同步帧 blob（wal-sync-<seq>）：LIST 每个种子，取 seq > 快照点的。
-	after := m.SnapshotSeq
+	after, err := store.WALSeq()
+	if err != nil {
+		return nil, err
+	}
+	observed := make(map[uint64]bool)
 	for _, addr := range seeds {
 		blobs, err := b.listBlobs(addr)
 		if err != nil {
-			continue // 单节点不可达跳过，其它节点可能也有同一帧
+			log.Printf("恢复: 无法枚举种子 %s 的同步帧: %v", addr, err)
+			continue
 		}
 		for _, bl := range blobs {
 			seq, ok := parseSyncFrameSeq(bl.Key)
 			if !ok || seq <= after {
 				continue
 			}
-			if _, have := bySeq[seq]; have {
-				continue // 已从成段 WAL 拿到
-			}
+			observed[seq] = true
 			data, found, err := b.getBlob(addr, bl.Key)
 			if err != nil || !found {
 				continue
 			}
-			fs, err := meta.DecodeWALSegment(data) // 同步帧也是"单帧的段"，复用解码
-			if err != nil || len(fs) == 0 {
+			fs, err := meta.DecodeWALSegment(data)
+			if err != nil || len(fs) != 1 || fs[0].Seq != seq {
 				continue
 			}
-			bySeq[seq] = fs[0]
+			if err := addFrame(fs[0]); err != nil {
+				return nil, err
+			}
 		}
 	}
-
-	if len(bySeq) == 0 {
-		return nil, nil
+	// 见过但无法读取的尾帧也不能默默丢弃，仅中间缺口检测不足以保护最后一笔写。
+	for seq := range observed {
+		if _, ok := bySeq[seq]; !ok {
+			return nil, fmt.Errorf("rebuild: observed WAL seq %d has no valid copy", seq)
+		}
 	}
-	// 按 seq 升序输出；ApplyFrames 要求从 (快照点+1) 起连续。
 	seqs := make([]uint64, 0, len(bySeq))
-	for s := range bySeq {
-		seqs = append(seqs, s)
+	for seq := range bySeq {
+		seqs = append(seqs, seq)
 	}
 	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
 	frames := make([]meta.Frame, 0, len(seqs))
-	for _, s := range seqs {
-		frames = append(frames, bySeq[s])
+	for _, seq := range seqs {
+		frames = append(frames, bySeq[seq])
 	}
 	return frames, nil
 }
@@ -311,6 +455,14 @@ func (b *MetaBackup) fetchWALFrames(m Manifest, seeds []string) ([]meta.Frame, e
 		if err != nil {
 			return nil, err
 		}
+		if uint64(len(fs)) != seg.ToSeq-seg.FromSeq+1 {
+			return nil, fmt.Errorf("rebuild: WAL segment %s count does not match its range", seg.Key)
+		}
+		for i, f := range fs {
+			if f.Seq != seg.FromSeq+uint64(i) {
+				return nil, fmt.Errorf("rebuild: WAL segment %s is not contiguous", seg.Key)
+			}
+		}
 		frames = append(frames, fs...)
 	}
 	return frames, nil
@@ -321,26 +473,36 @@ func (b *MetaBackup) fetchWALFrames(m Manifest, seeds []string) ([]meta.Frame, e
 func (b *MetaBackup) Recover(dbPath string, seeds []string, mode RecoverMode) (*meta.Store, error) {
 	in := RecoverInput{Mode: mode, SeedsGiven: len(seeds) > 0}
 
-	// 本地事实：文件是否存在 + 其 WAL seq。
-	if _, err := os.Stat(dbPath); err == nil {
+	// 已存在的目标必须是可验证的本地库；断链符号链接不是“库不存在”。
+	if st, statErr := os.Lstat(dbPath); statErr == nil {
+		if !st.Mode().IsRegular() || st.Size() == 0 {
+			return nil, &ErrFailStop{Reason: "本地元数据库不是有效的普通文件，拒绝初始化或覆盖"}
+		}
+		if err := meta.ValidateSnapshotFile(dbPath); err != nil {
+			return nil, fmt.Errorf("恢复: 校验本地库: %w", err)
+		}
 		in.LocalExists = true
-		// 打开读一下 seq 再关（决策后可能重开或改用集群）。
 		s, err := meta.Open(dbPath)
 		if err != nil {
 			return nil, fmt.Errorf("恢复: 打开本地库读 seq 失败: %w", err)
 		}
 		seq, err := s.WALSeq()
-		s.Close()
+		closeErr := s.Close()
 		if err != nil {
 			return nil, err
 		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
 		in.LocalSeq = seq
+	} else if !os.IsNotExist(statErr) {
+		return nil, fmt.Errorf("恢复: 检查本地库: %w", statErr)
 	}
 
 	// 集群事实：向种子收 manifest 取 max（仅在配了种子时）。
 	var clusterMF Manifest
 	if in.SeedsGiven {
-		clusterMF, in.ClusterFound = b.gatherClusterManifest(seeds)
+		clusterMF, in.ClusterFound, in.ClusterUnknown = b.gatherClusterManifest(seeds)
 		if in.ClusterFound {
 			in.ClusterSeq = clusterMF.LatestSeq()
 		}
