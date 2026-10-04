@@ -15,6 +15,7 @@ import (
 	"atoll/master"
 	"atoll/master/meta"
 	"atoll/node"
+	"atoll/pkg/types"
 )
 
 // newCmdCluster 拉起 1 master + N node（真实注册）供 CLI e2e。
@@ -49,12 +50,90 @@ func newCmdCluster(t *testing.T, numNodes int) (masterURL string) {
 	return masterSrv.URL
 }
 
+func TestCLIPutRoutesBySizeAndCopies(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		size      int
+		minCopies string
+		chunked   bool
+	}{
+		{name: "empty"},
+		{name: "small", size: 4096},
+		{name: "small_limit", size: int(types.SmallFileMax)},
+		{name: "over_limit", size: int(types.SmallFileMax) + 1, chunked: true},
+		{name: "small_two_copies", size: 4096, minCopies: "2", chunked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			masterURL := newCmdCluster(t, 2)
+			local := filepath.Join(t.TempDir(), "input")
+			data := bytes.Repeat([]byte{0x5a}, tc.size)
+			if err := os.WriteFile(local, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"put", "-master", masterURL, "-replicas", "2"}
+			if tc.minCopies != "" {
+				args = append(args, "-min-copies", tc.minCopies)
+			}
+			args = append(args, local, "/file")
+			var out, errBuf bytes.Buffer
+			if code := run(args, &out, &errBuf); code != 0 {
+				t.Fatalf("put: code=%d %s", code, errBuf.String())
+			}
+			// v2-4b 兼容计划：直连 HTTP 的 meta 读要按新客户端身份带特性协商头，
+			// master 对返回新 ObjID 的 meta 读缺失该头时回 426（保护旧客户端）。
+			req, err := http.NewRequest(http.MethodGet, masterURL+"/meta?path=/file", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Atoll-Features", "object-id-v1")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("meta status=%d", resp.StatusCode)
+			}
+			var result struct {
+				Inode types.Inode `json:"inode"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Inode.Chunked != tc.chunked || result.Inode.Size != int64(tc.size) {
+				t.Fatalf("metadata=%+v, want chunked=%v size=%d", result.Inode, tc.chunked, tc.size)
+			}
+			// v2-4b：small 写的内容对象应有显式高位 ObjID（0 字节文件无对象，走 legacy 整传）。
+			if !tc.chunked && tc.size > 0 && result.Inode.ObjID < types.StagingInodeBase {
+				t.Errorf("small upload should carry an explicit high ObjID: %+v", result.Inode)
+			}
+			if tc.minCopies == "2" {
+				for _, chunk := range result.Inode.Chunks {
+					if len(chunk.Done) < 2 {
+						t.Errorf("explicit min-copies not satisfied: %+v", chunk)
+					}
+				}
+			}
+			down := filepath.Join(t.TempDir(), "output")
+			out.Reset()
+			errBuf.Reset()
+			if code := run([]string{"get", "-master", masterURL, "/file", down}, &out, &errBuf); code != 0 {
+				t.Fatalf("get: code=%d %s", code, errBuf.String())
+			}
+			got, err := os.ReadFile(down)
+			if err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("readback bytes=%d, want %d, err=%v", len(got), len(data), err)
+			}
+		})
+	}
+}
+
 // TestCLIPutGetE2E put 走分块流水线 → inode 为 Chunked → get 读回一致。
 func TestCLIPutGetE2E(t *testing.T) {
 	masterURL := newCmdCluster(t, 2)
 	dir := t.TempDir()
 	local := filepath.Join(dir, "up.bin")
-	data := bytes.Repeat([]byte("cli-chunked-e2e!"), 3000) // ~45KB
+	data := bytes.Repeat([]byte("cli-chunked-e2e!"), 20000) // 300KB，超过小文件通道上限
 	if err := os.WriteFile(local, data, 0o644); err != nil {
 		t.Fatal(err)
 	}

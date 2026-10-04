@@ -23,14 +23,16 @@ import (
 
 // Server 是 master 的 HTTP 服务。
 type Server struct {
-	store      *meta.Store
-	nodeMaxAge time.Duration // 节点心跳超时阈值
-	scanner    *Scanner      // GC 需要调用
-	backup     *MetaBackup   // 元数据备份状态查询/手动触发（可为 nil：未启用备份）
-	token      auth.Token    // 集群认证；空 = 兼容模式
-	adminToken auth.Token    // 破坏性操作（/admin/gc）专用；空 = 回退用 token
-	scheme     string        // 出站访问节点的 scheme：http（默认）/https
-	tlsCfg     *tls.Config   // 出站 TLS 客户端配置（nil = 普通 HTTP）
+	store             *meta.Store
+	nodeMaxAge        time.Duration // 节点心跳超时阈值
+	scanner           *Scanner      // GC 需要调用
+	backup            *MetaBackup   // 元数据备份状态查询/手动触发（可为 nil：未启用备份）
+	token             auth.Token    // 集群认证；空 = 兼容模式
+	adminToken        auth.Token    // 破坏性操作（/admin/gc）专用；空 = 回退用 token
+	scheme            string        // 出站访问节点的 scheme：http（默认）/https
+	tlsCfg            *tls.Config   // 出站 TLS 客户端配置（nil = 普通 HTTP）
+	nodeTransportOnce sync.Once
+	nodeTransport     *auth.Transport
 	// commitWait 是 min_copies 提交时 master 侧等待从副本到齐的上限。
 	// 与 nodeMaxAge 解耦（后者可能长达小时级）：这里只吸收秒级同步延迟，
 	// 超时仍 409 交客户端兜底。测试可调小以免阻塞。
@@ -87,6 +89,14 @@ func (s *Server) nodeScheme() string {
 	return s.scheme
 }
 
+func (s *Server) nodeHTTPClient(timeout time.Duration) *http.Client {
+	// token/TLS 在启动前设置；各类请求保留自己的超时，共用节点连接池。
+	s.nodeTransportOnce.Do(func() {
+		s.nodeTransport = auth.HTTPTransport(s.token, s.tlsCfg, nil)
+	})
+	return &http.Client{Timeout: timeout, Transport: s.nodeTransport}
+}
+
 // adminPaths 需要 adminToken 的破坏性路径。/admin/objects 是只读清单、不在内。
 var adminPaths = map[string]bool{"/admin/gc": true, "/admin/metabackup/trigger": true, "/admin/metabackup/config": true}
 
@@ -116,7 +126,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /files/corrupt", s.handleReportCorrupt)         // 读端上报副本内容损坏
 	mux.HandleFunc("POST /files/suspect", s.handleReportSuspect)         // 版本校验后标记整对象副本待修
 	mux.HandleFunc("POST /files/small", s.handleCreateSmall)             // 小文件单请求通道（v2-2a）
-	mux.HandleFunc("POST /files/symlink", s.handleCreateSymlink) // 创建符号链接
+	mux.HandleFunc("POST /files/symlink", s.handleCreateSymlink)         // 创建符号链接
 	mux.HandleFunc("POST /entry/rename", s.handleRename)                 // 同目录改名
 	mux.HandleFunc("DELETE /entry", s.handleDelete)                      // ?path=/a/b
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
@@ -185,6 +195,12 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "path not found")
 		return
 	}
+	// 新对象布局的显式对象引用不能被旧客户端消费（它会把 FileID 当物理地址读错对象）。
+	// legacy 布局（ObjID=0）保持兼容直读。
+	if !in.Chunked && in.ObjID != 0 && !hasObjectIDFeature(r) {
+		httpError(w, http.StatusUpgradeRequired, "this entry requires "+types.ObjectIDFeature+" client feature")
+		return
+	}
 	resp := struct {
 		Inode types.Inode `json:"inode"`
 		Nodes []nodeEntry `json:"nodes"` // 按 inode.Replicas 顺序给出节点详情
@@ -231,7 +247,6 @@ type nodeEntry struct {
 	Done bool `json:"done"`
 }
 
-
 // handleReplicaTargets 主副本节点查询：除自己外还需要推送到哪些节点。
 // ?inode_id=N&node_id=self。inode_id 可以是块对象 ID（分块模型）：
 // master 反解出所属 inode 与块下标，返回该块未 Done 的副本节点。
@@ -240,6 +255,35 @@ func (s *Server) handleReplicaTargets(w http.ResponseWriter, r *http.Request) {
 	nodeID, _ := strconv.ParseUint(r.URL.Query().Get("node_id"), 10, 64)
 	if inodeID == 0 || nodeID == 0 {
 		httpError(w, http.StatusBadRequest, "inode_id and node_id required")
+		return
+	}
+	// 内容对象 ID（≥ 2^63，不可变对象布局）：节点持有的是物理对象地址，
+	// 反解到对象登记表取副本集；顺带把查询方标 Done（同 chunk 路径的闭环约定）。
+	if inodeID >= types.ObjectIDBase {
+		obj, err := s.store.GetObject(inodeID)
+		if err != nil {
+			httpErrorFromMeta(w, err)
+			return
+		}
+		if err := s.store.MarkObjectDone(inodeID, nodeID); err != nil {
+			httpErrorFromMeta(w, err)
+			return
+		}
+		var targets []types.NodeInfo
+		for _, id := range obj.Replicas {
+			if id == nodeID || types.ContainsUint64(obj.Done, id) {
+				continue
+			}
+			n, err := s.store.GetNode(id)
+			if err != nil {
+				continue
+			}
+			if time.Since(n.LastHeartbeat) > s.nodeMaxAge {
+				continue
+			}
+			targets = append(targets, n)
+		}
+		writeJSON(w, http.StatusOK, targets)
 		return
 	}
 	// 块对象 ID ≥ 2^40：反解出所属 staging inode（必为 Chunked）。
@@ -316,6 +360,15 @@ func (s *Server) handleReplicated(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.InodeID == 0 || req.NodeID == 0 {
 		httpError(w, http.StatusBadRequest, "inode_id and node_id required")
+		return
+	}
+	// 内容对象 ID：写入对象登记表的 Done（live 时同步推进 inode 的 DoneReplicas）。
+	if req.InodeID >= types.ObjectIDBase {
+		if err := s.store.MarkObjectDone(req.InodeID, req.NodeID); err != nil {
+			httpErrorFromMeta(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
 	// 块对象 ID：写入块 Done 集合（staging 与已提交的分块文件都合法）。
@@ -547,7 +600,7 @@ func (s *Server) probeHealthz(nodeAddr string) bool {
 	if err != nil {
 		return false
 	}
-	client := &http.Client{Timeout: 2 * time.Second, Transport: auth.HTTPTransport(s.token, s.tlsCfg, nil)}
+	client := s.nodeHTTPClient(2 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -561,10 +614,10 @@ func (s *Server) probeHealthz(nodeAddr string) bool {
 // {inode_id, index, size, replicas} → {nodes}。幂等；reassign=true 强制换节点。
 func (s *Server) handleAssignChunk(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		InodeID  uint64 `json:"inode_id"`
-		Index    int    `json:"index"`
-		Size     int64  `json:"size"`
-		Replicas int    `json:"replicas"`
+		InodeID  uint64   `json:"inode_id"`
+		Index    int      `json:"index"`
+		Size     int64    `json:"size"`
+		Replicas int      `json:"replicas"`
 		Reassign bool     `json:"reassign"`
 		Checksum uint32   `json:"checksum"` // 块内容 CRC32C（0 = 未提供）
 		Exclude  []uint64 `json:"exclude"`  // reassign 时排除的节点（刚卡死/失败的）
@@ -668,6 +721,19 @@ func (s *Server) reclaimChunkObjects(in types.Inode) {
 	}
 }
 
+// reclaimReplacedObject 回收被替换/删除的旧版本内容对象：
+//   - 分块旧版本：块对象逐块通知删除（现有通道）；
+//   - v1 旧协议对象（ObjID==0）：立即通知删除（无登记表，无宽限载体）；
+//   - 新协议对象（ObjID≠0）：此处不动作——meta 已在布局切换/删除事务里把对象登记为
+//     retired，GC 在退休宽限期过后按两轮确认回收，迟到删除在宽限期内无法销毁新版本。
+func (s *Server) reclaimReplacedObject(old types.Inode) {
+	if old.Chunked {
+		s.reclaimChunkObjects(old)
+	} else if old.ObjID == 0 && len(old.Replicas) > 0 {
+		go s.notifyObjectDelete(old.ID, old.Replicas)
+	}
+}
+
 // handleCommitFile 数据写完后客户端 commit。
 // 请求带 chunk_count > 0（新客户端）：校验块表 + 原子换名（staging → 正式文件），
 // 被替换旧版本的块对象异步回收。否则（legacy）：更新大小 + 标记主副本 Done。
@@ -761,13 +827,9 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 			httpErrorFromMeta(w, err)
 			return
 		}
-		// 旧版本（含 legacy 整对象与旧分块）异步回收；失败由 GC 两轮确认兜底。
+		// 旧版本（含 legacy 整对象与旧分块）回收；失败由 GC 两轮确认兜底。
 		if hadOld {
-			if old.Chunked {
-				s.reclaimChunkObjects(old)
-			} else if len(old.Replicas) > 0 {
-				go s.notifyObjectDelete(old.ID, old.Replicas)
-			}
+			s.reclaimReplacedObject(old)
 		}
 		// v2-3a：记录 op 结果供重试回放（仅分块提交路径；legacy commit 天然幂等安全）。
 		if req.OpID != "" {
@@ -789,13 +851,9 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 			httpErrorFromMeta(w, cerr)
 			return
 		}
-		// 被替换旧版本异步回收（分块旧版本回收其块对象，legacy 回收单对象）。
+		// 被替换旧版本回收（分块旧版本回收其块对象，legacy 回收单对象）。
 		if hadOld {
-			if old.Chunked {
-				s.reclaimChunkObjects(old)
-			} else if len(old.Replicas) > 0 {
-				go s.notifyObjectDelete(old.ID, old.Replicas)
-			}
+			s.reclaimReplacedObject(old)
 		}
 		writeJSON(w, http.StatusOK, in)
 		return
@@ -819,13 +877,14 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		// 先删元数据（客户端立刻看不到该文件），再异步通知各副本节点回收对象。
 		// 回收失败不阻塞删除请求；残留对象由 GC 两轮确认兜底清理。
 		// 符号链接无副本：notifyObjectDelete 遍历空列表为 no-op。
+		// 新协议对象：delInode 已在同事务登记 retired，回收走退休宽限+GC，不立即删。
 		if err := s.store.DeleteFile(in.ID); err != nil {
 			httpErrorFromMeta(w, err)
 			return
 		}
 		if in.Chunked {
 			s.reclaimChunkObjects(in)
-		} else if len(in.Replicas) > 0 {
+		} else if in.ObjID == 0 && len(in.Replicas) > 0 {
 			go s.notifyObjectDelete(in.ID, in.Replicas)
 		}
 	} else {
@@ -872,28 +931,17 @@ func (s *Server) handleCreateSymlink(w http.ResponseWriter, r *http.Request) {
 	}{Inode: sl})
 }
 
-// handleCreateSmall 小文件单请求通道（v2-2a）：POST /files/small?path=&replicas=&overwrite=
-// body = 文件内容（≤ types.SmallFileMax）。master 服务端把数据写到主副本节点（带 CRC 头，
-// 节点落盘即校验），成功后单事务提交元数据——客户端 1 次往返，完全绕开 staging/分块协议。
-// 数据流 client→master→主副本 共 2 腿（对比分块路径 4-5 腿）；其余副本由节点
-// replicateToPeers 异步推送（复用现有机制）。落库 legacy 单对象模型（content=inode ID），
-// 覆盖写保留 inode（Generation++）；符号链接占名时保留旧替换语义（删旧、新建）。
-// 失败窗口：节点写成功但元数据事务失败 → 孤儿对象，GC 两轮确认清理。
+// handleCreateSmall 小文件单请求通道（v2-2a 修订）：POST /files/small?path=&replicas=&overwrite=
+// body = 文件内容（≤ types.SmallFileMax）。协议三段：Prepare（事务内解析目标、分配不可复用
+// 内容对象并登记 pending、op 重放/冲突判定）→ 写主副本（对象地址 = 新 ObjectID）→ Commit
+// （同一事务做目标 CAS、内容指针切换、op 结果记录）。内容对象不复用：并发覆盖写各占一个
+// 对象，失败/迟到的一方不影响已发布版本；旧对象经退休宽限后由 GC 回收。
+// 要求 X-Atoll-Features: object-id-v1——不识别的旧客户端会得到 426 而不是读错对象。
 func (s *Server) handleCreateSmall(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	remote := q.Get("path")
 	overwrite := q.Get("overwrite") == "true"
 	opID := q.Get("op_id")
-	// v2-3a 幂等回放：同 op_id 的重试直接返回原结果（响应丢失后客户端重试不去重执行）。
-	if opID != "" {
-		if rec, ok, err := s.store.GetOpResult(opID); err == nil && ok {
-			w.Header().Set("X-Atoll-Replay", "true")
-			writeJSON(w, http.StatusOK, struct {
-				Inode types.Inode `json:"inode"`
-			}{Inode: rec.Inode})
-			return
-		}
-	}
 	replicas := 1
 	if n, err := strconv.Atoi(q.Get("replicas")); err == nil && n > 0 {
 		replicas = n
@@ -913,54 +961,49 @@ func (s *Server) handleCreateSmall(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "empty or oversize body")
 		return
 	}
+	// 特性门槛在 body 校验之后：请求级错误（400/413）与客户端版本无关；
+	// 通过校验的旧客户端在这里被 426 拦截，绝不带着旧寻址语义触碰新对象。
+	if !hasObjectIDFeature(r) {
+		httpError(w, http.StatusUpgradeRequired, "small path requires "+types.ObjectIDFeature+" client feature")
+		return
+	}
+	crc := types.CRC32C(data)
+	fingerprint := fmt.Sprintf("%s|%d|%08x|%t|%d", remote, len(data), crc, overwrite, replicas)
+	// 快路径回放：已完成的 op 直接返回原结果（无需选节点/落盘）。
+	// kind+指纹双校验：同 op_id 不同请求（挪用）→ 409，绝不回放无关结果；
+	// 跨 kind（同 op_id 曾用于 commit）同样拒绝。事务内的 Prepare/Commit 仍持权威判定。
+	if opID != "" {
+		if rec, ok, err := s.store.GetOpResult(opID); err == nil && ok {
+			if rec.Kind != "small" || (rec.Fingerprint != "" && rec.Fingerprint != fingerprint) {
+				httpError(w, http.StatusConflict, meta.ErrOpConflict.Error())
+				return
+			}
+			w.Header().Set("X-Atoll-Replay", "true")
+			writeJSON(w, http.StatusOK, struct {
+				Inode types.Inode `json:"inode"`
+			}{Inode: rec.Inode})
+			return
+		}
+	}
 	parent, err := s.store.ResolvePath(parentPath)
 	if err != nil {
 		httpError(w, http.StatusNotFound, "parent not found")
 		return
 	}
-	crc := types.CRC32C(data)
 
-	// 解析目标：新建 / 覆盖文件（in-place 内容替换）/ 目录冲突 / 非文件条目替换。
+	// 选节点（与旧路径同规则：覆盖 legacy 文件且其主副本存活时沿用旧主副本）。
 	existing, lookupErr := s.store.ResolvePath(remote)
-	var targetID uint64
 	var replicaIDs []uint64
-	var replaceOther bool
-	switch {
-	case lookupErr == nil && existing.Type == types.TypeDir:
+	var primary types.NodeInfo
+	if lookupErr == nil && existing.Type == types.TypeFile && !existing.Chunked && len(existing.Replicas) > 0 {
+		if n, err := s.store.GetNode(existing.Replicas[0]); err == nil && time.Since(n.LastHeartbeat) <= s.nodeMaxAge {
+			primary = n
+			replicaIDs = existing.Replicas
+		}
+	}
+	if lookupErr == nil && existing.Type == types.TypeDir {
 		httpError(w, http.StatusConflict, meta.ErrExist.Error())
 		return
-	case lookupErr == nil && existing.Type == types.TypeFile:
-		if !overwrite {
-			httpError(w, http.StatusConflict, meta.ErrExist.Error())
-			return
-		}
-		targetID = existing.ID
-		if existing.Chunked {
-			// 采纳式记录的副本位置在块表里；小内容覆盖改写为 legacy 单对象并重新
-			// 挑选副本（旧块对象在提交成功后回收）。
-			replicaIDs = nil
-		} else if len(existing.Replicas) > 0 {
-			replicaIDs = existing.Replicas
-		} else {
-			httpError(w, http.StatusInternalServerError, "existing file has no replicas")
-			return
-		}
-	case lookupErr == nil:
-		// 符号链接等非文件条目：删旧、新建（旧替换语义）。
-		if !overwrite {
-			httpError(w, http.StatusConflict, meta.ErrExist.Error())
-			return
-		}
-		replaceOther = true
-	}
-
-	// 主副本：覆盖 legacy 文件沿用旧副本集的主副本（内容原子 in-place）；
-	// 新建/替换/chunked 转 legacy 走现有选节点（含健康探测）。
-	var primary types.NodeInfo
-	if targetID != 0 && len(replicaIDs) > 0 {
-		if n, err := s.store.GetNode(replicaIDs[0]); err == nil && time.Since(n.LastHeartbeat) <= s.nodeMaxAge {
-			primary = n
-		}
 	}
 	if primary.ID == 0 {
 		alive, err := s.pickAliveNodes(replicas, int64(len(data)), nil)
@@ -975,78 +1018,82 @@ func (s *Server) handleCreateSmall(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 新建/替换：先持久分配对象 ID（= 新 inode ID，保持 legacy content=ID 不变式）。
-	if targetID == 0 {
-		id, err := s.store.AllocateFileID()
-		if err != nil {
-			httpError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		targetID = id
+	obj, replay, perr := s.store.PrepareSmallFile(meta.SmallFileTarget{
+		ParentID: parent.ID, Name: name, RemotePath: remote,
+		Size: int64(len(data)), Checksum: crc,
+		Replicas: replicaIDs, PrimaryID: primary.ID,
+		Overwrite: overwrite, OpID: opID, Fingerprint: fingerprint,
+		Mtime: time.Now(),
+	})
+	if perr != nil {
+		httpErrorFromMeta(w, perr)
+		return
+	}
+	if replay != nil {
+		w.Header().Set("X-Atoll-Replay", "true")
+		writeJSON(w, http.StatusOK, struct {
+			Inode types.Inode `json:"inode"`
+		}{Inode: replay.Inode})
+		return
 	}
 
 	// 数据落主副本（节点侧 tmp+fsync+rename 原子写，CRC 头即时校验）。
-	nodeClient := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: auth.HTTPTransport(s.token, s.tlsCfg, nil),
-	}
-	putReq, perr := http.NewRequest(http.MethodPut,
-		fmt.Sprintf("%s://%s/objects/%d", s.nodeScheme(), primary.Addr, targetID), bytes.NewReader(data))
-	if perr != nil {
-		httpError(w, http.StatusInternalServerError, perr.Error())
+	nodeClient := s.nodeHTTPClient(30 * time.Second)
+	putReq, perr2 := http.NewRequest(http.MethodPut,
+		fmt.Sprintf("%s://%s/objects/%d", s.nodeScheme(), primary.Addr, obj.ID), bytes.NewReader(data))
+	if perr2 != nil {
+		_ = s.store.AbortSmallFile(obj.ID)
+		httpError(w, http.StatusInternalServerError, perr2.Error())
 		return
 	}
 	putReq.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", crc))
-	putResp, perr := nodeClient.Do(putReq)
-	if perr != nil {
-		httpError(w, http.StatusServiceUnavailable, fmt.Sprintf("write to node %s: %v", primary.Addr, perr))
+	putResp, perr2 := nodeClient.Do(putReq)
+	if perr2 != nil {
+		_ = s.store.AbortSmallFile(obj.ID)
+		httpError(w, http.StatusServiceUnavailable, fmt.Sprintf("write to node %s: %v", primary.Addr, perr2))
 		return
 	}
 	io.Copy(io.Discard, putResp.Body)
 	putResp.Body.Close()
 	if putResp.StatusCode != http.StatusCreated && putResp.StatusCode != http.StatusOK {
+		_ = s.store.AbortSmallFile(obj.ID)
 		httpError(w, http.StatusServiceUnavailable, fmt.Sprintf("node %s: %d", primary.Addr, putResp.StatusCode))
 		return
 	}
 
-	// 单事务提交元数据（节点已落盘，这里失败只留孤儿对象，GC 兜底）。
-	now := time.Now()
-	wasChunked := lookupErr == nil && existing.Type == types.TypeFile && existing.Chunked
-	terr := s.store.WriteSmallFile(meta.SmallFileTarget{
-		ParentID: parent.ID, Name: name, FileID: targetID,
-		Size: int64(len(data)), Checksum: crc,
-		Replicas: replicaIDs, PrimaryID: primary.ID,
-		ReplaceOtherID: replaceOtherInodeID(existing, lookupErr, replaceOther),
-		Mtime:          now,
-	})
-	if terr != nil {
-		httpErrorFromMeta(w, terr)
+	out, old, hadOld, wasReplay, cerr := s.store.CommitSmallFile(obj.ID)
+	if cerr != nil {
+		// 目标在 prepare→commit 窗口变化：CAS 拒绝，数据对象退休由 GC 回收。
+		_ = s.store.AbortSmallFile(obj.ID)
+		httpErrorFromMeta(w, cerr)
 		return
 	}
-	// 小内容覆盖了 chunked 文件：记录已转 legacy，旧块对象回收（GC 兜底）。
-	if wasChunked {
-		s.reclaimChunkObjects(existing)
-	}
-	out, gerr := s.store.GetInode(targetID)
-	if gerr != nil {
-		httpError(w, http.StatusInternalServerError, gerr.Error())
+	if wasReplay {
+		w.Header().Set("X-Atoll-Replay", "true")
+		// 提交期回放（并发同 op 的慢者）：返回 200 与原结果，语义同 prepare 期回放。
+		writeJSON(w, http.StatusOK, struct {
+			Inode types.Inode `json:"inode"`
+		}{Inode: out})
 		return
 	}
-	// v2-3a：记录 op 结果供重试回放。
-	if opID != "" {
-		_ = s.store.PutOpResult(opID, "small", out)
+	// 被替换的旧版本：分块对象走现有回收；legacy 旧对象对象登记退休后由 GC 宽限回收。
+	if hadOld {
+		s.reclaimReplacedObject(old)
 	}
 	writeJSON(w, http.StatusCreated, struct {
 		Inode types.Inode `json:"inode"`
 	}{Inode: out})
 }
 
-// replaceOtherInodeID 提取被替换的非文件条目 ID（symlink 等）；无则 0。
-func replaceOtherInodeID(existing types.Inode, lookupErr error, replaceOther bool) uint64 {
-	if replaceOther && lookupErr == nil {
-		return existing.ID
+// hasObjectIDFeature 检查客户端特性协商头：新对象寻址路径必须双向知情，
+// 旧客户端（会把 FileID 当对象地址读）被明确拒绝而不是静默读错数据。
+func hasObjectIDFeature(r *http.Request) bool {
+	for _, f := range strings.Split(r.Header.Get(types.FeaturesHeader), ",") {
+		if strings.TrimSpace(f) == types.ObjectIDFeature {
+			return true
+		}
 	}
-	return 0
+	return false
 }
 
 // handleRename 同目录内改名：POST /entry/rename {"path":..., "new_name":...}
@@ -1085,7 +1132,7 @@ func (s *Server) probeObject(nodeAddr string, objectID uint64) bool {
 		return false
 	}
 	req.Header.Set("Range", "bytes=0-0")
-	client := &http.Client{Timeout: 5 * time.Second, Transport: auth.HTTPTransport(s.token, s.tlsCfg, nil)}
+	client := s.nodeHTTPClient(5 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -1125,10 +1172,7 @@ func (s *Server) countCommitReadyChunks(st types.Inode, minCopies int) int {
 
 // notifyObjectDelete 通知持有该对象的所有节点删除本地文件。
 func (s *Server) notifyObjectDelete(inodeID uint64, replicaNodeIDs []uint64) {
-	client := &http.Client{
-		Timeout:   5 * time.Second,
-		Transport: auth.HTTPTransport(s.token, s.tlsCfg, nil),
-	}
+	client := s.nodeHTTPClient(5 * time.Second)
 	for _, id := range replicaNodeIDs {
 		n, err := s.store.GetNode(id)
 		if err != nil {
@@ -1143,6 +1187,7 @@ func (s *Server) notifyObjectDelete(inodeID uint64, replicaNodeIDs []uint64) {
 			log.Printf("通知节点 %d 删除对象 %d 失败: %v", id, inodeID, err)
 			continue
 		}
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 }
@@ -1253,7 +1298,7 @@ func httpErrorFromMeta(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, meta.ErrNotExist):
 		httpError(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, meta.ErrExist), errors.Is(err, meta.ErrCommitFailed):
+	case errors.Is(err, meta.ErrExist), errors.Is(err, meta.ErrCommitFailed), errors.Is(err, meta.ErrOpConflict):
 		httpError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, meta.ErrNotEmpty), errors.Is(err, meta.ErrNotDir), errors.Is(err, meta.ErrNotFile),
 		errors.Is(err, meta.ErrNotStaging), errors.Is(err, meta.ErrChunkBadIndex), errors.Is(err, meta.ErrChunkBadSize),

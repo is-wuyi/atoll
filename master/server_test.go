@@ -22,8 +22,8 @@ func newTestServer(t *testing.T) *httptest.Server {
 		t.Fatalf("meta.Open: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	srv := NewServer(store, time.Hour) // 测试里节点心跳 1 小时内都算存活
-	srv.SetCommitWait(200 * time.Millisecond) // min_copies 测试不阻塞在 20s 默认等待
+	srv := NewServer(store, time.Hour)                    // 测试里节点心跳 1 小时内都算存活
+	srv.SetCommitWait(200 * time.Millisecond)             // min_copies 测试不阻塞在 20s 默认等待
 	srv.SetHealthProbe(func(string) bool { return true }) // 假地址节点无 /healthz，桩为始终可达
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { ts.Close() })
@@ -324,7 +324,7 @@ func TestCommitUpdatesSize(t *testing.T) {
 
 	var out struct {
 		Inode struct {
-			Size     int64   `json:"size"`
+			Size     int64    `json:"size"`
 			Replicas []uint64 `json:"replicas"`
 		} `json:"inode"`
 	}
@@ -592,7 +592,7 @@ func TestCreateFileOverwrite(t *testing.T) {
 
 // TestSymlinkEndpoint 符号链接 API：POST /files/symlink 创建（201、元数据含 target）、
 // 重复 409、父目录缺失 404、DELETE /entry 删除。Finder 拷贝含符号链接的目录必走此路径
-//（rustfs 事故：.claude/skills -> ../.agents/skills）。
+// （rustfs 事故：.claude/skills -> ../.agents/skills）。
 func TestSymlinkEndpoint(t *testing.T) {
 	ts := newTestServer(t)
 
@@ -659,7 +659,12 @@ func TestPutSmallValidation(t *testing.T) {
 
 	postSmall := func(path string, overwrite bool, body []byte) *http.Response {
 		url := ts.URL + "/files/small?path=" + path + "&replicas=1&overwrite=" + map[bool]string{true: "true", false: "false"}[overwrite]
-		resp, err := http.Post(url, "application/octet-stream", bytes.NewReader(body))
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -713,7 +718,12 @@ func TestPutSmallIdempotentViaOpID(t *testing.T) {
 	}
 
 	url := ts.URL + "/files/small?path=/idem.txt&replicas=1&overwrite=false&op_id=op-x1"
-	resp, err := http.Post(url, "application/octet-stream", bytes.NewReader([]byte("ignored")))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader([]byte("ignored")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -37,7 +37,7 @@ type Mount struct {
 	replicas int    // 新写入文件的副本数
 	cacheDir string // 写缓冲临时文件目录
 	token    auth.Token
-	tlsCfg   *tls.Config // 读句柄直连节点的 TLS 配置（nil = 普通 HTTP）
+	tlsCfg   *tls.Config  // 读句柄直连节点的 TLS 配置（nil = 普通 HTTP）
 	readHTTP *http.Client // 读句柄共享的 HTTP 客户端（连接池复用；此前每次 Open 新建）
 
 	// NoSmallPath 测试钩子：禁用小文件单请求通道，强制走 chunked/流式路径。
@@ -88,15 +88,15 @@ func NewWithTLS(c *client.Client, cacheDir string, replicas int, token auth.Toke
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
 	return &Mount{
-		client:   c,
-		replicas: replicas,
-		cacheDir: cacheDir,
-		token:    token,
-		tlsCfg:   tlsCfg,
-		readHTTP: &http.Client{Timeout: 30 * time.Second, Transport: auth.HTTPTransport(token, tlsCfg, nil)},
-		writes:   make(map[string]*writeHandle),
-		attrTTL:  2 * time.Second,
-		attrs:    make(map[string]attrCacheEntry),
+		client:    c,
+		replicas:  replicas,
+		cacheDir:  cacheDir,
+		token:     token,
+		tlsCfg:    tlsCfg,
+		readHTTP:  &http.Client{Timeout: 30 * time.Second, Transport: auth.HTTPTransport(token, tlsCfg, nil)},
+		writes:    make(map[string]*writeHandle),
+		attrTTL:   2 * time.Second,
+		attrs:     make(map[string]attrCacheEntry),
 		inoByPath: make(map[string]uint64),
 		nextIno:   localInoBase,
 	}, nil
@@ -153,18 +153,18 @@ type node struct {
 }
 
 var (
-	_ fs.NodeGetattrer = (*node)(nil)
-	_ fs.NodeLookuper  = (*node)(nil)
-	_ fs.NodeReaddirer = (*node)(nil)
-	_ fs.NodeMkdirer   = (*node)(nil)
-	_ fs.NodeUnlinker  = (*node)(nil)
-	_ fs.NodeRmdirer   = (*node)(nil)
-	_ fs.NodeRenamer   = (*node)(nil)
-	_ fs.NodeCreater   = (*node)(nil)
-	_ fs.NodeOpener    = (*node)(nil)
-	_ fs.NodeSetattrer = (*node)(nil)
-	_ fs.NodeSymlinker  = (*node)(nil)
-	_ fs.NodeReadlinker = (*node)(nil)
+	_ fs.NodeGetattrer   = (*node)(nil)
+	_ fs.NodeLookuper    = (*node)(nil)
+	_ fs.NodeReaddirer   = (*node)(nil)
+	_ fs.NodeMkdirer     = (*node)(nil)
+	_ fs.NodeUnlinker    = (*node)(nil)
+	_ fs.NodeRmdirer     = (*node)(nil)
+	_ fs.NodeRenamer     = (*node)(nil)
+	_ fs.NodeCreater     = (*node)(nil)
+	_ fs.NodeOpener      = (*node)(nil)
+	_ fs.NodeSetattrer   = (*node)(nil)
+	_ fs.NodeSymlinker   = (*node)(nil)
+	_ fs.NodeReadlinker  = (*node)(nil)
 	_ fs.NodeGetxattrer  = (*node)(nil)
 	_ fs.NodeSetxattrer  = (*node)(nil)
 	_ fs.NodeListxattrer = (*node)(nil)
@@ -479,7 +479,11 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 		return nil, 0, syscall.EIO
 	}
 	return &readHandle{
+		// ino 保持逻辑 FileID（suspect 上报按文件身份+版本比对，见 read_handle.go）；
+		// objID 是本次打开时快照的内容对象 ID：物理读只打这个对象，后续覆盖写换了
+		// 对象也不影响本句柄寻址（旧对象回收后本句柄自然读失败，绝不读成新版本）。
 		ino:        in.ID,
+		objID:      types.ObjIDFor(in),
 		size:       in.Size,
 		checksum:   in.Checksum,
 		generation: in.Generation,
@@ -500,9 +504,6 @@ func (n *node) Create(ctx context.Context, name string, _ uint32, _ uint32, out 
 	// 这个空文件不存在（我们没上传 0 字节文件）就判定失败弹 -43。故新建的空文件也要上传。
 	w.created = true
 	w.streamOn = true
-	// 预建 staging：其 ID 供数据寻址/流式上传用；staging 失败（网络抖动）只记 nil，不阻断创建。
-	// st_ino 一律用 inoFor（与远端 ID 解耦），故建 staging 成功与否都不影响 inode 稳定性。
-	_ = w.startStream()
 	w.attr(&out.Attr)
 	return n.newChildNode(ctx, n.m.inoFor(n.remotePath(name)), fuse.S_IFREG), w, 0, 0
 }
@@ -654,6 +655,30 @@ func mapErrno(err error) syscall.Errno {
 	}
 	// 传输层错误（超时/dial 失败/连接重置等）：瞬时故障，EIO 让内核可重试，不负缓存。
 	return syscall.EIO
+}
+
+// smallConflictErrno 判定 PutSmall 的失败是否属于“服务端明确拒绝、禁止回退”：
+//   - 409：目标状态冲突（并发修改/同 op_id 不同内容等）——回退到通用覆盖路径会重传
+//     整个文件、绕过 small 通道事务里的目标状态校验（CAS），必须把冲突如实暴露；
+//   - 401/403：权限拒绝——换一条路径重试同样无权，且会掩盖真实的访问控制问题；
+//   - 426：master 要求特性协商（旧 master 拒收新写法）——此时旧写法同样不被新 master
+//     支持，落回旧路径只会制造第二轮错误。
+//
+// 其余错误（网络失败、5xx 可重试、旧 master 未实现该通道的 404/405/501）不禁止回退。
+func smallConflictErrno(err error) (syscall.Errno, bool) {
+	var he *client.HTTPError
+	if !errors.As(err, &he) {
+		return 0, false
+	}
+	switch he.StatusCode {
+	case http.StatusConflict:
+		return mapErrno(err), true
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return syscall.EACCES, true
+	case http.StatusUpgradeRequired:
+		return syscall.EIO, true
+	}
+	return 0, false
 }
 
 // ---- 分块读句柄：按块表定位 → 块内 Range 读取 ----
@@ -921,7 +946,7 @@ func (w *writeHandle) startStream() error {
 	w.stream = u
 	w.streamOn = true
 	w.sentIdx = 0
-	w.ino = u.StagingID() // 用 staging ID 作 st_ino，与提交后一致
+	w.ino = u.StagingID()
 	return nil
 }
 
@@ -975,8 +1000,8 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 			w.ooo[off] = end
 		}
 	}
-	// byte 0 已落盘即可建会话（乱序时首个到达的写可能不是 0 号，等它到齐再建）。
-	if w.stream == nil && w.contigEnd > 0 {
+	// 小文件留给 Flush 单请求提交；整块可推送时才需要远端会话。
+	if w.stream == nil && w.contigEnd >= types.ChunkSize && (w.m.NoSmallPath || w.size > types.SmallFileMax) {
 		if err := w.startStream(); err != nil {
 			return 0, syscall.EIO
 		}
@@ -999,7 +1024,7 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 
 // Flush 完成上传。小文件通道（v2-2a）：≤ SmallFileMax 的内容单请求完成（1 次往返）；
 // 流式会话：传尾巴 + commit；旧路径（就地编辑/空文件）：整传。可能被多次调用
-//（每次 close），成功后幂等。
+// （每次 close），成功后幂等。
 func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1027,9 +1052,12 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 				w.created = false
 				w.m.attrInvalidate(w.remote)
 				return 0
+			} else if errno, blocked := smallConflictErrno(serr); blocked {
+				return errno
 			}
 		}
-		// 失败 → 继续走原路径（该路径自会 abort/重建会话）。
+		// 其余失败（网络抖动/5xx 可重试；旧 master 无此通道 404/405/501）→ 继续走
+		// 原路径（该路径自会 abort/重建会话）。
 	}
 
 	// 流式路径：整块已在 WRITE 期间陆续上传，这里只读尾巴 + commit。

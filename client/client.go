@@ -52,6 +52,15 @@ func (c *Client) ioTimeout(size int64) time.Duration {
 	return t
 }
 
+// 特性协商头（v2-4b）：新客户端在 master 元数据请求上声明支持显式内容对象 ID（obj_id）。
+// master 对会产生/返回新 ObjID 的 small 写与 meta 读强制此头，缺失回 426——防止滚动升级期
+// 旧客户端把新版本对象按“文件 ID = 对象 ID”的旧约定读错/写坏。pkg/types 稍后给出
+// ObjectIDFeature/FeaturesHeader 常量，届时可切换引用（值保持一致）。
+const (
+	featuresHeader  = "X-Atoll-Features"
+	objectIDFeature = "object-id-v1"
+)
+
 // New 创建客户端。token 为空 = 兼容模式（不注入认证头，连未启认证的旧集群）。
 func New(masterURL string) *Client {
 	return NewWithToken(masterURL, "")
@@ -275,7 +284,7 @@ func (c *Client) getFromReplicas(in types.Inode, candidates []Replica, localPath
 	var lastErr error
 	for _, n := range candidates {
 		ctx, cancel := context.WithTimeout(context.Background(), c.ioTimeout(in.Size))
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s://%s/objects/%d", c.scheme(), n.Addr, in.ID), nil)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s://%s/objects/%d", c.scheme(), n.Addr, types.ObjIDFor(in)), nil)
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
 			cancel()
@@ -713,6 +722,8 @@ func (c *Client) PutSmall(remotePath string, data []byte, replicas int, overwrit
 			return types.Inode{}, err
 		}
 		req.Header.Set("Content-Type", "application/octet-stream")
+		// small 写会分配新的高位 ObjID：声明特性，master 缺此头回 426（保护旧客户端）。
+		req.Header.Set(featuresHeader, objectIDFeature)
 		req.ContentLength = int64(len(data))
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
@@ -803,6 +814,8 @@ func (c *Client) getJSON(path string, out any) error {
 	if err != nil {
 		return err
 	}
+	// meta 读会返回小文件的显式 obj_id：必须声明特性，否则 master 回 426 保护旧客户端。
+	req.Header.Set(featuresHeader, objectIDFeature)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err

@@ -19,6 +19,7 @@ import (
 
 type readHandle struct {
 	ino        uint64
+	objID      uint64
 	size       int64
 	checksum   uint32
 	generation uint64
@@ -36,6 +37,17 @@ type readHandle struct {
 }
 
 var _ fs.FileReader = (*readHandle)(nil)
+
+// objectID 返回本句柄物理读寻址的内容对象 ID：Open 时快照的显式 ObjID 优先；
+// 0 兼容旧数据/直接构造句柄的测试——旧约定对象 ID = 文件 ID（ino）。
+// 注意这与 reportSuspect 用的 ino（逻辑 FileID）刻意分离：物理寻址跟对象走，
+// 版本比对跟文件身份走。
+func (rh *readHandle) objectID() uint64 {
+	if rh.objID != 0 {
+		return rh.objID
+	}
+	return rh.ino
+}
 
 func (rh *readHandle) candidateStart() int {
 	rh.mu.Lock()
@@ -64,6 +76,9 @@ func (rh *readHandle) reportSuspect(nodeID uint64) {
 	rh.reported[nodeID] = true
 	rh.mu.Unlock()
 
+	// 上报用 ino（逻辑 FileID）+ 打开时的 generation/size/checksum：master 按
+	// “当前 inode 的版本三元组是否仍匹配”决定是否撤销 Done——旧版本读者的上报
+	// 不会撤销新版本的副本标记，也不会删除任何对象（新版本内容在另一个 ObjID 上）。
 	in := types.Inode{ID: rh.ino, Size: rh.size, Checksum: rh.checksum, Generation: rh.generation}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -83,7 +98,7 @@ func (rh *readHandle) fetchWholeVerified(ctx context.Context) ([]byte, syscall.E
 		index := (start + i) % len(rh.cands)
 		r := rh.cands[index]
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-			fmt.Sprintf("%s://%s/objects/%d", rh.scheme, r.Addr, rh.ino), nil)
+			fmt.Sprintf("%s://%s/objects/%d", rh.scheme, r.Addr, rh.objectID()), nil)
 		if err != nil {
 			continue
 		}
@@ -159,7 +174,7 @@ func (rh *readHandle) readRange(ctx context.Context, start, end int64) ([]byte, 
 		index := (next + i) % len(rh.cands)
 		r := rh.cands[index]
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-			fmt.Sprintf("%s://%s/objects/%d", rh.scheme, r.Addr, rh.ino), nil)
+			fmt.Sprintf("%s://%s/objects/%d", rh.scheme, r.Addr, rh.objectID()), nil)
 		if err != nil {
 			continue
 		}

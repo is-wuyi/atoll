@@ -28,10 +28,13 @@ var (
 	bucketChildren = []byte("children")
 	bucketNodes    = []byte("nodes")
 	bucketMeta     = []byte("meta")
-	bucketOps      = []byte("ops") // v2-3a：写操作幂等结果表（op_id → OpRecord）
+	bucketOps      = []byte("ops")
+	bucketObjects  = []byte("objects")
+	bucketRetired  = []byte("retired_objects")
 
-	keyNextInode = []byte("next_inode")
-	keyNextNode  = []byte("next_node")
+	keyNextInode  = []byte("next_inode")
+	keyNextNode   = []byte("next_node")
+	keyNextObject = []byte("next_object")
 	// keyBackupVersion 持久化元数据备份的版本计数器。它是 master 自己的权威状态
 	// （不是内存临时值），随快照一起进 bbolt，重启后直接读回、单调续增，不依赖集群可达。
 	keyBackupVersion = []byte("backup_version")
@@ -42,13 +45,13 @@ const RootID uint64 = 1
 
 // 常见错误。
 var (
-	ErrNotExist   = errors.New("not found")
-	ErrExist      = errors.New("already exists")
-	ErrNotEmpty   = errors.New("directory not empty")
-	ErrNotDir     = errors.New("not a directory")
-	ErrNotFile    = errors.New("not a file")
-	ErrBadPath    = errors.New("invalid path")
-	ErrBadName    = errors.New("invalid name")
+	ErrNotExist = errors.New("not found")
+	ErrExist    = errors.New("already exists")
+	ErrNotEmpty = errors.New("directory not empty")
+	ErrNotDir   = errors.New("not a directory")
+	ErrNotFile  = errors.New("not a file")
+	ErrBadPath  = errors.New("invalid path")
+	ErrBadName  = errors.New("invalid name")
 )
 
 // validateName 校验单个目录项名字：非空、非 "."/".."、不含 "/"。
@@ -92,7 +95,7 @@ func (s *Store) DBPath() string { return s.db.Path() }
 
 func (s *Store) init() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketInodes, bucketChildren, bucketNodes, bucketMeta, bucketWAL, bucketOps} {
+		for _, b := range [][]byte{bucketInodes, bucketChildren, bucketNodes, bucketMeta, bucketWAL, bucketOps, bucketObjects, bucketRetired} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -306,78 +309,7 @@ func (s *Store) CreateSymlink(parentID uint64, name, target string) (types.Inode
 	return in, nil
 }
 
-// SmallFileTarget 描述小文件单请求通道的一次元数据提交（master 已把数据写到主副本后调用）。
-type SmallFileTarget struct {
-	ParentID uint64
-	Name     string
-	FileID   uint64 // 新建：预分配的 inode ID；覆盖：已存在的文件 ID
-	Size     int64
-	Checksum uint32
-	Replicas []uint64
-	PrimaryID uint64
-	// ReplaceOtherID 被替换的非文件条目（symlink 等），0=无。
-	ReplaceOtherID uint64
-	Mtime          time.Time
-}
-
-// WriteSmallFile 单事务提交小文件元数据（v2-2a）：
-//   - FileID 不存在 → 新建（TypeFile、legacy 单对象模型、Generation=1、挂 children）
-//   - FileID 存在且是文件 → in-place 内容替换（转 legacy、Size/Checksum/Generation++）
-//   - ReplaceOtherID 非 0 → 同事务删除被替换的非文件条目
-//
-// 数据已由调用方先行写到主副本（节点侧 fsync）；本事务失败留下孤儿对象由 GC 兜底。
-// legacy content=ID 不变式保持：对象 ID 即 FileID（新建预分配 / 覆盖沿用）。
-func (s *Store) WriteSmallFile(t SmallFileTarget) error {
-	if err := validateName(t.Name); err != nil {
-		return err
-	}
-	return s.write(func(w *txw) error {
-		if t.ReplaceOtherID != 0 {
-			other, err := getInodeTx(w.tx, t.ReplaceOtherID)
-			if err != nil {
-				return err
-			}
-			if other.Type == types.TypeDir {
-				return ErrExist
-			}
-			if err := w.delInode(other.ID); err != nil {
-				return err
-			}
-		}
-		in, err := getInodeTx(w.tx, t.FileID)
-		if err != nil && !errors.Is(err, ErrNotExist) {
-			return err
-		}
-		if errors.Is(err, ErrNotExist) {
-			in = types.Inode{
-				ID: t.FileID, ParentID: t.ParentID, Name: t.Name, Type: types.TypeFile,
-				Size: t.Size, Checksum: t.Checksum, Mtime: t.Mtime,
-				Replicas: t.Replicas, DoneReplicas: []uint64{t.PrimaryID},
-				Generation: 1,
-			}
-			if err := w.putInode(&in); err != nil {
-				return err
-			}
-			return w.putChild(t.ParentID, t.Name, t.FileID)
-		}
-		if in.Type != types.TypeFile {
-			return ErrNotFile
-		}
-		// in-place 内容替换：转 legacy 单对象模型，身份保留。
-		in.Chunked = false
-		in.Chunks = nil
-		in.Size = t.Size
-		in.Checksum = t.Checksum
-		in.Mtime = t.Mtime
-		in.Generation++
-		in.Replicas = t.Replicas // chunked 转 legacy 时重挑副本；legacy 覆盖与原值一致
-		in.DoneReplicas = []uint64{t.PrimaryID} // 其余副本由 replicateToPeers 补齐后重新上报
-		return w.putInode(&in)
-	})
-}
-
-// AllocateFileID 预分配一个文件 ID（小文件单请求通道需要在写节点数据前确定对象 ID）。
-// 分配即持久（记 WAL）；分配后未使用留下的 ID 空洞无害（与计数器语义一致）。
+// AllocateFileID 预分配一个文件 ID（用于需要把文件 ID 当作内容对象 ID 兼容旧布局的路径）。
 func (s *Store) AllocateFileID() (uint64, error) {
 	var id uint64
 	err := s.write(func(w *txw) error {
@@ -690,6 +622,7 @@ func (s *Store) CommitLegacyStagingFile(inodeID uint64, size int64, checksum uin
 	}
 	return out, old, hadOld, nil
 }
+
 // 用于确定性地把 staging 回退到过去，避免 TTL 测试依赖 wall-clock sleep 而在 CI/-race 下偶发）。
 func (s *Store) SetInodeMtimeForTest(id uint64, mt time.Time) error {
 	return s.write(func(w *txw) error {
@@ -701,6 +634,7 @@ func (s *Store) SetInodeMtimeForTest(id uint64, mt time.Time) error {
 		return w.putInode(&in)
 	})
 }
+
 // AssignChunk 为 staging 文件的第 index 块分配副本节点。
 // 幂等：该块已分配则原样返回既有分配（重试安全）。
 func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []uint64, checksum uint32) (types.ChunkInfo, error) {

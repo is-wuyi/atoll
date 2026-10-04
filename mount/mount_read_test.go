@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -168,9 +170,16 @@ func TestMountSmallReadVerifiesCRC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := rc.objectPath(t, in.Replicas[0], in.ID)
+	if in.ObjID == 0 {
+		t.Fatalf("small 新上传应有显式 ObjID: %+v", in)
+	}
+	path := rc.objectPath(t, in.Replicas[0], types.ObjIDFor(in))
 	corruptDiskObject(t, path)
 	rh := openReadHandle(t, rc.m, "/file")
+	if rh.objID != in.ObjID || rh.ino != in.ID {
+		t.Fatalf("Open 应快照 objID=%d 且保持逻辑 FileID ino=%d: got objID=%d ino=%d",
+			in.ObjID, in.ID, rh.objID, rh.ino)
+	}
 	if got, errno := readBytes(rh, context.Background(), 0, 5); errno != syscall.EIO || len(got) != 0 {
 		t.Fatalf("bad bytes escaped verification: %x errno=%v", got, errno)
 	}
@@ -189,7 +198,7 @@ func TestMountSmallReadFailsOverToGoodReplica(t *testing.T) {
 	}
 	waitReplica(t, rc.client, "/file", 2)
 	victim := in.Replicas[0]
-	badPath := rc.objectPath(t, victim, in.ID)
+	badPath := rc.objectPath(t, victim, types.ObjIDFor(in))
 	corruptDiskObject(t, badPath)
 	rh := openReadHandle(t, rc.m, "/file")
 	// 固定先命中坏副本，不能用随机顺序或缓存命中证明故障转移。
@@ -230,13 +239,20 @@ func TestMountSmallReadFailsOverToGoodReplica(t *testing.T) {
 		t.Fatalf("repair did not converge: %+v %v", state, err)
 	}
 	for _, id := range in.Replicas {
-		got, err := os.ReadFile(rc.objectPath(t, id, in.ID))
+		got, err := os.ReadFile(rc.objectPath(t, id, types.ObjIDFor(in)))
 		if err != nil || !bytes.Equal(got, data) {
 			t.Fatalf("replica %d still differs after repair: %v", id, err)
 		}
 	}
 }
 
+// TestMountStaleChecksumDoesNotDeleteNewVersion 旧版本读者不得伤害新版本（v2-4b）：
+// 覆盖写保留 FileID/Generation 递进，内容切换到新的不复用 ObjID；旧对象延迟回收。
+// 旧句柄按打开时快照的旧 ObjID 寻址：旧对象尚在则读到旧内容（CRC 匹配，属允许的
+// “回收窗口内旧 fd 可读”），已回收则 404 失败——两条路都不能伤到新版本。
+// 旧版本 suspect 不依赖旧 fd 产生 CRC 冲突（新语义下通常不会），故显式重放旧版本的
+// suspect 报文验证：master 按版本三元组精确匹配，旧快照上报既不撤销新版本副本、
+// 也不删除任何对象。
 func TestMountStaleChecksumDoesNotDeleteNewVersion(t *testing.T) {
 	rc := newReadTestCluster(t, 1)
 	old := []byte("old-version")
@@ -246,29 +262,112 @@ func TestMountStaleChecksumDoesNotDeleteNewVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	rh := openReadHandle(t, rc.m, "/file")
+	if rh.objID != types.ObjIDFor(in) || rh.ino != in.ID {
+		t.Fatalf("Open 应快照 objID=%d、ino 保持 FileID=%d: got objID=%d ino=%d",
+			types.ObjIDFor(in), in.ID, rh.objID, rh.ino)
+	}
 	updated, err := rc.client.PutSmall("/file", latest, 1, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if updated.ID != in.ID || updated.Generation <= in.Generation {
-		t.Fatalf("test requires same object ID with a newer generation: %+v", updated)
+		t.Fatalf("覆盖写应保留 FileID 且 Generation 递进: %+v", updated)
 	}
-	if _, errno := readBytes(rh, context.Background(), 0, len(old)); errno == 0 {
-		t.Fatal("stale checksum unexpectedly accepted the new bytes")
+	if updated.ObjID == in.ObjID {
+		t.Fatalf("覆盖写应切换到新 ObjID: %+v", updated)
 	}
-	rc.waitReport(t)
-	got, err := os.ReadFile(rc.objectPath(t, in.Replicas[0], in.ID))
-	if err != nil || !bytes.Equal(got, latest) {
-		t.Fatalf("stale reader damaged the new version: %q %v", got, err)
+
+	// 安全断言 1：旧句柄永远读不到新版本字节。旧对象还在 → 读回旧内容；
+	// 已被异步回收 → EIO。等待回收收敛后再读，同时容忍窗口内读到旧内容。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(rc.objectPath(t, in.Replicas[0], in.ObjID)); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got, errno := readBytes(rh, context.Background(), 0, len(old))
+	if errno == 0 && !bytes.Equal(got, old) {
+		t.Fatalf("stale handle observed new-version bytes: %q", got)
+	}
+	if errno != 0 && errno != syscall.EIO {
+		t.Fatalf("stale read: unexpected errno %v", errno)
+	}
+
+	// 安全断言 2：显式重放旧版本 suspect（不靠旧 fd 的 CRC 冲突）——
+	// 服务端按 (FileID, generation, size, checksum) 与当前版本精确匹配，
+	// 旧快照上报必须被忽略：新版本 Done 副本不被撤销、磁盘对象不被删除。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	staleReport := types.Inode{ID: in.ID, Size: in.Size, Checksum: in.Checksum, Generation: in.Generation}
+	if err := rc.client.ReportSuspect(ctx, staleReport, in.Replicas[0]); err != nil {
+		t.Fatalf("ReportSuspect: %v", err)
 	}
 	state, err := rc.store.GetInode(in.ID)
 	if err != nil || !types.ContainsUint64(state.DoneReplicas, in.Replicas[0]) {
 		t.Fatalf("stale report invalidated the new version: %+v %v", state, err)
 	}
+	disk, err := os.ReadFile(rc.objectPath(t, updated.Replicas[0], updated.ObjID))
+	if err != nil || !bytes.Equal(disk, latest) {
+		t.Fatalf("stale reader damaged the new version: %q %v", disk, err)
+	}
+
+	// 安全断言 3：新读者按新 ObjID 读到新内容。
 	fresh := openReadHandle(t, rc.m, "/file")
 	if got, errno := readBytes(fresh, context.Background(), 0, len(latest)); errno != 0 || !bytes.Equal(got, latest) {
 		t.Fatalf("fresh reader cannot read new version: %q %v", got, errno)
 	}
+}
+
+// TestReadHandlePhysicalReadsUseObjID 物理寻址与身份分离的单元测试：
+// objID 非零时请求打 /objects/<objID>（ino 仅用于 suspect 上报）；
+// objID=0 兼容直接构造句柄的既有测试/旧数据——回退按旧约定 ino 寻址。
+func TestReadHandlePhysicalReadsUseObjID(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		ino      uint64
+		objID    uint64
+		wantHits []uint64
+	}{
+		{name: "explicit_objid", ino: 100, objID: 500, wantHits: []uint64{500}},
+		{name: "legacy_fallback", ino: 100, objID: 0, wantHits: []uint64{100}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte("addressed-by-objid")
+			var mu sync.Mutex
+			var hits []uint64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				hits = append(hits, parseObjectIDForTest(r.URL.Path))
+				mu.Unlock()
+				w.Write(data)
+			}))
+			t.Cleanup(srv.Close)
+			rh := &readHandle{ino: tc.ino, objID: tc.objID, size: int64(len(data)),
+				checksum: types.CRC32C(data),
+				cands:    []client.Replica{{ID: 2, Addr: srv.Listener.Addr().String(), Done: true}},
+				http:     srv.Client(), scheme: "http"}
+			got, errno := readBytes(rh, context.Background(), 0, len(data))
+			if errno != 0 || !bytes.Equal(got, data) {
+				t.Fatalf("read: %q %v", got, errno)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !reflect.DeepEqual(hits, tc.wantHits) {
+				t.Fatalf("physical reads hit %v, want %v", hits, tc.wantHits)
+			}
+		})
+	}
+}
+
+// parseObjectIDForTest 从 /objects/<id> 路径提取对象 ID（测试辅助）。
+func parseObjectIDForTest(path string) uint64 {
+	const prefix = "/objects/"
+	if !strings.HasPrefix(path, prefix) {
+		return 0
+	}
+	id, _ := strconv.ParseUint(strings.TrimPrefix(path, prefix), 10, 64)
+	return id
 }
 
 func TestReadHandleConcurrentReads(t *testing.T) {

@@ -31,6 +31,13 @@ func ContainsUint64(list []uint64, v uint64) bool {
 // 存在则节点落盘后校验；缺失则跳过（向后兼容旧客户端）。
 const ChecksumHeader = "X-Atoll-Crc32c"
 
+const (
+	FeaturesHeader  = "X-Atoll-Features"
+	ObjectIDFeature = "object-id-v1"
+	ObjectIDBase    uint64 = 1 << 63
+	MaxStagingInode uint64 = (ObjectIDBase >> 8) - 1
+)
+
 // EntryType 区分目录与文件。
 type EntryType uint8
 
@@ -63,6 +70,9 @@ type Inode struct {
 	Chunked bool `json:"chunked,omitempty"`
 	// Chunks 是分块文件（Chunked=true）的块表，按 Index 升序。
 	Chunks []ChunkInfo `json:"chunks,omitempty"`
+	// ObjID 是小文件当前内容对象的存储 ID。0 = v1/v2-2a 旧数据：对象 ID 等于文件 ID。
+	// 新写入分配独立 ObjID，覆盖不再原地改写对象。
+	ObjID uint64 `json:"obj_id,omitempty"`
 	// Checksum 是 legacy 整对象文件内容的 CRC32C（0 = 未记录）。
 	// 分块文件不用此字段（校验和在每块的 ChunkInfo.Checksum 里）。
 	Checksum uint32 `json:"checksum,omitempty"`
@@ -118,7 +128,7 @@ const (
 var ChunkSize int64 = 64 << 20
 
 // SmallFileMax 是"小文件单请求通道"的尺寸上限：≤此值的文件走 POST /files/single
-//（数据内联进一个请求，master 服务端落节点+单事务提交，客户端 1 次往返），
+// （数据内联进一个请求，master 服务端落节点+单事务提交，客户端 1 次往返），
 // 完全绕开 staging/分块协议。> 此值走分块流水线。
 const SmallFileMax int64 = 256 << 10
 
@@ -142,11 +152,20 @@ func ChunkObjID(c ChunkInfo, ownerInodeID uint64) uint64 {
 	return ChunkID(ownerInodeID, c.Index)
 }
 
+// ObjIDFor 返回小文件当前内容对象 ID。显式 ObjID 优先；
+// 0 兼容旧数据：v1/v2-2a 小文件对象 ID 等于文件 ID。
+func ObjIDFor(in Inode) uint64 {
+	if in.ObjID != 0 {
+		return in.ObjID
+	}
+	return in.ID
+}
+
 // NodeInfo 是一个存储节点的注册信息与运行状态。
 type NodeInfo struct {
 	ID            uint64    `json:"id"`
 	Addr          string    `json:"addr"` // 客户端直连用的 host:port
-	TotalBytes    int64      `json:"total_bytes"`
-	UsedBytes     int64      `json:"used_bytes"`
-	LastHeartbeat time.Time  `json:"last_heartbeat"`
+	TotalBytes    int64     `json:"total_bytes"`
+	UsedBytes     int64     `json:"used_bytes"`
+	LastHeartbeat time.Time `json:"last_heartbeat"`
 }

@@ -164,6 +164,12 @@ func (s *Scanner) runGCLoop(ctx context.Context) {
 			} else if n > 0 {
 				log.Printf("op 结果清理: 移除 %d 条过期记录", n)
 			}
+			// 对象登记表过期项：pending 上传中断残留与退休宽限期已满的记录。
+			if n, err := s.store.SweepExpiredObjects(); err != nil {
+				log.Printf("对象登记清理: %v", err)
+			} else if n > 0 {
+				log.Printf("对象登记清理: 移除 %d 条过期记录", n)
+			}
 		}
 	}
 }
@@ -240,6 +246,9 @@ type repairTask struct {
 	TargetAddr  string // pull 目标地址（triggerPull 场景为该槽节点地址）
 	SourceAddr  string // 源节点地址
 	Checksum    uint32 // 期望 CRC32C，随 pull 下发给目标节点校验（0 = legacy/未记录则跳过）
+	ObjectID    uint64 // 物理对象地址（ObjIDFor / ChunkObjID）；probe/pull/上报全链路用它
+	InodeID     uint64 // 元数据身份（ReplaceObjectReplica/ReplaceReplica 的 CAS 主体）
+	Generation  uint64 // 内容代（对象 CAS 拒绝过期修复）
 }
 
 // planRepairs 对单个文件产出修复计划（纯函数，便于单测）。
@@ -404,7 +413,12 @@ func (s *Scanner) repairLegacyInode(in types.Inode, nodes []types.NodeInfo, now 
 	}
 	s.bumpRepairBackoff(in.ID)
 	for _, t := range tasks {
-		s.executeRepair(in.ID, t)
+		// 物理寻址与元数据身份分离：probe/pull/上报用对象地址（旧数据回退 FileID），
+		// 副本替换按 (FileID, ObjectID, Generation) CAS，过期修复被拒。
+		t.ObjectID = types.ObjIDFor(in)
+		t.InodeID = in.ID
+		t.Generation = in.Generation
+		s.executeRepair(t)
 	}
 }
 
@@ -591,35 +605,47 @@ func (s *Scanner) bumpRepairBackoff(inodeID uint64) {
 
 // executeRepair 执行单个修复任务。
 // 任何失败只记日志，不影响其他文件与扫描器（不 panic、不阻塞）。
-func (s *Scanner) executeRepair(inodeID uint64, t repairTask) {
+func (s *Scanner) executeRepair(t repairTask) {
+	objectID := t.ObjectID
+	if objectID == 0 {
+		objectID = t.InodeID // 兼容未填 ObjectID 的旧调用/测试
+	}
 	switch t.Action {
 	case repairSkipNoSource:
-		log.Printf("inode %d slot %d: 无可用源节点，跳过", inodeID, t.SlotIdx)
+		log.Printf("inode %d slot %d: 无可用源节点，跳过", t.InodeID, t.SlotIdx)
 	case repairSkipNoTarget:
-		log.Printf("inode %d slot %d: 无合格新目标（dead node %d），跳过", inodeID, t.SlotIdx, t.OldNodeID)
+		log.Printf("inode %d slot %d: 无合格新目标（dead node %d），跳过", t.InodeID, t.SlotIdx, t.OldNodeID)
 	case repairReplaceDead:
 		// 先探源：源上对象已丢失（404）时，换目标 + 重拉只会永远失败，
 		// 白白 churn 元数据与流量——跳过并保持退避，等源恢复或人工介入。
-		if !s.probeSource(t.SourceAddr, inodeID) {
-			log.Printf("inode %d slot %d: 源 %s 上对象缺失（404），跳过修复", inodeID, t.SlotIdx, t.SourceAddr)
+		if !s.probeSource(t.SourceAddr, objectID) {
+			log.Printf("inode %d slot %d: 源 %s 上对象缺失（404），跳过修复", t.InodeID, t.SlotIdx, t.SourceAddr)
 			return
 		}
-		if err := s.store.ReplaceReplica(inodeID, t.OldNodeID, t.NewNodeID); err != nil {
-			if errors.Is(err, meta.ErrNotExist) || errors.Is(err, meta.ErrReplicaDup) {
-				return // 文件被并发删除 / 候选已是副本（下轮换一个），静默跳过
+		// 副本槽位替换：新对象布局按 (FileID, ObjectID, Generation) CAS——
+		// 修复期间文件被覆盖时 Generation 已变，过期替换被拒，绝不改错版本。
+		var err error
+		if t.Generation != 0 && t.ObjectID >= types.ObjectIDBase {
+			err = s.store.ReplaceObjectReplica(t.InodeID, t.ObjectID, t.Generation, t.OldNodeID, t.NewNodeID)
+		} else {
+			err = s.store.ReplaceReplica(t.InodeID, t.OldNodeID, t.NewNodeID)
+		}
+		if err != nil {
+			if errors.Is(err, meta.ErrNotExist) || errors.Is(err, meta.ErrReplicaDup) || errors.Is(err, meta.ErrObjectChanged) {
+				return // 文件被并发删除/覆盖 / 候选已是副本（下轮换一个），静默跳过
 			}
-			log.Printf("inode %d slot %d: ReplaceReplica 失败: %v", inodeID, t.SlotIdx, err)
+			log.Printf("inode %d slot %d: 副本替换失败: %v", t.InodeID, t.SlotIdx, err)
 			return
 		}
-		log.Printf("inode %d slot %d: 替换 dead node %d → %d，触发 pull", inodeID, t.SlotIdx, t.OldNodeID, t.NewNodeID)
-		s.triggerPull(t.NewNodeAddr, inodeID, t.SourceAddr, t.Checksum)
+		log.Printf("inode %d slot %d: 替换 dead node %d → %d，触发 pull", t.InodeID, t.SlotIdx, t.OldNodeID, t.NewNodeID)
+		s.triggerPull(t.NewNodeAddr, objectID, t.SourceAddr, t.Checksum)
 	case repairTriggerPull:
-		if !s.probeSource(t.SourceAddr, inodeID) {
-			log.Printf("inode %d slot %d: 源 %s 上对象缺失（404），跳过 pull", inodeID, t.SlotIdx, t.SourceAddr)
+		if !s.probeSource(t.SourceAddr, objectID) {
+			log.Printf("inode %d slot %d: 源 %s 上对象缺失（404），跳过 pull", t.InodeID, t.SlotIdx, t.SourceAddr)
 			return
 		}
-		log.Printf("inode %d slot %d: 触发 pull（alive 未 Done）", inodeID, t.SlotIdx)
-		s.triggerPull(t.TargetAddr, inodeID, t.SourceAddr, t.Checksum)
+		log.Printf("inode %d slot %d: 触发 pull（alive 未 Done）", t.InodeID, t.SlotIdx)
+		s.triggerPull(t.TargetAddr, objectID, t.SourceAddr, t.Checksum)
 	}
 }
 
@@ -749,11 +775,21 @@ func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
 				validIDs[types.ChunkObjID(c, in.ID)] = true
 			}
 		} else {
-			validIDs[in.ID] = true
+			// 内容对象寻址：live 引用走 ObjIDFor（显式 ObjID 优先，旧数据回退 FileID）。
+			validIDs[types.ObjIDFor(in)] = true
 		}
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("遍历文件: %w", err)
+	}
+	// 对象登记表保护：live/pending 恒保护，retired 宽限期内保护——
+	// 防止"上传中对象被两轮孤儿确认误删"与"迟到删除销毁新版本"两类竞态。
+	protected, err := s.store.ProtectedObjectIDs()
+	if err != nil {
+		return nil, fmt.Errorf("对象登记表: %w", err)
+	}
+	for id := range protected {
+		validIDs[id] = true
 	}
 
 	var reports []GCNodeReport

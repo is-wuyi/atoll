@@ -25,8 +25,8 @@ import (
 // 恢复 = 最近快照(含快照时刻的 wal 桶与 seq) + 重放其后的帧。
 
 var (
-	bucketWAL  = []byte("wal")
-	keyWALSeq  = []byte("wal_seq") // 最后分配的帧 seq；帧 seq 从 1 起
+	bucketWAL = []byte("wal")
+	keyWALSeq = []byte("wal_seq") // 最后分配的帧 seq；帧 seq 从 1 起
 )
 
 // 桶编码：帧里用 1 字节标识目标桶，避免存整串桶名。
@@ -35,6 +35,9 @@ const (
 	bcChildren byte = 2
 	bcNodes    byte = 3
 	bcMeta     byte = 4
+	bcOps      byte = 5
+	bcObjects  byte = 6
+	bcRetired  byte = 7
 )
 
 func bucketByCode(c byte) ([]byte, error) {
@@ -47,6 +50,12 @@ func bucketByCode(c byte) ([]byte, error) {
 		return bucketNodes, nil
 	case bcMeta:
 		return bucketMeta, nil
+	case bcOps:
+		return bucketOps, nil
+	case bcObjects:
+		return bucketObjects, nil
+	case bcRetired:
+		return bucketRetired, nil
 	default:
 		return nil, fmt.Errorf("wal: 未知桶编码 %d", c)
 	}
@@ -96,6 +105,9 @@ func (w *txw) del(bucketCode byte, bkt, key []byte) error {
 }
 
 func (w *txw) putInode(in *types.Inode) error {
+	if err := w.updateObjectIndex(in); err != nil {
+		return err
+	}
 	raw, err := json.Marshal(in)
 	if err != nil {
 		return err
@@ -104,6 +116,12 @@ func (w *txw) putInode(in *types.Inode) error {
 }
 
 func (w *txw) delInode(id uint64) error {
+	in, err := getInodeTx(w.tx, id)
+	if err == nil && in.ObjID != 0 {
+		if err := w.retireObject(in.ObjID); err != nil {
+			return err
+		}
+	}
 	return w.del(bcInodes, bucketInodes, u64be(id))
 }
 
@@ -126,6 +144,9 @@ func (w *txw) nextID(key []byte) (uint64, error) {
 	if v := b.Get(key); v != nil {
 		cur = beU64(v)
 	}
+	if (string(key) == string(keyNextInode) && cur >= types.StagingInodeBase) || cur == ^uint64(0) {
+		return 0, fmt.Errorf("id space exhausted")
+	}
 	if err := w.put(bcMeta, bucketMeta, key, u64be(cur+1)); err != nil {
 		return 0, err
 	}
@@ -137,6 +158,9 @@ func (w *txw) nextStagingID() (uint64, error) {
 	cur := types.StagingInodeBase
 	if v := b.Get(keyNextStagingInode); v != nil {
 		cur = beU64(v)
+	}
+	if cur > types.MaxStagingInode {
+		return 0, fmt.Errorf("staging id space exhausted")
 	}
 	if err := w.put(bcMeta, bucketMeta, keyNextStagingInode, u64be(cur+1)); err != nil {
 		return 0, err

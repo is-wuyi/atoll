@@ -2,6 +2,7 @@ package meta
 
 import (
 	"encoding/json"
+	"errors"
 	"time"
 
 	"atoll/pkg/types"
@@ -22,13 +23,56 @@ import (
 
 // OpRecord 是一次已完成的写操作及其结果。
 type OpRecord struct {
-	OpID      string      `json:"op_id"`
-	Kind      string      `json:"kind"` // "small" | "commit"
-	Inode     types.Inode `json:"inode"`
-	CreatedAt time.Time   `json:"created_at"`
+	OpID        string      `json:"op_id"`
+	Kind        string      `json:"kind"`                  // "small" | "commit"
+	Fingerprint string      `json:"fingerprint,omitempty"` // 请求指纹；同 op_id 不同请求必须拒绝
+	Inode       types.Inode `json:"inode"`
+	CreatedAt   time.Time   `json:"created_at"`
 }
 
 func opKey(opID string) []byte { return []byte(opID) }
+
+// ErrOpConflict：同 op_id 但请求指纹不同——绝不能回放无关的旧结果。
+var ErrOpConflict = errors.New("op id reused with different request")
+
+// opResultTx 在事务内读取幂等结果：同 op_id+kind+指纹 → 回放；指纹不符 → 冲突。
+func opResultTx(tx *bolt.Tx, opID, kind, fingerprint string) (OpRecord, bool, error) {
+	var rec OpRecord
+	if opID == "" {
+		return rec, false, nil
+	}
+	raw := tx.Bucket(bucketOps).Get(opKey(opID))
+	if raw == nil {
+		return rec, false, nil
+	}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return rec, false, err
+	}
+	if rec.Kind != kind || (fingerprint != "" && rec.Fingerprint != "" && rec.Fingerprint != fingerprint) {
+		return rec, false, ErrOpConflict
+	}
+	return rec, true, nil
+}
+
+// putOpResult 在记录型事务内写入幂等结果（put-if-absent：已存在且一致则不占帧）。
+func (w *txw) putOpResult(opID, kind, fingerprint string, in types.Inode, at time.Time) error {
+	if opID == "" {
+		return nil
+	}
+	rec, ok, err := opResultTx(w.tx, opID, kind, fingerprint)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil // 已记录，幂等
+	}
+	_ = rec
+	raw, err := json.Marshal(OpRecord{OpID: opID, Kind: kind, Fingerprint: fingerprint, Inode: in, CreatedAt: at})
+	if err != nil {
+		return err
+	}
+	return w.put(bcOps, bucketOps, opKey(opID), raw)
+}
 
 // PutOpResult 记录一次写操作的结果（同 op_id 覆盖写为幂等语义）。
 func (s *Store) PutOpResult(opID, kind string, in types.Inode) error {
@@ -42,7 +86,7 @@ func (s *Store) PutOpResultAt(opID, kind string, in types.Inode, at time.Time) e
 		return err
 	}
 	return s.write(func(w *txw) error {
-		return w.tx.Bucket(bucketOps).Put(opKey(opID), raw)
+		return w.put(bcOps, bucketOps, opKey(opID), raw)
 	})
 }
 
@@ -88,7 +132,7 @@ func (s *Store) SweepOpsOlderThan(d time.Duration) (int, error) {
 			return err
 		}
 		for _, v := range stale {
-			if err := b.Delete(v.key); err != nil {
+			if err := w.del(bcOps, bucketOps, v.key); err != nil {
 				return err
 			}
 			removed++
