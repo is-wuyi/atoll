@@ -1,0 +1,66 @@
+// Copyright 2020 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package fs_test
+
+import (
+	"bytes"
+	"os"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/internal/testutil"
+)
+
+func TestWindowsEmulations(t *testing.T) {
+	mntDir := t.TempDir()
+	origDir := t.TempDir()
+
+	rootData := &fs.LoopbackRoot{
+		Path: origDir,
+	}
+	root := &WindowsNode{
+		LoopbackNode: &fs.LoopbackNode{
+			RootData: rootData,
+		},
+	}
+	opts := fs.Options{}
+	opts.Debug = testutil.VerboseTest()
+	server, err := fs.Mount(mntDir, root, &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Unmount()
+
+	data := []byte("hello")
+	nm := mntDir + "/file"
+	if err := os.WriteFile(nm, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := os.ReadFile(nm); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(got, data) {
+		t.Fatalf("got %q want %q", got, data)
+	}
+
+	f, err := os.Open(nm)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := syscall.Unlink(nm); err == nil {
+		t.Fatal("Unlink should have failed")
+	}
+
+	f.Close()
+	// Ugh - it may take a while for the RELEASE to be processed.
+	time.Sleep(10 * time.Millisecond)
+
+	if err := syscall.Unlink(nm); err != nil {
+		t.Fatalf("Unlink: %v", err)
+	}
+}

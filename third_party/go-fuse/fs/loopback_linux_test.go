@@ -1,0 +1,525 @@
+// Copyright 2019 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package fs
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/hanwen/go-fuse/v2/internal/ioctl"
+	"github.com/hanwen/go-fuse/v2/internal/testutil"
+	"golang.org/x/sys/unix"
+)
+
+func TestRenameNoOverwrite(t *testing.T) {
+	tc := newTestCase(t, &testOptions{attrCache: true, entryCache: true})
+
+	if err := os.Mkdir(tc.origDir+"/dir", 0755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	tc.writeOrig("file", "hello", 0644)
+	tc.writeOrig("dir/file", "x", 0644)
+
+	f1, err := syscall.Open(tc.mntDir+"/", syscall.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatalf("open 1: %v", err)
+	}
+	defer syscall.Close(f1)
+	f2, err := syscall.Open(tc.mntDir+"/dir", syscall.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatalf("open 2: %v", err)
+	}
+	defer syscall.Close(f2)
+
+	if err := unix.Renameat2(f1, "file", f2, "file", unix.RENAME_NOREPLACE); err == nil {
+		t.Errorf("rename NOREPLACE succeeded")
+	} else if err != syscall.EEXIST {
+		t.Errorf("got %v (%T) want EEXIST", err, err)
+	}
+}
+
+func TestRenameWhiteOut(t *testing.T) {
+	tc := newTestCase(t, &testOptions{attrCache: true, entryCache: true})
+
+	if err := os.Mkdir(tc.origDir+"/dir", 0755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	tc.writeOrig("file", "hello", 0644)
+
+	f1, err := syscall.Open(tc.mntDir+"/", syscall.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatalf("open 1: %v", err)
+	}
+	defer syscall.Close(f1)
+	f2, err := syscall.Open(tc.mntDir+"/dir", syscall.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatalf("open 2: %v", err)
+	}
+	defer syscall.Close(f2)
+
+	if err := unix.Renameat2(f1, "file", f2, "file", unix.RENAME_WHITEOUT); err != nil {
+		t.Errorf("rename WHITEOUT: %v", err)
+	}
+
+	fi, err := os.Stat(tc.mntDir + "/file")
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	st := fi.Sys().(*syscall.Stat_t)
+	if st.Mode&syscall.S_IFMT != unix.S_IFCHR {
+		t.Errorf("old file is not a whiteout")
+	}
+	if st.Rdev != 0 {
+		t.Errorf("old file is not a whiteout")
+	}
+
+	fi, err = os.Stat(tc.mntDir + "/dir/file")
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	st = fi.Sys().(*syscall.Stat_t)
+	if st.Mode&syscall.S_IFMT != unix.S_IFREG {
+		t.Errorf("new file is not a regular file")
+	}
+}
+
+// TestXAttrSymlink verifies that we did not forget to use Lgetxattr instead
+// of Getxattr. This test is Linux-specific because it depends on the behavoir
+// of the `security` namespace.
+//
+// On Linux, symlinks can not have xattrs in the `user` namespace, so we
+// try to read something from `security`. Writing would need root rights,
+// so don't even bother. See `man 7 xattr` for more info.
+func TestXAttrSymlink(t *testing.T) {
+	tc := newTestCase(t, nil)
+
+	path := tc.mntDir + "/symlink"
+	if err := syscall.Symlink("target/does/not/exist", path); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 10)
+	_, err := unix.Lgetxattr(path, "security.foo", buf)
+	if err != unix.ENODATA {
+		t.Errorf("want %d=ENODATA, got error %d=%q instead", unix.ENODATA, err, err)
+	}
+}
+
+type noReadWrite struct {
+	*LoopbackNode
+}
+
+var _ = NodeWriter((*noReadWrite)(nil))
+
+func (n *noReadWrite) Write(_ context.Context, fh FileHandle, _ []byte, off int64) (uint32, syscall.Errno) {
+	return 0, syscall.ENOTSUP
+}
+
+var _ = NodeReader((*noReadWrite)(nil))
+
+func (n *noReadWrite) Read(_ context.Context, fh FileHandle, _ []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	return nil, syscall.ENOTSUP
+}
+
+func TestCopyFileRange(t *testing.T) {
+	mnt := t.TempDir()
+	orig := t.TempDir()
+
+	root := &Inode{}
+	rdata := &LoopbackRoot{
+		Path: orig,
+	}
+
+	for k, v := range map[string]string{"src": "01234567890123456789",
+		"dst": "abcdefghijabcdefghij"} {
+		if err := os.WriteFile(filepath.Join(orig, k), []byte(v), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	src := &noReadWrite{
+		&LoopbackNode{RootData: rdata},
+	}
+	dst := &noReadWrite{
+		&LoopbackNode{RootData: rdata},
+	}
+	opt := &Options{
+		OnAdd: func(ctx context.Context) {
+			s := root.NewPersistentInode(ctx, src, StableAttr{Ino: 22})
+			root.AddChild("src", s, true)
+			d := root.NewPersistentInode(ctx, dst, StableAttr{Ino: 23})
+			root.AddChild("dst", d, true)
+		},
+	}
+	opt.Debug = testutil.VerboseTest()
+	srv, err := Mount(mnt, root, opt)
+	defer srv.Unmount()
+
+	if !srv.KernelSettings().SupportsVersion(7, 28) {
+		t.Skip("need v7.28 for CopyFileRange")
+	}
+
+	f1, err := os.OpenFile(mnt+"/src", syscall.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("Open src: %v", err)
+	}
+	defer f1.Close()
+
+	f2, err := os.OpenFile(mnt+"/dst", syscall.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("Open dst: %v", err)
+	}
+	defer f2.Close()
+
+	srcOff := int64(5)
+	dstOff := int64(7)
+	if sz, err := unix.CopyFileRange(int(f1.Fd()), &srcOff, int(f2.Fd()), &dstOff, 3, 0); err != nil || sz != 3 {
+		t.Fatalf("CopyFileRange: %d,%v", sz, err)
+	}
+
+	if err = f1.Close(); err != nil {
+		t.Fatalf("Close src: %v", err)
+	}
+
+	if err = f2.Close(); err != nil {
+		t.Fatalf("Close dst: %v", err)
+	}
+	c, err := os.ReadFile(orig + "/dst")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	want := "abcdefg567abcdefghij"
+	got := string(c)
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+
+}
+
+// Wait for a change in /proc/self/mounts. Efficient through the use of
+// unix.Poll().
+func waitProcMountsChange() error {
+	fd, err := syscall.Open("/proc/self/mounts", syscall.O_RDONLY, 0)
+	defer syscall.Close(fd)
+	if err != nil {
+		return err
+	}
+	pollFds := []unix.PollFd{
+		{
+			Fd:     int32(fd),
+			Events: unix.POLLPRI,
+		},
+	}
+	_, err = unix.Poll(pollFds, 1000)
+	return err
+}
+
+// Wait until mountpoint "mnt" shows up /proc/self/mounts
+func waitMount(mnt string) error {
+	for {
+		err := waitProcMountsChange()
+		if err != nil {
+			return err
+		}
+		content, err := os.ReadFile("/proc/self/mounts")
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(content, []byte(mnt)) {
+			return nil
+		}
+	}
+}
+
+// There is a hang that appears when enabling CAP_PARALLEL_DIROPS on Linux
+// 4.15.0: https://github.com/hanwen/go-fuse/issues/281
+// The hang was originally triggered by gvfs-udisks2-volume-monitor. This
+// test emulates what gvfs-udisks2-volume-monitor does.
+func TestParallelDiropsHang(t *testing.T) {
+	// We do NOT want to use newTestCase() here because we need to know the
+	// mnt path before the filesystem is mounted
+	dir := t.TempDir()
+	orig := dir + "/orig"
+	mnt := dir + "/mnt"
+	if err := os.Mkdir(orig, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(mnt, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unblock the goroutines onces the mount shows up in /proc/self/mounts
+	wait := make(chan struct{})
+	go func() {
+		err := waitMount(mnt)
+		if err != nil {
+			t.Error(err)
+		}
+		// Unblock the goroutines regardless of an error. We don't want to hang
+		// the test.
+		close(wait)
+	}()
+
+	// gvfs-udisks2-volume-monitor hits the mount with three threads - we try to
+	// emulate exactly what it does acc. to an strace log.
+	var wg sync.WaitGroup
+	wg.Add(3)
+	// [pid  2117] lstat(".../mnt/autorun.inf",  <unfinished ...>
+	go func() {
+		defer wg.Done()
+		<-wait
+		var st unix.Stat_t
+		unix.Lstat(mnt+"/autorun.inf", &st)
+	}()
+	// [pid  2116] open(".../mnt/.xdg-volume-info", O_RDONLY <unfinished ...>
+	go func() {
+		defer wg.Done()
+		<-wait
+		syscall.Open(mnt+"/.xdg-volume-info", syscall.O_RDONLY, 0)
+	}()
+	// 25 times this:
+	// [pid  1874] open(".../mnt", O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC <unfinished ...>
+	// [pid  1874] fstat(11, {st_mode=S_IFDIR|0775, st_size=4096, ...}) = 0
+	// [pid  1874] getdents(11, /* 2 entries */, 32768) = 48
+	// [pid  1874] close(11)                   = 0
+	go func() {
+		defer wg.Done()
+		<-wait
+		for i := 1; i <= 25; i++ {
+			f, err := os.Open(mnt)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_, err = f.Stat()
+			if err != nil {
+				t.Error(err)
+				f.Close()
+				return
+			}
+			_, err = f.Readdirnames(-1)
+			if err != nil {
+				t.Errorf("iteration %d: fd %d: %v", i, f.Fd(), err)
+				return
+			}
+			f.Close()
+		}
+	}()
+
+	loopbackRoot, err := NewLoopbackRoot(orig)
+	if err != nil {
+		t.Fatalf("NewLoopbackRoot(%s): %v\n", orig, err)
+	}
+	sec := time.Second
+	opts := &Options{
+		AttrTimeout:  &sec,
+		EntryTimeout: &sec,
+	}
+	opts.Debug = testutil.VerboseTest()
+
+	rawFS := NewNodeFS(loopbackRoot, opts)
+	server, err := fuse.NewServer(rawFS, mnt, &opts.MountOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go server.Serve()
+
+	wg.Wait()
+	server.Unmount()
+}
+
+func TestRoMount(t *testing.T) {
+	newTestCase(t, &testOptions{ro: true})
+}
+
+func TestDirectMount(t *testing.T) {
+	opts := &testOptions{
+		directMount: true,
+	}
+	if os.Geteuid() == 0 {
+		t.Log("running as root, setting DirectMountStrict")
+		opts.directMountStrict = true
+	}
+	newTestCase(t, opts)
+}
+
+const FS_NOATIME_FL = 0x00000080
+const FS_IOC_GETFLAGS = 0x80086601
+const FS_IOC_SETFLAGS = 0x40086602
+
+func flipNoAtime(fd uintptr) (bool, error) {
+	var flags uint32
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, FS_IOC_GETFLAGS, uintptr(unsafe.Pointer(&flags)))
+	if errno != 0 {
+		return false, errno
+	}
+
+	before := (flags & FS_NOATIME_FL) != 0
+	flags ^= FS_NOATIME_FL
+	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), FS_IOC_SETFLAGS, uintptr(unsafe.Pointer(&flags)))
+	if errno != 0 {
+		return false, errno
+	}
+
+	return before, nil
+}
+
+func TestIoctlLoopbackFile(t *testing.T) {
+	tc := newTestCase(t, &testOptions{attrCache: true, entryCache: true})
+
+	f, err := os.Create(tc.origDir + "/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := flipNoAtime(f.Fd())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.Close()
+
+	f, err = os.Open(tc.mntDir + "/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	after, err := flipNoAtime(f.Fd())
+
+	if after != !before {
+		t.Fatalf("didn't work: after %v, before %v", after, before)
+	}
+}
+
+func TestIoctlLoopbackDir(t *testing.T) {
+	tc := newTestCase(t, &testOptions{attrCache: true, entryCache: true})
+
+	err := os.Mkdir(tc.origDir+"/dir", 0777)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := os.Open(tc.origDir + "/dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := flipNoAtime(d.Fd())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d.Close()
+
+	d, err = os.Open(tc.mntDir + "/dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	after, err := flipNoAtime(d.Fd())
+
+	if after != !before {
+		t.Fatalf("didn't work: after %v, before %v", after, before)
+	}
+}
+
+// fiemap mirrors struct fiemap from linux/fiemap.h, without the
+// variable-length fm_extents array.
+type fiemap struct {
+	Start         uint64
+	Length        uint64
+	Flags         uint32
+	MappedExtents uint32
+	ExtentCount   uint32
+	Reserved      uint32
+}
+
+const fiemapFlagSync = 0x1 // FIEMAP_FLAG_SYNC
+
+// TestIoctlFIEMAP exercises a _IOWR ioctl: the kernel reads the
+// request struct and writes the result into the same buffer, so the
+// result must be copied into the FUSE output buffer.
+func TestIoctlFIEMAP(t *testing.T) {
+	// Create the file in the current directory rather than TMPDIR:
+	// /tmp is often tmpfs, which does not support FIEMAP.
+	tmp, err := os.CreateTemp(".", "fiemap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := tmp.Name()
+	tmp.Close()
+	t.Cleanup(func() { os.Remove(fn) })
+	if err := os.WriteFile(fn, bytes.Repeat([]byte{42}, 64*1024), 0666); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := syscall.Open(fn, syscall.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fd)
+
+	req := fiemap{
+		Length: ^uint64(0),
+		Flags:  fiemapFlagSync,
+	}
+	sz := unsafe.Sizeof(req)
+	input := unsafe.Slice((*byte)(unsafe.Pointer(&req)), sz)
+	var rep fiemap
+	output := unsafe.Slice((*byte)(unsafe.Pointer(&rep)), sz)
+
+	// FS_IOC_FIEMAP = _IOWR('f', 11, struct fiemap)
+	cmd := ioctl.New(ioctl.READ|ioctl.WRITE, 'f', 11, sz)
+	lf := NewLoopbackFile(fd).(FileIoctler)
+	_, errno := lf.Ioctl(context.Background(), uint32(cmd), 0, input, output)
+	if errno == syscall.ENOTTY || errno == syscall.EOPNOTSUPP {
+		t.Skipf("FIEMAP on %q unsupported: %v", fn, errno)
+	}
+	if errno != 0 {
+		t.Fatalf("Ioctl(FS_IOC_FIEMAP): %v", errno)
+	}
+	if rep.MappedExtents == 0 {
+		t.Errorf("FIEMAP result was not copied to the output buffer: %+v", rep)
+	}
+}
+
+func TestMknod(t *testing.T) {
+	tc := newTestCase(t, &testOptions{})
+
+	modes := map[string]uint32{
+		"regular": syscall.S_IFREG,
+		"socket":  syscall.S_IFSOCK,
+		"fifo":    syscall.S_IFIFO,
+	}
+
+	for nm, mode := range modes {
+		t.Run(nm, func(t *testing.T) {
+			p := filepath.Join(tc.mntDir, nm)
+			// This doesn't work on FreeBSD: fifos must be made with mkfifo for example
+			err := syscall.Mknod(p, mode|0755, (8<<8)|0)
+			if err != nil {
+				t.Fatalf("mknod(%s): %v", nm, err)
+			}
+
+			var st syscall.Stat_t
+			if err := syscall.Stat(p, &st); err != nil {
+				got := st.Mode &^ 07777
+				if want := uint(mode); want != uint(got) {
+					t.Fatalf("stat(%s): got %o want %o", nm, got, want)
+				}
+			}
+
+			// We could test if the files can be
+			// read/written but: The kernel handles FIFOs
+			// without talking to FUSE at all. Presumably,
+			// this also holds for sockets.  Regular files
+			// are tested extensively elsewhere.
+		})
+	}
+}
