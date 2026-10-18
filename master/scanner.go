@@ -32,16 +32,17 @@ type Scanner struct {
 
 	wg sync.WaitGroup // 后台循环生命周期，供 Wait() 优雅关闭
 
-	mu          sync.Mutex
-	prevAlive   map[uint64]bool      // 上轮 alive 集合
-	failStreak  map[uint64]int       // 修复连续未收敛轮数（按 inode / chunkID）
-	nextAttempt map[uint64]time.Time // 修复退避：下次允许触发修复的时间
+	retirementMu   sync.Mutex
+	retirementWake chan struct{}
+	mu             sync.Mutex
+	prevAlive      map[uint64]bool      // 上轮 alive 集合
+	failStreak     map[uint64]int       // 修复连续未收敛轮数（按 inode / chunkID）
+	nextAttempt    map[uint64]time.Time // 修复退避：下次允许触发修复的时间
 
-	prevOrphans     map[uint64]map[uint64]bool // GC 两轮确认：上轮孤儿集合 nodeID → objectID
-	stagingTTL      time.Duration              // staging inode 超时回收阈值
-	degradedSince   map[uint64]time.Time       // 块降级追踪（改进项2）：chunkID → 首次发现单副本时刻
-	degradedWarn    map[uint64]bool            // 已告警标记（避免重复刷日志）
-	degradedWarnDur time.Duration              // 持续降级多久后告警
+	stagingTTL      time.Duration        // staging inode 超时回收阈值
+	degradedSince   map[uint64]time.Time // 块降级追踪（改进项2）：chunkID → 首次发现单副本时刻
+	degradedWarn    map[uint64]bool      // 已告警标记（避免重复刷日志）
+	degradedWarnDur time.Duration        // 持续降级多久后告警
 }
 
 // NewScanner 创建一个新的 Scanner 实例。token 由 SetToken 设置后对出站请求生效。
@@ -53,6 +54,7 @@ func NewScanner(store *meta.Store, nodeMaxAge, repairIntv, gcIntv time.Duration)
 		gcIntv:          gcIntv,
 		httpClient:      &http.Client{Timeout: 10 * time.Second, Transport: &auth.Transport{Token: ""}},
 		scheme:          "http",
+		retirementWake:  make(chan struct{}, 1),
 		prevAlive:       make(map[uint64]bool),
 		failStreak:      make(map[uint64]int),
 		nextAttempt:     make(map[uint64]time.Time),
@@ -86,15 +88,16 @@ func (s *Scanner) SetTLS(cfg *tls.Config) {
 // Configure before Start; existing healthy or pending copies may still be repaired in place.
 func (s *Scanner) SetAdditiveOnly(enabled bool) { s.additiveOnly = enabled }
 
-// Start 启动三个后台扫描器，ctx 取消时退出。
+// Start starts background workers; Wait joins all of them after cancellation.
 func (s *Scanner) Start(ctx context.Context) {
-	s.wg.Add(3)
+	s.wg.Add(4)
 	go func() { defer s.wg.Done(); s.runDeathMonitor(ctx) }()
 	go func() { defer s.wg.Done(); s.runRepairLoop(ctx) }()
 	go func() { defer s.wg.Done(); s.runGCLoop(ctx) }()
+	go func() { defer s.wg.Done(); s.runRetirementLoop(ctx) }()
 }
 
-// Wait 阻塞直到三个后台扫描器全部退出（ctx 取消后调用）。
+// Wait joins the workers before the metadata store closes.
 // runMaster 在关闭 store 前调用它，避免扫描器还在用 store 时库被关闭。
 func (s *Scanner) Wait() { s.wg.Wait() }
 
@@ -741,9 +744,7 @@ type GCNodeReport struct {
 	NodeAddr    string        `json:"node_addr"`
 	Orphans     []ObjectEntry `json:"orphans"`
 	OrphanBytes int64         `json:"orphan_bytes"`
-	// Deleted 本轮实际删除的孤儿数（仅 execute）。两轮确认下首轮恒为 0——
-	// 此前 CLI 直接拿 len(Orphans) 当删除数打印"已删除 N"，首轮会虚报。
-	Deleted int `json:"deleted"`
+	Deleted     int           `json:"deleted"` // Unknown inventory orphans are report-only.
 }
 
 // findOrphans 纯函数：节点对象列表 + 元数据 inode 集合 → 孤儿列表。
@@ -759,7 +760,7 @@ func findOrphans(objects []ObjectEntry, validIDs map[uint64]bool) []ObjectEntry 
 
 // gcScanOnce 执行一次 GC dry-run 比对，输出日志摘要。
 func (s *Scanner) gcScanOnce() {
-	reports, err := s.runGC(false)
+	reports, err := s.runGC()
 	if err != nil {
 		log.Printf("GC dry-run: %v", err)
 		return
@@ -771,16 +772,18 @@ func (s *Scanner) gcScanOnce() {
 	}
 }
 
-// RunGC 是 gcScanOnce 的可导出版本，供 HTTP handler 调用。
-// execute=true 时通知节点删除孤儿。
+// RunGC reports inventory orphans and optionally executes durable retirements.
 func (s *Scanner) RunGC(execute bool) ([]GCNodeReport, error) {
-	return s.runGC(execute)
+	if execute {
+		if _, err := s.RunRetirements(context.Background()); err != nil {
+			return nil, err
+		}
+	}
+	return s.runGC()
 }
 
-// runGC 执行 GC 比对，execute=true 时删除孤儿。
-// 孤儿两轮确认：只有连续两轮扫描都在孤儿集合中的对象才允许删除。
-// 这消除了"上传中的新块 vs GC 快照"竞态（快照没含新块 → 新块被误判孤儿）。
-func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
+// Repeated inventory snapshots are not proof that an object has no retention roots.
+func (s *Scanner) runGC() ([]GCNodeReport, error) {
 	nodes, err := s.store.ListNodes()
 	if err != nil {
 		return nil, fmt.Errorf("列出节点: %w", err)
@@ -815,7 +818,6 @@ func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
 	}
 
 	var reports []GCNodeReport
-	curOrphans := make(map[uint64]map[uint64]bool) // 本轮孤儿快照
 	for _, n := range nodes {
 		if !n.LastHeartbeat.After(cutoff) {
 			continue // 跳过 dead 节点
@@ -835,35 +837,8 @@ func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
 			report.OrphanBytes += o.Size
 		}
 
-		set := make(map[uint64]bool, len(orphans))
-		for _, o := range orphans {
-			set[o.ID] = true
-		}
-		curOrphans[n.ID] = set
-
-		if execute {
-			// 只删上轮也判孤儿的对象（两轮确认）。
-			s.mu.Lock()
-			prev := s.prevOrphans[n.ID]
-			s.mu.Unlock()
-			var confirmed []ObjectEntry
-			for _, o := range orphans {
-				if prev == nil || !prev[o.ID] {
-					continue // 上轮没见过它，本轮留它到下轮再删
-				}
-				confirmed = append(confirmed, o)
-			}
-			if len(confirmed) > 0 {
-				report.Deleted = s.deleteOrphans(n.Addr, confirmed)
-				log.Printf("GC 节点 %d (%s): 两轮确认删除 %d/%d 个孤儿", n.ID, n.Addr, report.Deleted, len(confirmed))
-			}
-		}
 		reports = append(reports, report)
 	}
-	// 保存本轮孤儿集合作为下轮的"上轮"快照。
-	s.mu.Lock()
-	s.prevOrphans = curOrphans
-	s.mu.Unlock()
 	return reports, nil
 }
 
@@ -903,25 +878,9 @@ func (s *Scanner) sweepStaging() {
 	}
 }
 
-// notifyDeleteAsync 异步通知节点删除对象（staging 清扫用，失败只记日志）。
-func (s *Scanner) notifyDeleteAsync(objectID uint64, replicaNodeIDs []uint64) {
-	for _, id := range replicaNodeIDs {
-		n, err := s.store.GetNode(id)
-		if err != nil {
-			continue
-		}
-		go func(addr string) {
-			req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s://%s/objects/%d", s.scheme, addr, objectID), nil)
-			if err != nil {
-				return
-			}
-			resp, err := s.httpClient.Do(req)
-			if err != nil {
-				return
-			}
-			resp.Body.Close()
-		}(n.Addr)
-	}
+// Journaled retirement, rather than the stale caller snapshot, authorizes deletion.
+func (s *Scanner) notifyDeleteAsync(_ uint64, _ []uint64) {
+	s.wakeRetirements()
 }
 
 // fetchNodeObjects 获取节点的对象清单。
@@ -939,24 +898,4 @@ func (s *Scanner) fetchNodeObjects(addr string) ([]ObjectEntry, error) {
 		return nil, err
 	}
 	return objects, nil
-}
-
-// deleteOrphans 通知节点删除孤儿对象，返回成功删除数。
-func (s *Scanner) deleteOrphans(addr string, orphans []ObjectEntry) int {
-	deleted := 0
-	for _, o := range orphans {
-		req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s://%s/objects/%d", s.scheme, addr, o.ID), nil)
-		if err != nil {
-			continue
-		}
-		resp, err := s.httpClient.Do(req)
-		if err != nil {
-			continue
-		}
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			deleted++
-		}
-	}
-	return deleted
 }

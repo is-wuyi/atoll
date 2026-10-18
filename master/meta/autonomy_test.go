@@ -49,6 +49,10 @@ func TestProtectionReservationPublishesOnlyVerifiedAdditions(t *testing.T) {
 	s := newTestStore(t)
 	ids := protectionNodes(t, s, 3, 100)
 	d := protectionFixture(t, s, "file", ids[:1], 10)
+	primaryUsage := types.NodeUsage{Epoch: "primary", Sequence: 1, UsedBytes: 10}
+	if ok, err := s.MarkVerifiedObjectDoneWithUsage(d, ids[0], &primaryUsage); err != nil || !ok {
+		t.Fatalf("primary usage receipt: %v %v", ok, err)
+	}
 	p, err := s.ReserveProtection(protectionReq("add", d, ids[1], ids[2]), time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -79,10 +83,11 @@ func TestProtectionReservationPublishesOnlyVerifiedAdditions(t *testing.T) {
 		if ok, err := s.MarkVerifiedObjectDone(wrong, id); ok || err != nil {
 			t.Fatalf("bad contents accepted: %v %v", ok, err)
 		}
-		if ok, err := s.MarkVerifiedObjectDone(desc, id); !ok || err != nil {
+		usage := types.NodeUsage{Epoch: "target", Sequence: 1, UsedBytes: 10}
+		if ok, err := s.MarkVerifiedObjectDoneWithUsage(desc, id, &usage); !ok || err != nil {
 			t.Fatalf("valid receipt: %v %v", ok, err)
 		}
-		if ok, err := s.MarkVerifiedObjectDone(desc, id); !ok || err != nil {
+		if ok, err := s.MarkVerifiedObjectDoneWithUsage(desc, id, &usage); !ok || err != nil {
 			t.Fatalf("lost-ack replay: %v %v", ok, err)
 		}
 		current, _ := s.ObjectIntegrity(d.ObjectID)

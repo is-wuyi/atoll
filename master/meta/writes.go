@@ -697,11 +697,13 @@ func (s *Store) AbortPlannedWrite(actor WriteActor, b types.WriteBinding, now ti
 			return ErrWritePlanConflict
 		}
 		if rec.Upload.State == types.WriteAborted {
-			return nil
+			return w.retireAbortedWrite(rec, now)
 		}
 		rec.Upload.State = types.WriteAborted
-		// The node may still finish an already-authorized transfer. Keep its reservation and staging references.
-		return putPlannedWrite(w, rec)
+		if err := putPlannedWrite(w, rec); err != nil {
+			return err
+		}
+		return w.retireAbortedWrite(rec, now)
 	})
 	if err == nil {
 		err = s.EnsureDurable()
@@ -727,6 +729,9 @@ func (s *Store) ExpirePlannedWrites(now time.Time) (int, error) {
 		for _, rec := range expired {
 			rec.Upload.State = types.WriteAborted
 			if err := putPlannedWrite(w, rec); err != nil {
+				return err
+			}
+			if err := w.retireAbortedWrite(rec, now); err != nil {
 				return err
 			}
 			count++
@@ -765,6 +770,13 @@ func writeReservationsTx(tx *bolt.Tx) (map[[2]uint64]int64, error) {
 				return nil, ErrWritePlanConflict
 			}
 			for _, id := range p.Layout.Nodes {
+				retired, err := retirementConfirmedTx(tx, p.Object.ID, id)
+				if err != nil {
+					return nil, err
+				}
+				if retired {
+					continue
+				}
 				confirmed := false
 				if published != nil {
 					for _, chunk := range published.Chunks {

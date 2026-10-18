@@ -307,6 +307,13 @@ func (w *txw) retireObject(id uint64) error {
 	if err != nil || obj.State == objectRetired || obj.State == objectDeleting {
 		return err
 	}
+	d := types.ObjectIntegrity{ObjectID: obj.ID, InodeID: obj.FileID, Generation: obj.Generation, ChunkIndex: -1,
+		Size: obj.Size, Checksum: obj.Checksum, ChecksumKnown: true, Replicas: obj.Replicas, Done: obj.Done, Suspect: obj.Suspect, IntegrityEpoch: obj.IntegrityEpoch}
+	for _, nodeID := range obj.Replicas {
+		if err := w.queueRetirement(d, nodeID, obj.FileID != 0, "retired-object", time.Now()); err != nil {
+			return err
+		}
+	}
 	obj.State, obj.ExpiresAt = objectRetired, time.Now().Add(objectRetireGrace)
 	return w.putObject(obj)
 }
@@ -336,26 +343,30 @@ func (s *Store) AbortSmallFile(id uint64) error {
 	})
 }
 
-// ProtectedObjectIDs 返回当前不可被 GC 回收的内容对象 ID 集合：
-//   - live：inode 正引用；
-//   - pending：上传登记中（24h TTL，过期后不再保护、由 GC 两轮确认回收）；
-//   - retired：宽限期内（ExpiresAt 前）——迟到删除/旧读者窗口的兜底。
+// ProtectedObjectIDs retains live uploads and detached published content.
 func (s *Store) ProtectedObjectIDs() (map[uint64]bool, error) {
 	out := make(map[uint64]bool)
 	now := time.Now()
 	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketObjects).ForEach(func(_, v []byte) error {
+		if err := tx.Bucket(bucketObjects).ForEach(func(_, v []byte) error {
 			var obj ObjectRecord
 			if err := json.Unmarshal(v, &obj); err != nil {
-				return nil // 损坏记录不保护也不阻塞 GC
+				return err
 			}
-			switch obj.State {
-			case objectLive, objectPending:
+			if obj.State == objectLive || obj.State == objectPending || obj.ExpiresAt.After(now) || obj.FileID != 0 {
 				out[obj.ID] = true
-			case objectRetired:
-				if obj.ExpiresAt.After(now) {
-					out[obj.ID] = true
-				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		return tx.Bucket(bucketRetired).ForEach(func(k, v []byte) error {
+			rec, err := decodeRetirementRecord(k, v)
+			if err != nil {
+				return err
+			}
+			if rec.State != RetirementConfirmed {
+				out[rec.ObjectID] = true
 			}
 			return nil
 		})
@@ -363,28 +374,33 @@ func (s *Store) ProtectedObjectIDs() (map[uint64]bool, error) {
 	return out, err
 }
 
-// SweepExpiredObjects 清理到期的 pending 登记（master 在 prepare 后崩溃的残留）
-// 与宽限期已过的 retired 记录。记录删除后对象不再受保护，GC 两轮确认回收物理对象。
-// 返回删除数。
+// Expired registry entries become durable retirement records before losing their upload roots.
 func (s *Store) SweepExpiredObjects() (int, error) {
 	removed := 0
 	now := time.Now()
 	err := s.write(func(w *txw) error {
-		var stale [][]byte
-		if err := w.tx.Bucket(bucketObjects).ForEach(func(k, v []byte) error {
+		var expired []ObjectRecord
+		if err := w.tx.Bucket(bucketObjects).ForEach(func(_, v []byte) error {
 			var obj ObjectRecord
 			if err := json.Unmarshal(v, &obj); err != nil {
-				return nil
+				return err
 			}
 			if (obj.State == objectPending || obj.State == objectRetired) && !obj.ExpiresAt.After(now) {
-				stale = append(stale, append([]byte(nil), k...))
+				expired = append(expired, obj)
 			}
 			return nil
 		}); err != nil {
 			return err
 		}
-		for _, k := range stale {
-			if err := w.del(bcObjects, bucketObjects, k); err != nil {
+		for _, obj := range expired {
+			d := types.ObjectIntegrity{ObjectID: obj.ID, InodeID: obj.FileID, Generation: obj.Generation, ChunkIndex: -1,
+				Size: obj.Size, Checksum: obj.Checksum, ChecksumKnown: true, Replicas: obj.Replicas, Done: obj.Done, Suspect: obj.Suspect, IntegrityEpoch: obj.IntegrityEpoch}
+			for _, nodeID := range obj.Replicas {
+				if err := w.queueRetirement(d, nodeID, obj.FileID != 0, "expired-object", now); err != nil {
+					return err
+				}
+			}
+			if err := w.del(bcObjects, bucketObjects, u64be(obj.ID)); err != nil {
 				return err
 			}
 			removed++

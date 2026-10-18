@@ -100,6 +100,18 @@ func (s *Store) DBPath() string { return s.db.Path() }
 
 func (s *Store) init() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
+		if metadata := tx.Bucket(bucketMeta); metadata != nil {
+			marker := metadata.Get(keyRetirementInitialized)
+			journal := tx.Bucket(bucketRetired)
+			if marker != nil && (!bytes.Equal(marker, []byte{1}) || journal == nil) {
+				return errors.New("retirement journal missing or invalid in initialized database")
+			}
+			if marker == nil && journal != nil {
+				if key, _ := journal.Cursor().First(); key != nil {
+					return errors.New("retirement initialization marker missing")
+				}
+			}
+		}
 		for _, b := range [][]byte{bucketInodes, bucketChildren, bucketNodes, bucketMeta, bucketWAL, bucketOps, bucketObjects, bucketRetired, bucketAutonomy, bucketSecurity, bucketWrites} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err

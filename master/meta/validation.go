@@ -39,6 +39,22 @@ func ValidateSnapshotFile(path string) error {
 				return fmt.Errorf("snapshot missing bucket %q", name)
 			}
 		}
+		marker := tx.Bucket(bucketMeta).Get(keyRetirementInitialized)
+		journal := tx.Bucket(bucketRetired)
+		if marker != nil && (len(marker) != 1 || marker[0] != 1 || journal == nil) {
+			return fmt.Errorf("snapshot retirement journal missing or invalid")
+		}
+		if journal != nil {
+			if key, _ := journal.Cursor().First(); marker == nil && key != nil {
+				return fmt.Errorf("snapshot retirement initialization marker missing")
+			}
+			if err := journal.ForEach(func(key, raw []byte) error {
+				_, err := decodeRetirementRecord(key, raw)
+				return err
+			}); err != nil {
+				return err
+			}
+		}
 		var root types.Inode
 		if err := json.Unmarshal(tx.Bucket(bucketInodes).Get(u64be(RootID)), &root); err != nil {
 			return fmt.Errorf("snapshot root: %w", err)

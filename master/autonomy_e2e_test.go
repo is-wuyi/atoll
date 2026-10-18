@@ -873,6 +873,9 @@ func TestAutonomyE2EAckLostVerifyDoesNotRetransfer(t *testing.T) {
 	if err := os.WriteFile(dstPath, body, 0o644); err != nil {
 		t.Fatalf("plant landed copy: %v", err)
 	}
+	if err := target.node.InitUsedBytes(); err != nil {
+		t.Fatalf("reconcile landed copy before its usage receipt: %v", err)
+	}
 	landed, err := os.Stat(dstPath)
 	if err != nil {
 		t.Fatalf("stat landed copy: %v", err)

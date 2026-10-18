@@ -1147,25 +1147,10 @@ func (s *Server) countCommitReadyChunks(st types.Inode, minCopies int) int {
 	return ready
 }
 
-// notifyObjectDelete 通知持有该对象的所有节点删除本地文件。
-func (s *Server) notifyObjectDelete(inodeID uint64, replicaNodeIDs []uint64) {
-	client := s.nodeHTTPClient(5 * time.Second)
-	for _, id := range replicaNodeIDs {
-		n, err := s.store.GetNode(id)
-		if err != nil {
-			continue
-		}
-		req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s://%s/objects/%d", s.nodeScheme(), n.Addr, inodeID), nil)
-		if err != nil {
-			continue
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("通知节点 %d 删除对象 %d 失败: %v", id, inodeID, err)
-			continue
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+// Deletion authority comes from the durable journal, not this caller's old replica snapshot.
+func (s *Server) notifyObjectDelete(_ uint64, _ []uint64) {
+	if s.scanner != nil {
+		s.scanner.wakeRetirements()
 	}
 }
 

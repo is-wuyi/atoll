@@ -165,7 +165,7 @@ func (s *Store) MarkVerifiedObjectDoneWithUsage(expected types.ObjectIntegrity, 
 		return false, nil
 	}
 	if expected.PlanID != "" {
-		return s.markProtectionDone(expected, nodeID)
+		return s.markProtectionDone(expected, nodeID, usage)
 	}
 	return s.markIntegrityDone(expected, nodeID, true, usage)
 }

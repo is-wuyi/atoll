@@ -43,12 +43,13 @@ type Node struct {
 	token             auth.Token    // 集群认证；空 = 兼容模式
 	sec               *nodeSecurity // 独立身份+在线票据模式；nil = legacy 行为
 
-	capMu       sync.Mutex // 容量闸：保护 inflight 与「used 结算 + 预留归还」的原子性
-	usageOnce   sync.Once
-	usageEpoch  string
-	usageSeq    uint64
-	inflight    int64 // 在飞临时写已预留的字节（rename 前的 temp 占用）
-	objectLocks [objectLockStripes]sync.Mutex
+	capMu              sync.Mutex // 容量闸：保护 inflight 与「used 结算 + 预留归还」的原子性
+	usageOnce          sync.Once
+	usageEpoch         string
+	usageSeq           uint64
+	inflight           int64 // 在飞临时写已预留的字节（rename 前的 temp 占用）
+	objectLocks        [objectLockStripes]sync.Mutex
+	activeObjectWrites sync.Map // object ID -> count, guarded by its object lock
 }
 
 func New(dataDir, masterURL, advertise string, totalBytes int64) *Node {
@@ -147,6 +148,7 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("PUT /objects/{id}", n.handlePut)
 	mux.HandleFunc("GET /objects/{id}", n.handleGet)
 	mux.HandleFunc("DELETE /objects/{id}", n.handleDelete)
+	mux.HandleFunc("POST /retire/{id}", n.handleRetirement)
 	mux.HandleFunc("PUT /replicate/{id}", n.handleReplicate)
 	mux.HandleFunc("POST /verify/{id}", n.handleVerifyObject)
 	mux.HandleFunc("POST /pull", n.handlePull)
@@ -197,6 +199,10 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		// 容量硬闸拒绝 ≠ 内部错误：507 让调用方能区分「节点满」与「节点坏」。
 		if errors.Is(err, errCapacityExceeded) {
 			httpError(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
+		if errors.Is(err, errObjectRetired) {
+			httpError(w, http.StatusConflict, err.Error())
 			return
 		}
 		httpError(w, http.StatusInternalServerError, "write object failed")
@@ -265,6 +271,10 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	size, _, err := n.storeVerifiedObject(id, r.Body, crc, plan.Object.Size)
 	if err != nil {
 		log.Printf("replicate object %d: %v", id, err)
+		if errors.Is(err, errObjectRetired) {
+			httpError(w, http.StatusConflict, err.Error())
+			return
+		}
 		httpError(w, http.StatusUnprocessableEntity, "object does not match metadata or could not be stored")
 		return
 	}
@@ -495,6 +505,15 @@ func (n *Node) storeVerifiedObject(id uint64, r io.Reader, expectCRC *uint32, ex
 	if expectSize < -1 || expectSize == int64(^uint64(0)>>1) {
 		return 0, 0, fmt.Errorf("invalid expected object size")
 	}
+	if err := n.beginObjectWrite(id); err != nil {
+		return 0, 0, err
+	}
+	cleanupCertain := true
+	defer func() {
+		if cleanupCertain {
+			n.endObjectWrite(id)
+		}
+	}()
 	var rr *reservingReader
 	reserved := int64(0)
 	if expectSize >= 0 {
@@ -542,7 +561,11 @@ func (n *Node) storeVerifiedObject(id uint64, r io.Reader, expectCRC *uint32, ex
 		if errors.Is(removeErr, os.ErrNotExist) {
 			removeErr = nil
 		}
+		if closeErr == nil && removeErr == nil {
+			removeErr = syncObjectDirectories(tmp.Name())
+		}
 		if closeErr != nil || removeErr != nil {
+			cleanupCertain = false
 			resultErr = errors.Join(resultErr, closeErr, removeErr)
 			return // Uncertain cleanup stays charged until restart reconciliation.
 		}
@@ -582,6 +605,10 @@ func (n *Node) storeVerifiedObject(id uint64, r io.Reader, expectCRC *uint32, ex
 	}
 	lock := n.objectLock(id)
 	lock.Lock()
+	if err := n.checkObjectFence(id); err != nil {
+		lock.Unlock()
+		return 0, 0, err
+	}
 	var oldSize int64
 	if st, err := os.Stat(objPath); err == nil {
 		oldSize = st.Size()
@@ -758,6 +785,10 @@ func parseRange(h string, size int64) (start, end int64, ok bool) {
 
 // handleDelete 删除对象。与同对象 store 经分片锁串行化，保证 used 差值不错算。
 func (n *Node) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if n.nodeID.Load() != 0 {
+		httpError(w, http.StatusUpgradeRequired, "registered nodes require durable object retirement")
+		return
+	}
 	id, ok := parseObjectID(w, r)
 	if !ok {
 		return
@@ -771,7 +802,7 @@ func (n *Node) handleDelete(w http.ResponseWriter, r *http.Request) {
 			httpError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		n.used.Add(-st.Size())
+		n.settleCapacity(-st.Size(), 0)
 	}
 	lock.Unlock()
 	// 不存在视为幂等成功。
@@ -910,6 +941,9 @@ func (n *Node) InitUsedBytes() error {
 	if err := n.cleanupTmpFiles(); err != nil {
 		return err
 	}
+	if err := n.reconcileFences(); err != nil {
+		return err
+	}
 	var total int64
 	err := filepath.WalkDir(filepath.Join(n.dataDir, "objects"), func(_ string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -919,9 +953,14 @@ func (n *Node) InitUsedBytes() error {
 			return err
 		}
 		if !d.IsDir() && !strings.HasPrefix(d.Name(), ".tmp-") {
-			if info, err := d.Info(); err == nil {
-				total += info.Size()
+			info, err := d.Info()
+			if err != nil {
+				return err
 			}
+			if !info.Mode().IsRegular() || info.Size() < 0 || total > int64(^uint64(0)>>1)-info.Size() {
+				return errors.New("invalid stored object during usage reconciliation")
+			}
+			total += info.Size()
 		}
 		return nil
 	})
@@ -949,15 +988,20 @@ func (n *Node) cleanupTmpFiles() error {
 		}
 		files, err := os.ReadDir(filepath.Join(objectsDir, bucket.Name()))
 		if err != nil {
-			continue // 单桶失败不阻塞启动
+			return err
 		}
 		for _, f := range files {
 			if f.IsDir() || !strings.HasPrefix(f.Name(), ".tmp-") {
 				continue
 			}
-			if err := os.Remove(filepath.Join(objectsDir, bucket.Name(), f.Name())); err == nil {
-				removed++
+			path := filepath.Join(objectsDir, bucket.Name(), f.Name())
+			if err := os.Remove(path); err != nil {
+				return err
 			}
+			if err := syncObjectDirectories(path); err != nil {
+				return err
+			}
+			removed++
 		}
 	}
 	if removed > 0 {

@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -716,13 +717,17 @@ func TestSmallPublishLateDeleteOfRetiredObjectCannotHarmLatest(t *testing.T) {
 		t.Fatalf("每次发布必须使用全新对象: latest=%d old=%d chunk=%d", latestObj, oldObj, chunkID)
 	}
 
-	// 显式对旧物理对象发起迟到 DELETE（retired/宽限内的回收动作晚到模拟）；
-	// 节点 DELETE 幂等，master 是否已提前回收不影响本断言。
-	if code := spDeleteObject(t, nd.Base, oldObj); code != http.StatusOK {
-		t.Errorf("迟到 DELETE 旧 small 对象 = %d", code)
+	// Registered nodes cannot delete detached versions through the unfenced legacy API.
+	if code := spDeleteObject(t, nd.Base, oldObj); code != http.StatusUpgradeRequired {
+		t.Errorf("unfenced DELETE of old small object = %d", code)
 	}
-	if code := spDeleteObject(t, nd.Base, chunkID); code != http.StatusOK {
-		t.Errorf("迟到 DELETE 旧 chunk 对象 = %d", code)
+	if code := spDeleteObject(t, nd.Base, chunkID); code != http.StatusUpgradeRequired {
+		t.Errorf("unfenced DELETE of old chunk object = %d", code)
+	}
+	for objectID, expected := range map[uint64][]byte{oldObj: []byte("one"), chunkID: chunkBody} {
+		if code, got := spReadObject(t, nd.Base, objectID, true); code != http.StatusOK || !bytes.Equal(got, expected) {
+			t.Fatalf("held object %d was removed: status=%d bytes=%q", objectID, code, got)
+		}
 	}
 
 	// 最新版本完好：元数据指向最新 ObjID，字节与 CRC 无损。
@@ -867,17 +872,20 @@ func TestSmallPublishThreeNodeReplicationSurvivesPrimaryLoss(t *testing.T) {
 		t.Fatalf("lookup 缺副本信息: %+v", lu)
 	}
 	primaryID := lu.Inode.Replicas[0]
-	primaryBase := ""
+	var primary *spNodeT
 	for _, n := range nodes {
 		if n.Info.ID == primaryID {
-			primaryBase = n.Base
+			primary = n
 		}
 	}
-	if primaryBase == "" {
+	if primary == nil {
 		t.Fatalf("找不到主副本节点 %d", primaryID)
 	}
-	if code := spDeleteObject(t, primaryBase, objID); code != http.StatusOK {
-		t.Fatalf("删除主副本对象 = %d", code)
+	primaryBase := primary.Base
+	// Disk loss is a fault injection, not an authorized retirement of live content.
+	primaryPath := filepath.Join(primary.node.DataDirForTest(), "objects", fmt.Sprintf("%02x", objID%256), fmt.Sprint(objID))
+	if err := os.Remove(primaryPath); err != nil {
+		t.Fatalf("remove primary object for disk-loss simulation: %v", err)
 	}
 	if code, _ := spReadObject(t, primaryBase, objID, true); code != http.StatusNotFound {
 		t.Fatalf("主副本对象应已删除: code=%d", code)

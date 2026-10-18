@@ -233,7 +233,7 @@ func TestFindOrphans(t *testing.T) {
 	objects := []ObjectEntry{
 		{ID: 1, Size: 100},
 		{ID: 2, Size: 200},
-		{ID: 99, Size: 300}, // 孤儿
+		{ID: 99, Size: 300},  // 孤儿
 		{ID: 100, Size: 400}, // 孤儿
 	}
 	validIDs := map[uint64]bool{1: true, 2: true}
@@ -415,8 +415,8 @@ func TestChunkRepairReplaceDead(t *testing.T) {
 	}
 }
 
-// TestGCConfirmTwoRounds GC 两轮确认：第一轮 execute 不删，第二轮才删。
-func TestGCConfirmTwoRounds(t *testing.T) {
+// Inventory alone cannot authorize deletion, even after repeated observations.
+func TestGCUnknownOrphansRemainReportOnly(t *testing.T) {
 	s, store := newTestScanner(t, time.Hour)
 
 	// 源节点上放一个孤儿对象（不在任何元数据中）。
@@ -441,24 +441,27 @@ func TestGCConfirmTwoRounds(t *testing.T) {
 	if !found {
 		t.Fatal("第一轮应报告孤儿")
 	}
-	// 第二轮 execute：上轮见过 → 删除。
+	// No durable retirement record exists for this object.
 	_, err = s.RunGC(true)
 	if err != nil {
 		t.Fatalf("GC 第二轮: %v", err)
 	}
-	// 验证删除：对象清单里不再有 99999。
+	// The object must survive repeated inventory scans.
 	resp, err := http.Get(nTS.URL + "/admin/objects")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	var objects []ObjectEntry
-	json.NewDecoder(resp.Body).Decode(&objects)
+	if err := json.NewDecoder(resp.Body).Decode(&objects); err != nil {
+		t.Fatal(err)
+	}
 	for _, o := range objects {
 		if o.ID == 99999 {
-			t.Fatal("两轮确认后孤儿应被删除")
+			return
 		}
 	}
+	t.Fatal("unknown orphan was removed without a durable retirement record")
 }
 
 // TestSweepStagingExpiredTTL 超 TTL 的 staging 被回收，未超时保留。
@@ -535,8 +538,8 @@ func TestDegradedChunkWarnAfterThreshold(t *testing.T) {
 	in, _ := store.GetInode(st.ID)
 	nodes := mkNodes([]uint64{1, 2}, []uint64{1, 2})
 	now := time.Now()
-	s.trackDegradedChunk(in, in.Chunks[0], types.ChunkID(st.ID, 0), nodes, now)         // 首次：记时刻
-	s.trackDegradedChunk(in, in.Chunks[0], types.ChunkID(st.ID, 0), nodes, now.Add(time.Minute)) // 告警
+	s.trackDegradedChunk(in, in.Chunks[0], types.ChunkID(st.ID, 0), nodes, now)                    // 首次：记时刻
+	s.trackDegradedChunk(in, in.Chunks[0], types.ChunkID(st.ID, 0), nodes, now.Add(time.Minute))   // 告警
 	s.trackDegradedChunk(in, in.Chunks[0], types.ChunkID(st.ID, 0), nodes, now.Add(2*time.Minute)) // 不重复
 
 	logs := buf.String()

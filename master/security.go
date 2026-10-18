@@ -800,7 +800,8 @@ func (s *Server) secureControlTransport(base http.RoundTripper) http.RoundTrippe
 			return nil
 		}
 		req := access.TicketRequest{NodeAddr: r.URL.Host, Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, PlanID: r.Header.Get(access.PlanHeader)}
-		if r.URL.Path == "/pull" {
+		_, retirement := types.RetirementPathID(r.URL.Path)
+		if r.URL.Path == "/pull" || retirement {
 			if r.GetBody == nil {
 				return errors.New("control request body is not replayable")
 			}

@@ -323,40 +323,48 @@ func TestFailoverRead(t *testing.T) {
 	}
 }
 
-// 删除时通知节点回收对象（阶段2顺手实现）。
-func TestDeleteReclaimsObjects(t *testing.T) {
-	c, nodes := newClusterV2(t, 2)
-
-	dir := t.TempDir()
-	local := filepath.Join(dir, "del.txt")
-	os.WriteFile(local, []byte("to be reclaimed"), 0o644)
+// Namespace deletion does not prove that a published object has no readers or retention roots.
+func TestDeleteRetainsPublishedObjects(t *testing.T) {
+	cv := newClusterV3(t, 2, time.Hour)
+	c := cv.client
+	content := []byte("published content must stay held")
+	local := filepath.Join(t.TempDir(), "del.txt")
+	if err := os.WriteFile(local, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.Put(local, "/del.txt", 2); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	waitDone(t, c, "/del.txt", 2)
-
+	inode, _, err := c.Lookup("/del.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := c.Rm("/del.txt"); err != nil {
 		t.Fatalf("Rm: %v", err)
 	}
-
-	// master 的回收通知是异步的，轮询等待所有节点对象消失（满载下放宽到 20s）。
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		remaining := 0
-		for _, cn := range nodes {
-			filepath.WalkDir(filepath.Join(cn.node.DataDirForTest(), "objects"), func(p string, d os.DirEntry, err error) error {
-				if err == nil && !d.IsDir() {
-					remaining++
-				}
-				return nil
-			})
-		}
-		if remaining == 0 {
-			return // 全部回收
-		}
-		time.Sleep(100 * time.Millisecond)
+	if _, _, err := c.Lookup("/del.txt"); err == nil {
+		t.Fatal("deleted entry remained in the namespace")
 	}
-	t.Fatal("删除后对象未被回收（超时）")
+	if _, err := cv.scanner.RunGC(true); err != nil {
+		t.Fatal(err)
+	}
+	records, err := cv.store.ListRetirements()
+	if err != nil || len(records) != 2 {
+		t.Fatalf("published object retention records: %+v %v", records, err)
+	}
+	for _, record := range records {
+		if record.ObjectID != inode.ID || record.State != meta.RetirementHeld {
+			t.Fatalf("deleted published content was not held: %+v", record)
+		}
+	}
+	for _, cn := range cv.nodes {
+		path := filepath.Join(cn.node.DataDirForTest(), "objects", fmt.Sprintf("%02x", inode.ID%256), fmt.Sprint(inode.ID))
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, content) {
+			t.Fatalf("published object was reclaimed without retention proof: %q %v", got, err)
+		}
+	}
 }
 
 // 覆写场景：overwrite=true 成功覆盖；不带 overwrite 重复创建返回 409。
@@ -556,8 +564,8 @@ func TestRepairAfterNodeDeath3Nodes(t *testing.T) {
 	}
 }
 
-// TestGCOrphanReclaim 验证孤儿对象回收。
-func TestGCOrphanReclaim(t *testing.T) {
+// Inventory observations alone do not authorize deletion of unknown physical objects.
+func TestGCUnknownOrphanRemainsReportOnly(t *testing.T) {
 	cv := newClusterV3(t, 2, time.Hour)
 	c := cv.client
 
@@ -594,13 +602,13 @@ func TestGCOrphanReclaim(t *testing.T) {
 		t.Fatal("dry-run 应报告孤儿对象 99999")
 	}
 
-	// execute 应删除孤儿。
-	_, err = cv.scanner.RunGC(true)
-	if err != nil {
-		t.Fatalf("GC execute: %v", err)
+	for i := 0; i < 2; i++ {
+		if _, err := cv.scanner.RunGC(true); err != nil {
+			t.Fatalf("GC execute: %v", err)
+		}
 	}
-	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
-		t.Fatal("孤儿对象应已删除")
+	if got, err := os.ReadFile(orphanPath); err != nil || string(got) != "orphan" {
+		t.Fatalf("unknown orphan was deleted without retirement authority: %q %v", got, err)
 	}
 
 	// 正常文件不受影响。

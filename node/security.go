@@ -44,6 +44,7 @@ import (
 	"atoll/pkg/access"
 	"atoll/pkg/auth"
 	"atoll/pkg/edgeidentity"
+	"atoll/pkg/types"
 )
 
 // 设备挑战签名绑定约定（与 master security_devices 侧一致）：
@@ -808,13 +809,14 @@ func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 			planID = r.URL.Query().Get("plan_id") // query 只允许 plan_id 参与绑定
 		}
 		bodyHash := ""
-		if r.Method == http.MethodPost && r.URL.Path == "/pull" {
+		_, retirement := types.RetirementPathID(r.URL.Path)
+		if r.Method == http.MethodPost && (r.URL.Path == "/pull" || retirement) {
 			data, err := readControlBody(r.Body)
 			if err != nil {
 				if errors.Is(err, errControlBodyTooLarge) {
-					httpError(w, http.StatusRequestEntityTooLarge, "pull control body too large")
+					httpError(w, http.StatusRequestEntityTooLarge, "control body too large")
 				} else {
-					httpError(w, http.StatusBadRequest, "read pull body failed")
+					httpError(w, http.StatusBadRequest, "read control body failed")
 				}
 				return
 			}

@@ -44,6 +44,9 @@ func (n *Node) verifyStoredReplay(id uint64, body io.Reader, size int64, checksu
 	lock := n.objectLock(id)
 	lock.Lock()
 	defer lock.Unlock()
+	if err := n.checkObjectFence(id); err != nil {
+		return false, err
+	}
 	current, err := os.Lstat(path)
 	if err != nil || !current.Mode().IsRegular() || !os.SameFile(opened, current) || current.Size() != size {
 		return false, fmt.Errorf("stored replay object changed during verification")

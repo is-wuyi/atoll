@@ -202,10 +202,13 @@ func validateDeviceTicketTx(tx *bolt.Tx, t accessTicketRecord, now time.Time) (t
 }
 
 func validateControlTicket(req access.TicketRequest) bool {
+	if _, ok := types.RetirementPathID(req.Path); ok {
+		return req.Method == http.MethodPost && req.Query == "" && types.ValidRetirementToken(req.PlanID) && len(req.BodyHash) == 64
+	}
 	if id, ok := ticketResourceID(req.Path); ok && id != 0 {
 		switch {
 		case strings.HasPrefix(req.Path, "/objects/"):
-			return req.Method == http.MethodGet || req.Method == http.MethodPut || req.Method == http.MethodDelete
+			return req.Method == http.MethodGet || req.Method == http.MethodPut
 		case strings.HasPrefix(req.Path, "/verify/"):
 			return req.Method == http.MethodPost
 		}
@@ -270,6 +273,9 @@ func (s *Store) issueTicket(record accessTicketRecord, now time.Time) (access.Ti
 			if !validateControlTicket(record.Request) {
 				err = ErrAccessTicket
 			}
+			if id, ok := types.RetirementPathID(record.Request.Path); ok && !retirementRequestAllowedTx(w.tx, id, record.AudienceNodeID, record.Request.PlanID, record.Request.BodyHash) {
+				err = ErrAccessTicket
+			}
 		default:
 			err = ErrAccessTicket
 		}
@@ -317,6 +323,9 @@ func (s *Store) CheckAccessTicket(nodeSession string, req access.CheckRequest, n
 			current, err = validateDeviceTicketTx(tx, ticket, now)
 		case "control":
 			if !validateControlTicket(ticket.Request) {
+				err = ErrAccessTicket
+			}
+			if id, ok := types.RetirementPathID(ticket.Request.Path); ok && !retirementRequestAllowedTx(tx, id, node.NodeID, ticket.Request.PlanID, ticket.Request.BodyHash) {
 				err = ErrAccessTicket
 			}
 		default:

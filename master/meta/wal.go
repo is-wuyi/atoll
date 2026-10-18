@@ -124,6 +124,14 @@ func (w *txw) putInode(in *types.Inode) error {
 			return err
 		}
 	}
+	before, err := getInodeTx(w.tx, in.ID)
+	if err == nil {
+		if err := w.retainDroppedContent(before, in); err != nil {
+			return err
+		}
+	} else if err != ErrNotExist {
+		return err
+	}
 	if err := w.updateObjectIndex(in); err != nil {
 		return err
 	}
@@ -136,9 +144,17 @@ func (w *txw) putInode(in *types.Inode) error {
 
 func (w *txw) delInode(id uint64) error {
 	in, err := getInodeTx(w.tx, id)
-	if err == nil && in.ObjID != 0 {
-		if err := w.retireObject(in.ObjID); err != nil {
+	if err != nil && err != ErrNotExist {
+		return err
+	}
+	if err == nil {
+		if err := w.retainDroppedContent(in, nil); err != nil {
 			return err
+		}
+		if in.ObjID != 0 {
+			if err := w.retireObject(in.ObjID); err != nil {
+				return err
+			}
 		}
 	}
 	if w.tx.Bucket(bucketSecurity).Get(securityDataKey("upload", fmtUint(id))) != nil {
@@ -516,6 +532,9 @@ func (s *Store) ApplyFrames(frames []Frame) error {
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		meta := tx.Bucket(bucketMeta)
+		if meta == nil || tx.Bucket(bucketWAL) == nil {
+			return fmt.Errorf("wal: missing replay control bucket")
+		}
 		cur := uint64(0)
 		if v := meta.Get(keyWALSeq); v != nil {
 			cur = beU64(v)
@@ -532,11 +551,15 @@ func (s *Store) ApplyFrames(frames []Frame) error {
 				if err != nil {
 					return err
 				}
+				bucket := tx.Bucket(bkt)
+				if bucket == nil {
+					return fmt.Errorf("wal: missing replay bucket %q", bkt)
+				}
 				if m.Del {
-					if err := tx.Bucket(bkt).Delete(m.Key); err != nil {
+					if err := bucket.Delete(m.Key); err != nil {
 						return err
 					}
-				} else if err := tx.Bucket(bkt).Put(m.Key, m.Value); err != nil {
+				} else if err := bucket.Put(m.Key, m.Value); err != nil {
 					return err
 				}
 			}

@@ -29,7 +29,7 @@ func TestOpResultStoreAndSweep(t *testing.T) {
 		t.Fatal("未知 op_id 不应命中")
 	}
 
-	// TTL 清理：老记录删除，新记录保留。
+	// Completed write identities remain protected after the old retry window.
 	if err := s.PutOpResultAt("op-old", "commit", in, time.Now().Add(-48*time.Hour)); err != nil {
 		t.Fatalf("PutOpResultAt: %v", err)
 	}
@@ -37,13 +37,18 @@ func TestOpResultStoreAndSweep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SweepOpsOlderThan: %v", err)
 	}
-	if removed != 1 {
-		t.Fatalf("应清理 1 条过期 op, got %d", removed)
+	if removed != 0 {
+		t.Fatalf("completed write tombstones were pruned: %d", removed)
 	}
-	if _, ok, _ := s.GetOpResult("op-old"); ok {
-		t.Fatal("过期 op 应已删除")
+	if _, ok, _ := s.GetOpResult("op-old"); !ok {
+		t.Fatal("completed commit tombstone must survive expiry")
 	}
 	if _, ok, _ := s.GetOpResult("op-a"); !ok {
 		t.Fatal("未过期 op 应保留")
+	}
+	if err := s.write(func(w *txw) error {
+		return w.putOpResult("op-old", "small", "different", in, time.Now())
+	}); err != ErrOpConflict {
+		t.Fatalf("expired commit identity was reused: %v", err)
 	}
 }

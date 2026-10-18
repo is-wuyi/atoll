@@ -420,6 +420,9 @@ func (s *Server) handleAbortWrite(w http.ResponseWriter, r *http.Request) {
 		writePlanningMetaError(w, err)
 		return
 	}
+	if s.scanner != nil {
+		s.scanner.wakeRetirements()
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "aborted"})
 }
 

@@ -17,9 +17,7 @@ import (
 // 解法：客户端为每个写操作生成唯一 op_id，服务端把"操作→结果"记录下来；
 // 同 op_id 的重试直接回放原结果，不重复执行。
 //
-// 记录随 bbolt 事务进 WAL/快照（与普通元数据同路径备份），master 崩溃恢复后仍可
-// 回放。记录由 staging 清扫循环按 TTL 过期清理——只为吸收"分钟级"的重试窗口，
-// 不是永久去重表。
+// Results remain durable tombstones: expiry must not turn a completed operation into a new write.
 
 // OpRecord 是一次已完成的写操作及其结果。
 type OpRecord struct {
@@ -123,6 +121,9 @@ func (s *Store) SweepOpsOlderThan(d time.Duration) (int, error) {
 			var rec OpRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
 				return nil // 损坏记录当作过期清理
+			}
+			if rec.Kind == "small" || rec.Kind == "commit" {
+				return nil
 			}
 			if rec.CreatedAt.Before(cutoff) {
 				stale = append(stale, victim{key: append([]byte(nil), k...)})

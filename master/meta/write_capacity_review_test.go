@@ -111,14 +111,14 @@ func TestCapacityHonestRestartRewindOversellsFree(t *testing.T) {
 	}
 	heartbeatUsage(t, s, n, types.NodeUsage{Epoch: "boot-a", Sequence: 2, UsedBytes: 950})
 	c = capacityFor(t, s, n)
-	if c.Accounted != 950 || c.Reserved != 0 || c.Free != 74 {
-		t.Fatalf("after 150B write: %+v, want accounted=950 free=74", c)
+	if c.Accounted != 950 || c.Reserved != 150 || c.Free > 74 {
+		t.Fatalf("unproven small-file usage must stay reserved: %+v", c)
 	}
 
 	heartbeatUsage(t, s, n, types.NodeUsage{Epoch: "boot-b", Sequence: 1, UsedBytes: 950})
 	c = capacityFor(t, s, n)
-	if c.Accounted != 950 || c.Free != 74 {
-		t.Fatalf("after restart epoch: %+v, want free=74", c)
+	if c.Accounted != 950 || c.Free > 74 {
+		t.Fatalf("after restart epoch: %+v, free must not exceed 74", c)
 	}
 
 	heartbeatUsage(t, s, n, types.NodeUsage{Epoch: "boot-a", Sequence: 1, UsedBytes: 800})
@@ -135,9 +135,9 @@ func TestCapacityHonestRestartRewindOversellsFree(t *testing.T) {
 		oversold = true
 	}
 
-	if c.Free != 74 {
-		t.Errorf("迟到心跳回退了占用：Accounted=%d Reserved=%d Free=%d，期望 Free=74（1024-950），超计 %d",
-			c.Accounted, c.Reserved, c.Free, c.Free-74)
+	if c.Free > 74 {
+		t.Errorf("迟到心跳回退了占用：Accounted=%d Reserved=%d Free=%d，实际空间只有74字节",
+			c.Accounted, c.Reserved, c.Free)
 	}
 	if oversold {
 		t.Errorf("节点物理仅剩 74B 可用，150B 新写被放行；期望 ErrWriteBudget")

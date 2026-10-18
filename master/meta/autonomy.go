@@ -145,7 +145,7 @@ func checkedBytesAdd(a, b int64) (int64, error) {
 }
 
 func capacitiesTx(tx *bolt.Tx) ([]NodeCapacity, error) {
-	writeReservations, err := writeReservationsTx(tx)
+	writeReservations, err := capacityReservationsTx(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +153,13 @@ func capacitiesTx(tx *bolt.Tx) ([]NodeCapacity, error) {
 	seen := map[[2]uint64]bool{}
 	addObject := func(id uint64, size int64, replicas []uint64) error {
 		for _, nodeID := range replicas {
+			retired, err := retirementConfirmedTx(tx, id, nodeID)
+			if err != nil {
+				return err
+			}
+			if retired {
+				continue
+			}
 			key := [2]uint64{id, nodeID}
 			if _, pending := writeReservations[key]; pending {
 				continue
@@ -199,6 +206,18 @@ func capacitiesTx(tx *bolt.Tx) ([]NodeCapacity, error) {
 	}); err != nil {
 		return nil, err
 	}
+	if err := tx.Bucket(bucketRetired).ForEach(func(key, raw []byte) error {
+		rec, err := decodeRetirementRecord(key, raw)
+		if err != nil {
+			return err
+		}
+		if rec.State == RetirementConfirmed {
+			return nil
+		}
+		return addObject(rec.ObjectID, rec.Expected.Size, []uint64{rec.NodeID})
+	}); err != nil {
+		return nil, err
+	}
 	reserved := map[uint64]int64{}
 	for key, size := range writeReservations {
 		value, err := checkedBytesAdd(reserved[key[1]], size)
@@ -206,27 +225,6 @@ func capacitiesTx(tx *bolt.Tx) ([]NodeCapacity, error) {
 			return nil, err
 		}
 		reserved[key[1]] = value
-	}
-	if err := walkAutonomy(tx, "plan", func(raw []byte) error {
-		var plan ProtectionPlan
-		if err := json.Unmarshal(raw, &plan); err != nil {
-			return err
-		}
-		for _, target := range plan.Targets {
-			// A cancelled in-flight transfer may still leave bytes on disk. Its
-			// reservation stays charged until a later reconciliation can prove release.
-			if target.Done || (plan.State != ProtectionPending && target.Attempts == 0) {
-				continue
-			}
-			value, err := checkedBytesAdd(reserved[target.NodeID], plan.Expected.Size)
-			if err != nil {
-				return err
-			}
-			reserved[target.NodeID] = value
-		}
-		return nil
-	}); err != nil {
-		return nil, err
 	}
 	var out []NodeCapacity
 	err = tx.Bucket(bucketNodes).ForEach(func(_, raw []byte) error {
@@ -477,7 +475,7 @@ func (s *Store) ProtectionDescriptor(planID string, objectID, nodeID uint64) (ty
 	return result, err
 }
 
-func (s *Store) markProtectionDone(expected types.ObjectIntegrity, nodeID uint64) (bool, error) {
+func (s *Store) markProtectionDone(expected types.ObjectIntegrity, nodeID uint64, usage *types.NodeUsage) (bool, error) {
 	marked := false
 	err := s.write(func(w *txw) error {
 		plan, err := planTx(w.tx, expected.PlanID)
@@ -518,6 +516,9 @@ func (s *Store) markProtectionDone(expected types.ObjectIntegrity, nodeID uint64
 		}
 		if plan.Targets[idx].Done {
 			marked = types.ContainsUint64(current.Done, nodeID) && !types.ContainsUint64(current.Suspect, nodeID)
+			if marked {
+				return recordProtectionUsage(w, current, nodeID, usage)
+			}
 			return nil
 		}
 		if !exactProtectionIdentity(current, plan.Expected) || !exactProtectionIdentity(current, expected) ||
@@ -530,6 +531,9 @@ func (s *Store) markProtectionDone(expected types.ObjectIntegrity, nodeID uint64
 		}
 		if in.Staging {
 			return nil
+		}
+		if err := recordProtectionUsage(w, current, nodeID, usage); err != nil {
+			return err
 		}
 		if current.Chunked {
 			found := false
