@@ -31,6 +31,9 @@ var (
 	bucketOps      = []byte("ops")
 	bucketObjects  = []byte("objects")
 	bucketRetired  = []byte("retired_objects")
+	bucketAutonomy = []byte("autonomy")
+	bucketSecurity = []byte("security")
+	bucketWrites   = []byte("write_plans")
 
 	keyNextInode  = []byte("next_inode")
 	keyNextNode   = []byte("next_node")
@@ -71,7 +74,9 @@ type Store struct {
 	// commitMu 把「提交 + postCommit 钩子」串成一个原子段，保证钩子按 seq 顺序执行。
 	// 否则同步旋钮开启时 seq6 可能先于 seq5 被 ship+ack，master 掉盘后集群 WAL 现空洞、
 	// 整段重放被拒。钩子为 nil（默认）时只是多一层 bbolt 本就有的写串行化，无额外代价。
-	commitMu sync.Mutex
+	commitMu             sync.Mutex
+	securitySweepMu      sync.Mutex
+	securitySweepCursors map[string][]byte
 }
 
 // Open 打开（或创建）元数据库并完成初始化：建 bucket、写根目录、初始化计数器。
@@ -95,7 +100,7 @@ func (s *Store) DBPath() string { return s.db.Path() }
 
 func (s *Store) init() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketInodes, bucketChildren, bucketNodes, bucketMeta, bucketWAL, bucketOps, bucketObjects, bucketRetired} {
+		for _, b := range [][]byte{bucketInodes, bucketChildren, bucketNodes, bucketMeta, bucketWAL, bucketOps, bucketObjects, bucketRetired, bucketAutonomy, bucketSecurity, bucketWrites} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -334,6 +339,9 @@ func (s *Store) DeleteFile(id uint64) error {
 		if in.Type != types.TypeFile && in.Type != types.TypeSymlink {
 			return ErrNotFile
 		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
+			return err
+		}
 		if err := w.delInode(id); err != nil {
 			return err
 		}
@@ -377,6 +385,9 @@ func (s *Store) Rename(id uint64, newName string) error {
 		if in.ID == RootID {
 			return errors.New("cannot rename root")
 		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
+			return err
+		}
 		if hasChild(w.tx, in.ParentID, newName) {
 			return ErrExist
 		}
@@ -400,13 +411,27 @@ func (s *Store) UpdateFileSize(id uint64, size int64, checksum uint32) error {
 		if err != nil {
 			return err
 		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
+			return err
+		}
 		if in.Type != types.TypeFile {
 			return ErrNotFile
+		}
+		if size != in.Size || checksum != in.Checksum {
+			if in.Size != 0 || in.Checksum != 0 || len(in.DoneReplicas) > 0 {
+				if in.Generation == ^uint64(0) {
+					return ErrObjectChanged
+				}
+				in.Generation++
+			}
+			in.DoneReplicas = nil
+			in.SuspectReplicas = nil
+			in.IntegrityEpoch = 0
 		}
 		in.Size = size
 		in.Checksum = checksum
 		in.Mtime = time.Now()
-		if len(in.Replicas) > 0 {
+		if len(in.Replicas) > 0 && !types.ContainsUint64(in.SuspectReplicas, in.Replicas[0]) {
 			in.DoneReplicas = appendUnique(in.DoneReplicas, in.Replicas[0])
 		}
 		return w.putInode(&in)
@@ -424,7 +449,7 @@ func (s *Store) AddReplicaDone(id, nodeID uint64) error {
 			return ErrNotFile
 		}
 		// 成员资格校验：只有副本集内的节点上报才计入 DoneReplicas（同 MarkChunkDone）。
-		if !types.ContainsUint64(in.Replicas, nodeID) {
+		if !types.ContainsUint64(in.Replicas, nodeID) || types.ContainsUint64(in.SuspectReplicas, nodeID) {
 			return nil
 		}
 		in.DoneReplicas = appendUnique(in.DoneReplicas, nodeID)
@@ -447,6 +472,9 @@ func (s *Store) UpdateFile(id uint64, size int64, replicas []uint64) error {
 	return s.write(func(w *txw) error {
 		in, err := getInodeTx(w.tx, id)
 		if err != nil {
+			return err
+		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
 			return err
 		}
 		if in.Type != types.TypeFile {
@@ -577,6 +605,9 @@ func (s *Store) CommitLegacyStagingFile(inodeID uint64, size int64, checksum uin
 		if err != nil {
 			return err
 		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
+			return err
+		}
 		if !in.Staging || in.Chunked {
 			return ErrNotStaging
 		}
@@ -605,7 +636,7 @@ func (s *Store) CommitLegacyStagingFile(inodeID uint64, size int64, checksum uin
 		in.Checksum = checksum
 		in.Staging = false
 		in.Mtime = time.Now()
-		if len(in.Replicas) > 0 {
+		if len(in.Replicas) > 0 && !types.ContainsUint64(in.SuspectReplicas, in.Replicas[0]) {
 			in.DoneReplicas = appendUnique(in.DoneReplicas, in.Replicas[0])
 		}
 		if err := w.putInode(&in); err != nil {
@@ -637,11 +668,14 @@ func (s *Store) SetInodeMtimeForTest(id uint64, mt time.Time) error {
 
 // AssignChunk 为 staging 文件的第 index 块分配副本节点。
 // 幂等：该块已分配则原样返回既有分配（重试安全）。
-func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []uint64, checksum uint32) (types.ChunkInfo, error) {
+func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []uint64, checksum uint32, checksumKnown ...bool) (types.ChunkInfo, error) {
 	var chunk types.ChunkInfo
 	err := s.write(func(w *txw) error {
 		in, err := getInodeTx(w.tx, inodeID)
 		if err != nil {
+			return err
+		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
 			return err
 		}
 		if !in.Staging {
@@ -655,16 +689,21 @@ func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []ui
 		}
 		for _, c := range in.Chunks {
 			if c.Index == index {
-				chunk = c // 已分配，幂等返回
+				known := checksum != 0 || (len(checksumKnown) > 0 && checksumKnown[0])
+				if c.Size != size || ((c.ChecksumKnown || c.Checksum != 0) && known && c.Checksum != checksum) {
+					return ErrObjectChanged
+				}
+				chunk = c
 				return nil
 			}
 		}
 		in.Chunks = append(in.Chunks, types.ChunkInfo{
-			ID:       types.ChunkID(inodeID, index), // v2：块表自描述对象 ID
-			Index:    index,
-			Size:     size,
-			Replicas: replicas,
-			Checksum: checksum,
+			ID:            types.ChunkID(inodeID, index), // v2：块表自描述对象 ID
+			Index:         index,
+			Size:          size,
+			Replicas:      replicas,
+			Checksum:      checksum,
+			ChecksumKnown: checksum != 0 || (len(checksumKnown) > 0 && checksumKnown[0]),
 		})
 		// 并发 Assign 可能乱序插入，保持块表按 Index 升序。
 		sort.Slice(in.Chunks, func(i, j int) bool { return in.Chunks[i].Index < in.Chunks[j].Index })
@@ -689,11 +728,14 @@ func (s *Store) AssignChunk(inodeID uint64, index int, size int64, replicas []ui
 
 // ReassignChunk 废弃某块现有分配并重新分配（主副本持续失败时换节点）。
 // 返回新分配。块 Done 集合重置。
-func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64, checksum uint32) (types.ChunkInfo, error) {
+func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64, checksum uint32, checksumKnown ...bool) (types.ChunkInfo, error) {
 	var chunk types.ChunkInfo
 	err := s.write(func(w *txw) error {
 		in, err := getInodeTx(w.tx, inodeID)
 		if err != nil {
+			return err
+		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
 			return err
 		}
 		if !in.Staging {
@@ -701,13 +743,27 @@ func (s *Store) ReassignChunk(inodeID uint64, index int, replicas []uint64, chec
 		}
 		for i := range in.Chunks {
 			if in.Chunks[i].Index == index {
+				if err := bumpIntegrityEpoch(&in.Chunks[i].IntegrityEpoch); err != nil {
+					return err
+				}
 				in.Chunks[i].Replicas = replicas
 				in.Chunks[i].Done = nil
+				var suspect []uint64
+				for _, id := range in.Chunks[i].Suspect {
+					if types.ContainsUint64(replicas, id) {
+						suspect = append(suspect, id)
+					}
+				}
+				in.Chunks[i].Suspect = suspect
 				if in.Chunks[i].ID == 0 {
 					in.Chunks[i].ID = types.ChunkID(inodeID, index) // v1 数据补齐自描述 ID
 				}
-				if checksum != 0 {
+				if checksum != 0 || (len(checksumKnown) > 0 && checksumKnown[0]) {
+					if (in.Chunks[i].ChecksumKnown || in.Chunks[i].Checksum != 0) && in.Chunks[i].Checksum != checksum {
+						return ErrObjectChanged
+					}
 					in.Chunks[i].Checksum = checksum
+					in.Chunks[i].ChecksumKnown = true
 				}
 				chunk = in.Chunks[i]
 				in.Mtime = time.Now() // 换节点重试也是活跃上传，刷新 TTL
@@ -734,6 +790,9 @@ func (s *Store) MarkChunkDone(chunkID, nodeID uint64) error {
 		if err != nil {
 			return err
 		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
+			return err
+		}
 		if !in.Chunked {
 			return ErrChunkNotExist
 		}
@@ -742,7 +801,8 @@ func (s *Store) MarkChunkDone(chunkID, nodeID uint64) error {
 				// 成员资格校验：只有该块副本集内的节点上报才计入 Done。
 				// reassign 后旧节点、或伪造上报的节点不应把自己刷成 Done（否则
 				// min-copies 会被虚高副本满足）。非成员静默忽略（保持上报幂等）。
-				if !types.ContainsUint64(in.Chunks[i].Replicas, nodeID) {
+				if types.ChunkObjID(in.Chunks[i], in.ID) != chunkID ||
+					!types.ContainsUint64(in.Chunks[i].Replicas, nodeID) || types.ContainsUint64(in.Chunks[i].Suspect, nodeID) {
 					return nil
 				}
 				in.Chunks[i].Done = appendUnique(in.Chunks[i].Done, nodeID)
@@ -762,6 +822,9 @@ func (s *Store) MarkChunkDoneAt(inodeID uint64, index int, nodeID uint64) error 
 		if err != nil {
 			return err
 		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
+			return err
+		}
 		if !in.Chunked {
 			return ErrChunkNotExist
 		}
@@ -769,8 +832,8 @@ func (s *Store) MarkChunkDoneAt(inodeID uint64, index int, nodeID uint64) error 
 			if in.Chunks[i].Index != index {
 				continue
 			}
-			if !types.ContainsUint64(in.Chunks[i].Replicas, nodeID) {
-				return nil // 成员资格校验同 MarkChunkDone
+			if !types.ContainsUint64(in.Chunks[i].Replicas, nodeID) || types.ContainsUint64(in.Chunks[i].Suspect, nodeID) {
+				return nil
 			}
 			in.Chunks[i].Done = appendUnique(in.Chunks[i].Done, nodeID)
 			return w.putInode(&in)
@@ -846,6 +909,9 @@ func (s *Store) ReplaceChunkReplica(inodeID uint64, index int, oldNodeID, newNod
 		if err != nil {
 			return err
 		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
+			return err
+		}
 		if !in.Chunked {
 			return ErrChunkNotExist
 		}
@@ -891,7 +957,7 @@ func (s *Store) ReplaceChunkReplica(inodeID uint64, index int, oldNodeID, newNod
 //   - 同名是目录：拒绝；是符号链接等其他条目：保留旧替换语义（删旧、staging 占名）。
 //
 // 事务前读者看到旧版本，事务后看到新版本——不存在中间态。
-func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (types.Inode, types.Inode, bool, error) {
+func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64, bindings ...SecureCommitBinding) (types.Inode, types.Inode, bool, error) {
 	if err := validateName(name); err != nil {
 		return types.Inode{}, types.Inode{}, false, err
 	}
@@ -902,8 +968,14 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 		if err != nil {
 			return err
 		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
+			return err
+		}
 		if !in.Staging || !in.Chunked {
 			return ErrNotStaging
+		}
+		if err := validateSecureUploadPublish(w, in, name); err != nil {
+			return err
 		}
 		if len(in.Chunks) == 0 {
 			return fmt.Errorf("%w: no chunks assigned", ErrCommitFailed)
@@ -916,7 +988,7 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 			if c.Index != i {
 				return fmt.Errorf("%w: chunk index gap at position %d (got index %d)", ErrCommitFailed, i, c.Index)
 			}
-			if len(c.Replicas) == 0 || !types.ContainsUint64(c.Done, c.Replicas[0]) {
+			if len(c.Replicas) == 0 || !types.ContainsUint64(c.Done, c.Replicas[0]) || types.ContainsUint64(c.Suspect, c.Replicas[0]) {
 				return fmt.Errorf("%w: chunk %d primary not done", ErrCommitFailed, c.Index)
 			}
 			sum += c.Size
@@ -950,6 +1022,8 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 				adopted.Checksum = 0 // chunked 内容校验和在每块的 ChunkInfo 里
 				adopted.Replicas = nil
 				adopted.DoneReplicas = nil
+				adopted.SuspectReplicas = nil
+				adopted.IntegrityEpoch = 0
 				adopted.Mtime = time.Now()
 				adopted.Generation++
 				if err := w.putInode(&adopted); err != nil {
@@ -960,6 +1034,9 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 				}
 				out = adopted
 				hadOld = true
+				if len(bindings) > 0 {
+					return w.putOpResult(bindings[0].OpID, "commit", bindings[0].Fingerprint, out, time.Now())
+				}
 				return nil
 			default:
 				// 符号链接等非文件条目：删除旧条目，staging 以新身份占名。
@@ -982,6 +1059,9 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64) (type
 			return err
 		}
 		out = in
+		if len(bindings) > 0 {
+			return w.putOpResult(bindings[0].OpID, "commit", bindings[0].Fingerprint, out, time.Now())
+		}
 		return nil
 	})
 	if err != nil {
@@ -998,6 +1078,9 @@ func (s *Store) AbortStaging(inodeID uint64) error {
 			if errors.Is(err, ErrNotExist) {
 				return nil
 			}
+			return err
+		}
+		if err := rejectPlannedStagingTx(w.tx, in); err != nil {
 			return err
 		}
 		if !in.Staging {
@@ -1092,7 +1175,27 @@ func (s *Store) RegisterNode(addr string, totalBytes int64) (types.NodeInfo, err
 
 // Heartbeat 更新节点心跳与用量。节点不存在时返回 ErrNotExist。
 func (s *Store) Heartbeat(nodeID uint64, usedBytes int64) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.HeartbeatWithUsage(nodeID, usedBytes, nil)
+}
+
+func (s *Store) HeartbeatWithUsage(nodeID uint64, usedBytes int64, usage *types.NodeUsage) error {
+	if usage != nil && (!validNodeUsage(*usage) || usage.UsedBytes != usedBytes) {
+		return ErrWritePlanConflict
+	}
+	return s.write(func(w *txw) error {
+		tx := w.tx
+		secure, err := securityEnabledTx(tx)
+		if err != nil {
+			return err
+		}
+		if secure {
+			if usedBytes < 0 {
+				return ErrDeviceAuth
+			}
+			if _, err := deviceByNodeTx(tx, nodeID); err != nil {
+				return ErrDeviceAuth
+			}
+		}
 		b := tx.Bucket(bucketNodes)
 		raw := b.Get(u64be(nodeID))
 		if raw == nil {
@@ -1102,11 +1205,26 @@ func (s *Store) Heartbeat(nodeID uint64, usedBytes int64) error {
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return err
 		}
-		n.UsedBytes = usedBytes
+		oldUsage, oldFloor := n.Usage, n.UsageFloorBytes
+		if usage != nil {
+			if err := applyNodeUsage(&n, *usage); err != nil {
+				return err
+			}
+		} else {
+			if n.Usage != nil {
+				n.UsageFloorBytes = max(n.UsageFloorBytes, max(n.UsedBytes, usedBytes))
+			}
+			n.UsedBytes = usedBytes
+			n.Usage = nil
+		}
 		n.LastHeartbeat = time.Now()
 		raw2, err := json.Marshal(n)
 		if err != nil {
 			return err
+		}
+		epochChanged := oldUsage == nil && n.Usage != nil || oldUsage != nil && n.Usage == nil || oldUsage != nil && n.Usage != nil && oldUsage.Epoch != n.Usage.Epoch
+		if n.UsageFloorBytes != oldFloor || epochChanged {
+			return w.putNode(raw2, nodeID)
 		}
 		return b.Put(u64be(nodeID), raw2)
 	})
@@ -1138,10 +1256,19 @@ func (s *Store) ListAliveNodes(maxAge time.Duration) ([]types.NodeInfo, error) {
 	var out []types.NodeInfo
 	cutoff := time.Now().Add(-maxAge)
 	err := s.db.View(func(tx *bolt.Tx) error {
+		secure, err := securityEnabledTx(tx)
+		if err != nil {
+			return err
+		}
 		return tx.Bucket(bucketNodes).ForEach(func(_, v []byte) error {
 			var n types.NodeInfo
 			if err := json.Unmarshal(v, &n); err != nil {
 				return err
+			}
+			if secure {
+				if _, err := deviceByNodeTx(tx, n.ID); err != nil {
+					return nil
+				}
 			}
 			if n.LastHeartbeat.After(cutoff) {
 				out = append(out, n)

@@ -688,10 +688,8 @@ func TestSmallPublishLateDeleteOfRetiredObjectCannotHarmLatest(t *testing.T) {
 	if code := spPutObject(t, nd.Base, chunkID, chunkBody); code != http.StatusCreated {
 		t.Fatalf("PUT chunk = %d", code)
 	}
-	if st, _ := spPostJSON(t, base+"/files/replicated", map[string]uint64{
-		"inode_id": chunkID, "node_id": nd.Info.ID,
-	}, false); st != http.StatusOK {
-		t.Fatalf("POST /files/replicated = %d", st)
+	if st, raw := spPostJSON(t, fmt.Sprintf("%s/verify/%d", nd.Base, chunkID), nil, false); st != http.StatusOK {
+		t.Fatalf("POST /verify = %d: %s", st, raw)
 	}
 	if st, raw := spPostJSON(t, base+"/files/commit", map[string]any{
 		"inode_id": created.Inode.ID, "name": "file",

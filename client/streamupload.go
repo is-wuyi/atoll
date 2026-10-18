@@ -13,6 +13,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -25,12 +26,13 @@ import (
 
 // StreamUploader 一次流式分块上传的会话。
 type StreamUploader struct {
-	c        *Client
-	staging  uint64
-	name     string
-	replicas int
+	planned   *plannedStream
+	c         *Client
+	staging   uint64
+	name      string
+	replicas  int
 	minCopies int
-	opID     string // v2-3a：commit 幂等凭据（响应丢失重试回放原结果）
+	opID      string // v2-3a：commit 幂等凭据（响应丢失重试回放原结果）
 
 	mu       sync.Mutex
 	nextIdx  int   // 下一个待分配的块号
@@ -38,13 +40,24 @@ type StreamUploader struct {
 	err      error // 首个上传错误（置位后会话作废）
 	closed   bool
 
-	sem chan struct{}   // 并发 ≤2
-	wg  sync.WaitGroup  // 等待所有在途块
+	sem chan struct{}  // 并发 ≤2
+	wg  sync.WaitGroup // 等待所有在途块
 }
 
 // BeginStreamUpload 创建 staging 并返回流式上传会话。remotePath 的父目录必须存在。
 // name 从 remotePath 提取，commit 时使用。
 func (c *Client) BeginStreamUpload(remotePath string, replicas int) (*StreamUploader, error) {
+	planned, err := c.WritePlanning(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if planned {
+		u, err := c.beginPlannedWrite(context.Background(), remotePath, -1, true, newOpID())
+		if err != nil {
+			return nil, plannedError(err)
+		}
+		return &StreamUploader{c: c, staging: u.ID, planned: newPlannedStream(c, u, context.Background())}, nil
+	}
 	name := remotePath[strings.LastIndexByte(remotePath, '/')+1:]
 	if name == "" || name == "." || name == ".." {
 		return nil, fmt.Errorf("invalid remote path: %s", remotePath)
@@ -76,6 +89,9 @@ func (c *Client) BeginStreamUpload(remotePath string, replicas int) (*StreamUplo
 // Push 把"恰好一个完整块"的数据投入上传。调用方保证 data 为 64MB 整块
 // （最后一块除外，最后一块走 Finish）。会话已出错时返回该错误、丢弃数据。
 func (u *StreamUploader) Push(data []byte) error {
+	if u.planned != nil {
+		return u.planned.push(data)
+	}
 	u.mu.Lock()
 	if u.err != nil {
 		defer u.mu.Unlock()
@@ -109,6 +125,10 @@ func (u *StreamUploader) Push(data []byte) error {
 // minCopies 档位 409 由 master 侧细粒度等待（7e29046），这里 30s 兜底轮询。
 // 成功后会话不可再用。失败会 abort staging 并返回错误。
 func (u *StreamUploader) Finish(tail []byte, totalSize int64) error {
+	if u.planned != nil {
+		_, err := u.planned.finish(tail, totalSize)
+		return err
+	}
 	u.mu.Lock()
 	u.closed = true
 	if u.err != nil {
@@ -179,6 +199,9 @@ func (u *StreamUploader) StagingID() uint64 { return u.staging }
 
 // Progress 返回已上传字节数（供 FUSE 层报告文件大小做进度条）。
 func (u *StreamUploader) Progress() int64 {
+	if u.planned != nil {
+		return u.planned.progress()
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.uploaded
@@ -186,6 +209,9 @@ func (u *StreamUploader) Progress() int64 {
 
 // Err 返回会话首个错误（无错为 nil）。
 func (u *StreamUploader) Err() error {
+	if u.planned != nil {
+		return u.planned.failure()
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.err
@@ -201,6 +227,9 @@ var _ io.Closer = (*StreamUploader)(nil)
 
 // Close 满足 io.Closer：未 Finish 就关闭视为放弃（abort staging）。
 func (u *StreamUploader) Close() error {
+	if u.planned != nil {
+		return u.planned.close()
+	}
 	u.mu.Lock()
 	alreadyClosed := u.closed
 	u.closed = true

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-06T12:00:00Z",
+  "trace_id": "example-new-object",
+  "nodes": [
+    { "id": "edge-a", "failure_domains": { "zone": "site-1", "rack": "r1" }, "hard_capacity_bytes": 2147483648, "reserved_bytes": 209715200, "in_flight_bytes": 0, "online": true, "availability_forecast": [{ "horizon_seconds": 86400, "probability_online": 0.995, "confidence": 0.92, "predicted_offline_spell_seconds": 0 }], "rtt_ms": 2, "cost_per_gb_month": 1.0 },
+    { "id": "edge-b", "failure_domains": { "zone": "site-1", "rack": "r2" }, "hard_capacity_bytes": 2147483648, "reserved_bytes": 209715200, "in_flight_bytes": 0, "online": true, "availability_forecast": [{ "horizon_seconds": 86400, "probability_online": 0.995, "confidence": 0.92, "predicted_offline_spell_seconds": 0 }], "rtt_ms": 3, "cost_per_gb_month": 1.0 },
+    { "id": "edge-c", "failure_domains": { "zone": "site-2", "rack": "r3" }, "hard_capacity_bytes": 2147483648, "reserved_bytes": 209715200, "in_flight_bytes": 0, "online": true, "availability_forecast": [{ "horizon_seconds": 86400, "probability_online": 0.99, "confidence": 0.88, "predicted_offline_spell_seconds": 0 }], "rtt_ms": 8, "cost_per_gb_month": 0.8 },
+    { "id": "edge-d", "failure_domains": { "zone": "site-2", "rack": "r4" }, "hard_capacity_bytes": 2147483648, "reserved_bytes": 209715200, "in_flight_bytes": 0, "online": true, "availability_forecast": [{ "horizon_seconds": 86400, "probability_online": 0.99, "confidence": 0.88, "predicted_offline_spell_seconds": 0 }], "rtt_ms": 9, "cost_per_gb_month": 0.8 },
+    { "id": "edge-e", "failure_domains": { "zone": "site-3" }, "hard_capacity_bytes": 2147483648, "reserved_bytes": 209715200, "in_flight_bytes": 0, "online": true, "availability_forecast": [{ "horizon_seconds": 86400, "probability_online": 0.985, "confidence": 0.85, "predicted_offline_spell_seconds": 0 }], "rtt_ms": 15, "cost_per_gb_month": 0.5 },
+    { "id": "edge-f", "hard_capacity_bytes": 2147483648, "reserved_bytes": 209715200, "in_flight_bytes": 0, "online": true, "availability_forecast": [{ "horizon_seconds": 86400, "probability_online": 0.98, "confidence": 0.8, "predicted_offline_spell_seconds": 0 }], "rtt_ms": 20, "cost_per_gb_month": 0.4 }
+  ],
+  "objects": [
+    {
+      "object_id": "obj-shared-team",
+      "size_bytes": 524288,
+      "content_version": 1,
+      "intent": { "tier": "normal", "weights": {} }
+    }
+  ],
+  "policy": {
+    "min_fault_tolerance": 1,
+    "max_replica_count": 3,
+    "codec_limits": { "min_k": 2, "max_k": 4, "min_m": 1, "max_m": 2, "max_total_shards": 6 },
+    "prediction_horizon_seconds": 86400,
+    "min_predicted_readability": 0.9,
+    "min_confidence": 0.5,
+    "max_defer_offline_seconds": 7200,
+    "min_fault_margin_to_defer": 1,
+    "max_migration_bytes_budget": 0,
+    "improvement_threshold": 0.05,
+    "search": { "exact_combo_limit": 252, "beam_width": 8, "max_candidates": 256 }
+  }
+}

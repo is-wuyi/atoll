@@ -38,6 +38,9 @@ const (
 	bcOps      byte = 5
 	bcObjects  byte = 6
 	bcRetired  byte = 7
+	bcAutonomy byte = 8
+	bcSecurity byte = 9
+	bcWrites   byte = 10
 )
 
 func bucketByCode(c byte) ([]byte, error) {
@@ -56,6 +59,12 @@ func bucketByCode(c byte) ([]byte, error) {
 		return bucketObjects, nil
 	case bcRetired:
 		return bucketRetired, nil
+	case bcAutonomy:
+		return bucketAutonomy, nil
+	case bcSecurity:
+		return bucketSecurity, nil
+	case bcWrites:
+		return bucketWrites, nil
 	default:
 		return nil, fmt.Errorf("wal: 未知桶编码 %d", c)
 	}
@@ -105,6 +114,16 @@ func (w *txw) del(bucketCode byte, bkt, key []byte) error {
 }
 
 func (w *txw) putInode(in *types.Inode) error {
+	if in.Content != nil {
+		if err := types.ValidatePlainContent(*in); err != nil {
+			return err
+		}
+	}
+	if !in.Staging && w.tx.Bucket(bucketSecurity).Get(securityDataKey("upload", fmtUint(in.ID))) != nil {
+		if err := w.del(bcSecurity, bucketSecurity, securityDataKey("upload", fmtUint(in.ID))); err != nil {
+			return err
+		}
+	}
 	if err := w.updateObjectIndex(in); err != nil {
 		return err
 	}
@@ -119,6 +138,11 @@ func (w *txw) delInode(id uint64) error {
 	in, err := getInodeTx(w.tx, id)
 	if err == nil && in.ObjID != 0 {
 		if err := w.retireObject(in.ObjID); err != nil {
+			return err
+		}
+	}
+	if w.tx.Bucket(bucketSecurity).Get(securityDataKey("upload", fmtUint(id))) != nil {
+		if err := w.del(bcSecurity, bucketSecurity, securityDataKey("upload", fmtUint(id))); err != nil {
 			return err
 		}
 	}

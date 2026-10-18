@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-06T12:00:00Z",
+  "trace_id": "example-healthy-repair",
+  "nodes": [
+    {
+      "id": "n1",
+      "failure_domains": {
+        "zone": "z1"
+      },
+      "hard_capacity_bytes": 1073741824,
+      "reserved_bytes": 104857600,
+      "in_flight_bytes": 0,
+      "online": true,
+      "availability_forecast": [
+        {
+          "horizon_seconds": 86400,
+          "probability_online": 0.99,
+          "confidence": 0.9,
+          "predicted_offline_spell_seconds": 0
+        }
+      ],
+      "rtt_ms": 4,
+      "cost_per_gb_month": 1.0
+    },
+    {
+      "id": "n2",
+      "failure_domains": {
+        "zone": "z2"
+      },
+      "hard_capacity_bytes": 1073741824,
+      "reserved_bytes": 104857600,
+      "in_flight_bytes": 0,
+      "online": true,
+      "availability_forecast": [
+        {
+          "horizon_seconds": 86400,
+          "probability_online": 0.99,
+          "confidence": 0.9,
+          "predicted_offline_spell_seconds": 0
+        }
+      ],
+      "rtt_ms": 6,
+      "cost_per_gb_month": 1.0
+    },
+    {
+      "id": "n3",
+      "failure_domains": {
+        "zone": "z3"
+      },
+      "hard_capacity_bytes": 1073741824,
+      "reserved_bytes": 104857600,
+      "in_flight_bytes": 0,
+      "online": false,
+      "availability_forecast": [
+        {
+          "horizon_seconds": 86400,
+          "probability_online": 0.97,
+          "confidence": 0.9,
+          "predicted_offline_spell_seconds": 1800
+        }
+      ],
+      "rtt_ms": 5,
+      "cost_per_gb_month": 1.0
+    },
+    {
+      "id": "n4",
+      "failure_domains": {
+        "zone": "z4"
+      },
+      "hard_capacity_bytes": 1073741824,
+      "reserved_bytes": 104857600,
+      "in_flight_bytes": 0,
+      "online": true,
+      "availability_forecast": [
+        {
+          "horizon_seconds": 86400,
+          "probability_online": 0.99,
+          "confidence": 0.9,
+          "predicted_offline_spell_seconds": 0
+        }
+      ],
+      "rtt_ms": 9,
+      "cost_per_gb_month": 1.5
+    },
+    {
+      "id": "n5",
+      "failure_domains": {
+        "zone": "z5"
+      },
+      "hard_capacity_bytes": 1073741824,
+      "reserved_bytes": 104857600,
+      "in_flight_bytes": 0,
+      "online": true,
+      "availability_forecast": [
+        {
+          "horizon_seconds": 86400,
+          "probability_online": 0.99,
+          "confidence": 0.9,
+          "predicted_offline_spell_seconds": 0
+        }
+      ],
+      "rtt_ms": 12,
+      "cost_per_gb_month": 2.0
+    }
+  ],
+  "objects": [
+    {
+      "object_id": "obj-media",
+      "size_bytes": 307200,
+      "content_version": 1,
+      "intent": {
+        "tier": "normal",
+        "weights": {}
+      },
+      "current_layout": {
+        "object_id": "obj-media",
+        "content_version": 1,
+        "layout_epoch": 3,
+        "scheme": "replicate",
+        "replicas": [
+          {
+            "node_id": "n1",
+            "fragment_index": 0,
+            "bytes": 307200,
+            "origin": "existing"
+          },
+          {
+            "node_id": "n2",
+            "fragment_index": 1,
+            "bytes": 307200,
+            "origin": "existing"
+          },
+          {
+            "node_id": "n3",
+            "fragment_index": 2,
+            "bytes": 307200,
+            "origin": "existing"
+          },
+          {
+            "node_id": "n4",
+            "fragment_index": 3,
+            "bytes": 307200,
+            "origin": "existing"
+          }
+        ]
+      }
+    },
+    {
+      "object_id": "obj-docs",
+      "size_bytes": 131072,
+      "content_version": 1,
+      "intent": {
+        "tier": "security",
+        "weights": {}
+      }
+    }
+  ],
+  "policy": {
+    "min_fault_tolerance": 1,
+    "max_replica_count": 3,
+    "codec_limits": {
+      "min_k": 2,
+      "max_k": 4,
+      "min_m": 1,
+      "max_m": 2,
+      "max_total_shards": 6
+    },
+    "prediction_horizon_seconds": 86400,
+    "min_predicted_readability": 0.9,
+    "min_confidence": 0.5,
+    "max_defer_offline_seconds": 7200,
+    "min_fault_margin_to_defer": 1,
+    "max_migration_bytes_budget": 0,
+    "improvement_threshold": 0.05,
+    "search": {
+      "exact_combo_limit": 252,
+      "beam_width": 8,
+      "max_candidates": 256
+    }
+  }
+}

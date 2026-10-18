@@ -32,8 +32,8 @@ func ContainsUint64(list []uint64, v uint64) bool {
 const ChecksumHeader = "X-Atoll-Crc32c"
 
 const (
-	FeaturesHeader  = "X-Atoll-Features"
-	ObjectIDFeature = "object-id-v1"
+	FeaturesHeader         = "X-Atoll-Features"
+	ObjectIDFeature        = "object-id-v1"
 	ObjectIDBase    uint64 = 1 << 63
 	MaxStagingInode uint64 = (ObjectIDBase >> 8) - 1
 )
@@ -61,7 +61,9 @@ type Inode struct {
 	Replicas []uint64 `json:"replicas,omitempty"`
 	// DoneReplicas 已确认落盘完成的副本节点 ID（含主副本）。
 	// 异步复制期间 DoneReplicas 是 Replicas 的子集；读操作优先从中挑选。
-	DoneReplicas []uint64 `json:"done_replicas,omitempty"`
+	DoneReplicas    []uint64 `json:"done_replicas,omitempty"`
+	SuspectReplicas []uint64 `json:"suspect_replicas,omitempty"`
+	IntegrityEpoch  uint64   `json:"integrity_epoch,omitempty"`
 	// Staging=true 表示写入中的隐藏 inode：不挂 children，路径不可见。
 	// 客户端 commit 时单事务原子换名；崩溃残留由 TTL 回收。
 	Staging bool `json:"staging,omitempty"`
@@ -82,7 +84,8 @@ type Inode struct {
 	// Generation 是内容版本计数（v2 文件模型：身份与内容分离）：
 	// 0 = v1 时代写入的旧内容；首次 chunked 提交置 1；此后每次覆盖写（采纳式替换）+1。
 	// FileID 在覆盖写/rename 间保持稳定，Generation 是区分"同一文件的哪一版内容"的依据。
-	Generation uint64 `json:"generation,omitempty"`
+	Generation uint64          `json:"generation,omitempty"`
+	Content    *ContentVersion `json:"content,omitempty"`
 }
 
 // ChunkInfo 是分块文件的一个块。
@@ -98,6 +101,11 @@ type ChunkInfo struct {
 	Replicas []uint64 `json:"replicas"`
 	// Done 已确认落盘的副本节点 ID（含主副本），是 Replicas 的子集。
 	Done []uint64 `json:"done,omitempty"`
+	// Suspect 不能由存在性探测解除，必须重新校验内容后确认。
+	Suspect        []uint64 `json:"suspect,omitempty"`
+	IntegrityEpoch uint64   `json:"integrity_epoch,omitempty"`
+	// ChecksumKnown distinguishes a recorded zero CRC from old metadata without a checksum.
+	ChecksumKnown bool `json:"checksum_known,omitempty"`
 	// Checksum 块内容的 CRC32C（0 = 未记录，旧数据向后兼容跳过校验）。
 	// 读取时逐块比对，不符则故障转移——检测磁盘/传输静默损坏。
 	Checksum uint32 `json:"checksum,omitempty"`
@@ -163,9 +171,12 @@ func ObjIDFor(in Inode) uint64 {
 
 // NodeInfo 是一个存储节点的注册信息与运行状态。
 type NodeInfo struct {
-	ID            uint64    `json:"id"`
-	Addr          string    `json:"addr"` // 客户端直连用的 host:port
-	TotalBytes    int64     `json:"total_bytes"`
-	UsedBytes     int64     `json:"used_bytes"`
-	LastHeartbeat time.Time `json:"last_heartbeat"`
+	ID            uint64     `json:"id"`
+	Addr          string     `json:"addr"` // 客户端直连用的 host:port
+	TotalBytes    int64      `json:"total_bytes"`
+	UsedBytes     int64      `json:"used_bytes"`
+	LastHeartbeat time.Time  `json:"last_heartbeat"`
+	Usage         *NodeUsage `json:"usage,omitempty"`
+	// Random process epochs cannot prove that a lower sample follows the last known usage.
+	UsageFloorBytes int64 `json:"usage_floor_bytes,omitempty"`
 }

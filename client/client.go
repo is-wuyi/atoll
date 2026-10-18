@@ -30,6 +30,15 @@ type Client struct {
 	// putTimeout 覆盖块 PUT 的上下文超时；0 = 按块大小公式。测试注入小值以在秒级
 	// 验证"节点卡死→超时→换节点"，无需真等 150s。
 	putTimeout time.Duration
+	// sec 非 nil = 安全会话模式（NewSecure 创建）：master 请求注入用户会话+space，
+	// 节点请求自动换短期票据（会话绝不外发节点）。旧构造函数保持 nil = 兼容模式。
+	sec *secureSession
+	// secTransport 是 secure 模式的出站 transport，与 c.HTTP 的 Transport 是同一实例
+	// （FUSE 读句柄经 ObjectTransport() 共用，连接池/票据逻辑一处）。
+	secTransport *secureTransport
+	writeMu      sync.Mutex
+	writeEnabled bool
+	writeChecked time.Time
 }
 
 // SetPutTimeout 覆盖块 PUT 超时（测试用，注入小值快速验证超时+换节点）。
@@ -111,7 +120,20 @@ func (c *Client) Ls(path string) ([]types.Inode, error) {
 // 只累计**存活**节点：此前用 /admin/overview 的全量求和，死节点的声明容量也被计入，
 // 虚报可用空间 → Finder 放行必然中途失败的拷贝（审计 #7）。控制台的全局视图仍走
 // /admin/overview（"名义容量"语义保留在那里）。
+//
+// secure 会话：/admin/nodes 是管理面读，用户改走受限聚合端点 /auth/capacity
+// （master 按存活节点算好总数，不向用户暴露节点清单）。
 func (c *Client) ClusterCapacity() (total, used int64, err error) {
+	if c.sec != nil {
+		var cap struct {
+			TotalBytes int64 `json:"total_bytes"`
+			UsedBytes  int64 `json:"used_bytes"`
+		}
+		if err := c.getJSON("/auth/capacity", &cap); err != nil {
+			return 0, 0, err
+		}
+		return cap.TotalBytes, cap.UsedBytes, nil
+	}
 	var nodes []struct {
 		TotalBytes int64 `json:"total_bytes"`
 		UsedBytes  int64 `json:"used_bytes"`
@@ -159,6 +181,11 @@ func (c *Client) Lookup(path string) (types.Inode, []Replica, error) {
 	if err := c.getJSON("/meta?"+queryPath(path), &out); err != nil {
 		return types.Inode{}, nil, err
 	}
+	if out.Inode.Content != nil {
+		if err := types.ValidatePlainContent(out.Inode); err != nil {
+			return types.Inode{}, nil, err
+		}
+	}
 	return out.Inode, out.Nodes, nil
 }
 
@@ -204,7 +231,22 @@ func (c *Client) PutReader(remotePath string, size int64, r io.Reader, replicas 
 
 // PutReaderOverwrite 从 io.Reader 上传，支持 overwrite 参数。
 // overwrite 为 true 时允许覆盖同名文件。
+//
+// secure 会话下 0 字节文件改走 POST /auth/files/empty（master 服务端建档落盘）：
+// 客户端不直写 legacy mutable object，授权面只暴露 chunked/小文件通道。
+// 非 secure 客户端行为不变。
 func (c *Client) PutReaderOverwrite(remotePath string, size int64, r io.Reader, replicas int, overwrite bool) error {
+	planned, err := c.WritePlanning(context.Background())
+	if err != nil {
+		return err
+	}
+	if planned {
+		_, err := c.putPlannedReader(context.Background(), remotePath, size, r, overwrite)
+		return err
+	}
+	if size == 0 && c.sec != nil {
+		return c.putEmptySecure(remotePath, replicas, overwrite)
+	}
 	// 1. 在 master 创建文件记录并获取副本节点（第一个为主副本）。
 	var created struct {
 		Inode types.Inode      `json:"inode"`
@@ -256,6 +298,15 @@ func (c *Client) Get(remotePath, localPath string) error {
 	in, nodes, err := c.lookup(remotePath)
 	if err != nil {
 		return err
+	}
+	// 0 字节文件无数据对象（secure /auth/files/empty 建档甚至无副本节点）：
+	// 无需触网，直接落一个 0 字节本地文件——否则"无可用副本节点"误报失败。
+	if in.Size == 0 {
+		out, err := os.Create(localPath)
+		if err != nil {
+			return err
+		}
+		return out.Close()
 	}
 	if in.Chunked {
 		return c.getChunked(in, nodes, localPath)
@@ -383,6 +434,14 @@ func (c *Client) PutChunkedReaderWithMinCopies(remotePath string, size int64, r 
 // 全部块落盘后 commit 原子换名；任一环节失败显式 abort。
 // minCopies>0 时 commit 遇 409（副本未到齐）轮询重试，最长 15 分钟。
 func (c *Client) putChunkedCore(remotePath string, size int64, r io.Reader, replicas, minCopies int, overwrite bool) error {
+	planned, err := c.WritePlanning(context.Background())
+	if err != nil {
+		return err
+	}
+	if planned {
+		_, err := c.putPlannedReader(context.Background(), remotePath, size, r, overwrite)
+		return err
+	}
 	if size <= 0 {
 		return fmt.Errorf("empty file not supported in chunked mode")
 	}
@@ -593,7 +652,7 @@ func (c *Client) getChunked(in types.Inode, nodes []Replica, localPath string) e
 	}
 	defer out.Close()
 	for _, ch := range in.Chunks {
-		if err := c.fetchChunkInto(in.ID, ch, addr, out); err != nil {
+		if err := c.fetchChunkInto(in, ch, addr, out); err != nil {
 			return fmt.Errorf("块 %d: %w", ch.Index, err)
 		}
 	}
@@ -601,7 +660,10 @@ func (c *Client) getChunked(in types.Inode, nodes []Replica, localPath string) e
 }
 
 // fetchChunkInto 下载一个块追加到 w。done 副本优先随机打散，失败轮换副本。
-func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uint64]string, w io.Writer) error {
+func (c *Client) fetchChunkInto(in types.Inode, ch types.ChunkInfo, addr map[uint64]string, w io.Writer) error {
+	if ch.Size <= 0 || ch.Size > types.ChunkSize {
+		return fmt.Errorf("invalid chunk size %d", ch.Size)
+	}
 	var primary, fallback []uint64
 	for _, id := range ch.Replicas {
 		if types.ContainsUint64(ch.Done, id) {
@@ -613,7 +675,7 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 	rand.Shuffle(len(primary), func(i, j int) { primary[i], primary[j] = primary[j], primary[i] })
 	candidates := append(append([]uint64{}, primary...), fallback...)
 
-	chunkID := types.ChunkObjID(ch, inodeID) // v2 块表自描述 ID 优先（采纳式替换后不可派生）
+	chunkID := types.ChunkObjID(ch, in.ID)
 	var lastErr error
 	for _, id := range candidates {
 		a, ok := addr[id]
@@ -637,7 +699,7 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 		}
 		// 先整块读入内存再校验后写出：块 ≤64MB，可整块驻留。必须校验后才写，
 		// 否则损坏块已落到输出文件、故障转移重写会导致内容重复错位。
-		buf, readErr := io.ReadAll(resp.Body)
+		buf, readErr := io.ReadAll(io.LimitReader(resp.Body, ch.Size+1))
 		resp.Body.Close()
 		cancel()
 		if readErr != nil {
@@ -645,12 +707,13 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 			continue
 		}
 		if int64(len(buf)) != ch.Size {
-			lastErr = fmt.Errorf("节点 %s: 块 %d 短读 %d != %d", a, ch.Index, len(buf), ch.Size)
+			lastErr = fmt.Errorf("节点 %s: 块 %d 长度 %d != %d", a, ch.Index, len(buf), ch.Size)
+			go c.reportChunkSuspect(in, ch, id)
 			continue
 		}
-		if ch.Checksum != 0 && types.CRC32C(buf) != ch.Checksum {
+		if (ch.ChecksumKnown || ch.Checksum != 0) && types.CRC32C(buf) != ch.Checksum {
 			lastErr = fmt.Errorf("节点 %s: 块 %d 校验和不符", a, ch.Index)
-			go c.ReportCorrupt(chunkID, id) // 尽力上报：master 删坏对象并清 Done → 修复重拉
+			go c.reportChunkSuspect(in, ch, id)
 			continue
 		}
 		if _, err := w.Write(buf); err != nil {
@@ -661,27 +724,10 @@ func (c *Client) fetchChunkInto(inodeID uint64, ch types.ChunkInfo, addr map[uin
 	return fmt.Errorf("全部副本失败: %w", lastErr)
 }
 
-// ReportCorrupt 读端发现某副本内容校验和不符时上报 master（失败静默）。
-// objectID 对分块传块对象 ID（ChunkID），对 legacy 传文件 inode ID（与 /files/replicated
-// 同编码）。master 会删该节点坏对象并清其 Done，使修复扫描重新拉取覆盖，自愈闭环闭合。
-// 调用方以 goroutine 触发：读路径已完成故障转移，上报不得阻塞或影响读结果。
-func (c *Client) ReportCorrupt(objectID, nodeID uint64) {
-	body, err := json.Marshal(map[string]uint64{"inode_id": objectID, "node_id": nodeID})
-	if err != nil {
-		return
-	}
+func (c *Client) reportChunkSuspect(in types.Inode, ch types.ChunkInfo, nodeID uint64) {
 	ctx, cancel := context.WithTimeout(context.Background(), metadataTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.MasterURL+"/files/corrupt", bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return
-	}
-	resp.Body.Close()
+	_ = c.ReportChunkSuspect(ctx, in, ch, nodeID)
 }
 
 // newOpID 生成写操作幂等凭据（v2-3a）：128 位随机十六进制。
@@ -704,6 +750,13 @@ func (c *Client) PutSmall(remotePath string, data []byte, replicas int, overwrit
 	}
 	if int64(len(data)) > types.SmallFileMax {
 		return types.Inode{}, fmt.Errorf("文件 %d 字节超过小文件通道上限 %d", len(data), types.SmallFileMax)
+	}
+	planned, err := c.WritePlanning(context.Background())
+	if err != nil {
+		return types.Inode{}, err
+	}
+	if planned {
+		return c.putPlannedReader(context.Background(), remotePath, int64(len(data)), bytes.NewReader(data), overwrite)
 	}
 	opID := newOpID()
 	u := func() string {
@@ -828,9 +881,15 @@ func (c *Client) getJSON(path string, out any) error {
 }
 
 // HTTPError 保留 HTTP 状态码，调用方不必从错误文案猜测错误类型。
+// Code 是新写协议（POST /writes 系列）服务端下发的机器可读错误码
+// （types.WritePlanRequired/WriteNotReady/WritePlanConflict/WriteNoFeasible/
+// WriteBudget/WriteExpired）；旧接口仅有自然语言 Error，Code 为空串。
+// 只有 Code==WriteNotReady（write_not_ready）允许同绑定重试，其余码一律不回退
+// 到旧写路径（契约 §HTTP /writes/commit）。
 type HTTPError struct {
 	StatusCode int
 	Message    string
+	Code       string
 }
 
 func (e *HTTPError) Error() string {
@@ -840,16 +899,31 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("http %d", e.StatusCode)
 }
 
+// WriteCode 取出错误链上的机器可读错误码（无则空串）。errors.As 语义保留，
+// 旧调用方（只判 StatusCode）行为不变。
+func WriteCode(err error) string {
+	var he *HTTPError
+	if errors.As(err, &he) {
+		return he.Code
+	}
+	return ""
+}
+
 // statusError 把非 2xx 响应转成带 master 错误信息的 error。
+// body 优先解析 {error, code}（新写协议 WriteError wire；code 进 HTTPError.Code 供
+// 上层做 typed 重试）。解析失败/缺 error 时保持旧行为（只带状态码），绝不把裸
+// error 文本当作 master 错误信息——旧 master 的纯文本 body 与 JSON 错误都靠 StatusCode。
 func statusError(resp *http.Response) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	var e struct {
 		Error string `json:"error"`
+		Code  string `json:"code"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&e); err == nil && e.Error != "" {
-		return &HTTPError{StatusCode: resp.StatusCode, Message: e.Error}
+	if err := json.Unmarshal(raw, &e); err == nil && (e.Error != "" || e.Code != "") {
+		return &HTTPError{StatusCode: resp.StatusCode, Message: e.Error, Code: e.Code}
 	}
 	return &HTTPError{StatusCode: resp.StatusCode}
 }

@@ -25,32 +25,58 @@ import (
 	"atoll/client"
 	"atoll/console"
 	"atoll/master"
-	"atoll/pkg/types"
 	"atoll/mount"
 	"atoll/node"
 	"atoll/pkg/auth"
+	"atoll/pkg/types"
 )
 
 const usageText = `usage: atoll <command> [args]
 
 服务角色:
   atoll master   启动中心服务器（元数据 + 副本调度）
+                 [-write-planning 启用调度器计划写入；启用后重启须保留开关]
+                 [-secure 启用安全模式：强制 TLS 证书且拒绝 -tls-skip-verify、
+                 控制凭据读 -control-token-env（默认 ATOLL_CONTROL_TOKEN，≥24 字符）、
+                 拒绝 -seeds 远程备份（安全模式仅本地库备份）；库未引导须先 auth init]
   atoll node     启动存储节点（对象存储 + 心跳）
+                 [-secure 启用节点独立身份：首次入网需设备邀请码环境变量
+                 -invite-env（默认 ATOLL_NODE_INVITE），强制 TLS；此后同一身份静默续期]
+
+安全账号 (auth init 为离线引导；其余经 master；密码默认读 ATOLL_PASSWORD):
+  atoll auth init -user <名>        引导安全库：创建首位平台管理员与个人空间
+                                    （master 停止时执行，-db 指定库文件）
+  atoll login -user <名>            登录，输出会话 token（24 小时有效）
+  atoll logout                      登出并吊销当前会话
+  atoll spaces                      列出个人与团队空间
+  atoll team-create <名称>          创建团队空间
+  atoll team-member -space <ID> <用户ID> read|write|remove
+                                    团队 owner 增改/移除成员
 
 客户端命令 (可用 -master 或环境变量 ATOLL_MASTER 指定 master 地址):
   atoll put <本地文件> <远程路径>    上传文件 [-replicas N] [-min-copies N] [-f]
-                                    大于零字节默认走分块上传（64MB 块，覆盖写原子）
-                                    单文件上限 16 GiB（256 × 64MB 块）
+                                    计划模式由调度器选择布局和确认；旧参数仅兼容旧 Master
+                                    非空小文件直传节点；旧模式使用小文件代理通道
+                                    单文件上限 16 GiB（256 × 64MiB 块）
   atoll get <远程路径> <本地文件>    下载文件（自动兼容分块/整文件格式）
   atoll ls  <远程路径>              列目录
+  atoll protection <远程路径> [performance|normal|security|inherit]
+                                    查询或设置目录/文件的新写保护偏好（档位仅为优化权重）
   atoll mkdir <远程路径>            建目录
-  atoll rm  <远程路径>              删除文件/空目录
+  atoll rm  <远程路径>              删除文件/空目录（立即生效，无回收站）
   atoll mount <挂载点>              FUSE 挂载为本地目录 [-cache 缓冲目录 -replicas N]
   atoll gc [--execute]              垃圾回收（dry-run 默认；--execute 执行删除）
   atoll auth gen                    生成随机集群认证 token
 
-认证: 全部角色支持 -token 参数或 ATOLL_TOKEN 环境变量（集群各组件须一致；
-不设置时为兼容模式，不校验也不注入）`
+认证与空间选择:
+  兼容模式（默认）：全部角色支持 -token 或 ATOLL_TOKEN（集群各组件须一致；
+    不设置时不校验也不注入）。
+  安全模式：客户端命令与 mount 支持 -session-env（默认 ATOLL_SESSION）携带登录
+    会话、-space 或 ATOLL_SPACE 选择个人/团队空间 ID；设置了会话时静态 token
+    不再使用——会话只发 master，直连节点的读写自动换取短期票据并由节点逐请求
+    在线核验（登出/禁用/移除成员对下一请求立即生效；内核页缓存与已开始请求除外）。
+  设备入网邀请码经 ATOLL_NODE_INVITE 传给 node -secure；邀请码由平台管理员经
+    HTTP 接口创建（详见 SECURITY.md）。`
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -69,7 +95,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runNode(rest, stderr)
 	case "mount":
 		return runMount(rest, stderr)
-	case "put", "get", "ls", "mkdir", "rm":
+	case "put", "get", "ls", "mkdir", "rm", "protection":
 		return runClientCmd(cmd, rest, stdout, stderr)
 	case "gc":
 		return runGC(rest, stdout, stderr)
@@ -77,6 +103,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runConsole(rest, stdout, stderr)
 	case "auth":
 		return runAuth(rest, stdout, stderr)
+	case "login", "logout", "spaces", "team-create", "team-member":
+		return runUserSecurity(cmd, rest, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprintln(stdout, usageText)
 		return 0
@@ -89,6 +117,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 // ---- auth ----
 
 func runAuth(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "init" {
+		return runSecurityBootstrap(args[1:], stdout, stderr)
+	}
 	if len(args) != 1 || args[0] != "gen" {
 		fmt.Fprintln(stderr, "用法: atoll auth gen")
 		return 2
@@ -112,6 +143,15 @@ func runMaster(args []string, stderr io.Writer) int {
 	nodeMaxAge := fs.Duration("node-max-age", 30*time.Second, "节点心跳超时阈值")
 	repairIntv := fs.Duration("repair-interval", 15*time.Second, "副本修复扫描周期")
 	gcIntv := fs.Duration("gc-interval", 10*time.Minute, "GC 对账扫描周期")
+	autonomyMode := fs.String("autonomy", "off", "自治保护：off|observe|shadow|add（add 仅增加副本）")
+	secure := fs.Bool("secure", false, "启用受邀账号、空间与节点独立身份")
+	allowInsecure := fs.Bool("allow-insecure", false, "仅供隔离测试：允许安全模式使用明文 HTTP")
+	controlEnv := fs.String("control-token-env", "ATOLL_CONTROL_TOKEN", "Master 私有控制凭据环境变量")
+	autonomyInterval := fs.Duration("autonomy-interval", time.Minute, "自治观测与决策周期")
+	autonomyBytes := fs.Int64("autonomy-bytes-per-round", 256<<20, "每轮增加副本的字节预算")
+	autonomyReplicas := fs.Int("autonomy-max-replicas", 8, "自治副本候选上限，不是固定副本数")
+	writePlanning := fs.Bool("write-planning", false, "由调度器规划新写入（启用状态持久化，重启须保留此开关）")
+	writeReplicas := fs.Int("write-max-replicas", 8, "新写入复制布局搜索上限，不是固定副本数")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
 	adminToken := fs.String("admin-token", envDefault("ATOLL_ADMIN_TOKEN", ""), "破坏性操作(/admin/gc)专用 token（空 = 回退用集群 token）")
 	tlsCert := fs.String("tls-cert", "", "TLS 证书文件（配 -tls-key 后 master 走 https）")
@@ -132,6 +172,18 @@ func runMaster(args []string, stderr io.Writer) int {
 		return 1
 	}
 	seeds := splitSeeds(*seedsFlag)
+	if *secure && !*allowInsecure && (*tlsCert == "" || *tlsKey == "" || *tlsSkip) {
+		fmt.Fprintln(stderr, "secure master requires TLS certificates and certificate verification")
+		return 1
+	}
+	if *secure && len(os.Getenv(*controlEnv)) < 24 {
+		fmt.Fprintln(stderr, "secure master requires a private control token of at least 24 characters")
+		return 1
+	}
+	if *secure && len(seeds) > 0 {
+		fmt.Fprintln(stderr, "secure recovery from node backups is not enabled yet; use a local database backup")
+		return 1
+	}
 
 	// 元数据备份器：既做恢复决策，也跑后台备份循环。
 	backup := master.NewMetaBackup(nil, *nodeMaxAge, master.MetaBackupConfig{
@@ -146,23 +198,55 @@ func runMaster(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "atoll master: %v\n", err)
 		return 1
 	}
+	enabled, err := store.SecurityEnabled()
+	if err != nil || enabled != *secure {
+		store.Close()
+		fmt.Fprintln(stderr, "security mode must match the database bootstrap state; use auth init before secure startup")
+		return 1
+	}
+	if initialized, err := store.WritePlanningEnabled(); err != nil || (initialized && !*writePlanning) {
+		store.Close()
+		fmt.Fprintln(stderr, "write planning database requires -write-planning and intact configuration")
+		return 1
+	}
 	backup.SetStore(store)
 	backup.InstallSyncHook() // 同步旋钮：开启时写元数据 ack 前先落集群（钩子内按配置决定）
 
+	var autonomy *master.Autonomy
+	if *autonomyMode != "off" {
+		autonomy, err = master.NewAutonomy(store, *nodeMaxAge, master.AutonomyConfig{
+			Mode: *autonomyMode, Interval: *autonomyInterval, MaxBytesPerRound: *autonomyBytes, MaxReplicas: *autonomyReplicas,
+		})
+		if err != nil {
+			store.Close()
+			fmt.Fprintf(stderr, "atoll master: %v\n", err)
+			return 1
+		}
+		autonomy.SetTransport(auth.Token(*token), outTLS)
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	scanner := master.NewScanner(store, *nodeMaxAge, *repairIntv, *gcIntv)
 	scanner.SetToken(auth.Token(*token))
 	scanner.SetTLS(outTLS)
-	scanner.Start(ctx) // 内部为三个循环各起 goroutine
+	scanner.SetAdditiveOnly(*autonomyMode == master.AutonomyAdd)
+	// Transport configuration must precede every background worker.
 	// 配了种子才跑备份循环（否则退化为纯本地，无灾备）。
 	if len(seeds) > 0 {
 		backup.StartLoop(ctx, 0) // walIntv=0 → 内部取 Interval/5
 		log.Printf("元数据备份进集群已启用：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
 	}
 	// 关闭顺序：等扫描器 + 备份 goroutine 全部退出后再关 store，避免关库时仍在读写。
-	defer func() { scanner.Wait(); backup.Wait(); store.Close() }()
+	defer func() {
+		cancel()
+		scanner.Wait()
+		backup.Wait()
+		if autonomy != nil {
+			autonomy.Wait()
+		}
+		store.Close()
+	}()
 
 	srv := master.NewServer(store, *nodeMaxAge)
 	srv.SetScanner(scanner)
@@ -170,6 +254,31 @@ func runMaster(args []string, stderr io.Writer) int {
 	srv.SetToken(auth.Token(*token))
 	srv.SetAdminToken(auth.Token(*adminToken))
 	srv.SetTLS(outTLS)
+	if *secure {
+		if err := srv.EnableSecurity(master.SecurityConfig{ControlToken: auth.Token(os.Getenv(*controlEnv)), AllowInsecure: *allowInsecure}); err != nil {
+			fmt.Fprintln(stderr, "secure master:", err)
+			return 1
+		}
+	}
+	if *writePlanning {
+		if err := srv.EnableWritePlanning(master.WritePlanningConfig{MaxReplicas: *writeReplicas}); err != nil {
+			fmt.Fprintln(stderr, "write planning:", err)
+			return 1
+		}
+	}
+	if autonomy != nil {
+		srv.SetAutonomy(autonomy)
+	}
+	if *secure {
+		srv.AttachSecureTransports()
+		srv.StartSecurity(ctx)
+		defer func() { cancel(); srv.WaitSecurity() }()
+	}
+	scanner.Start(ctx)
+	if autonomy != nil {
+		autonomy.Start(ctx)
+		log.Printf("autonomy mode=%s interval=%s (add-only, EC disabled)", *autonomyMode, *autonomyInterval)
+	}
 	httpSrv := &http.Server{Addr: *listen, Handler: srv.Handler()}
 	go func() {
 		<-ctx.Done() // SIGTERM/SIGINT：NotifyContext 拦截了默认终止行为，必须显式退出
@@ -211,6 +320,10 @@ func runNode(args []string, stderr io.Writer) int {
 	listen := fs.String("listen", ":9421", "监听地址")
 	advertise := fs.String("advertise", "", "注册到 master 供客户端直连的地址；跨机部署必须显式指定（如 203.0.113.5:9421）")
 	dataDir := fs.String("data-dir", "./node-data", "对象存储目录")
+	secureNode := fs.Bool("secure", false, "启用节点独立身份与访问票据")
+	identityPath := fs.String("identity", "", "节点私钥文件（默认 data-dir/identity.key）")
+	inviteEnv := fs.String("invite-env", "ATOLL_NODE_INVITE", "节点加入邀请码环境变量")
+	allowInsecureNode := fs.Bool("allow-insecure", false, "仅供隔离测试：允许明文或跳过证书验证")
 	totalBytes := fs.Int64("total-bytes", 100<<30, "声明容量（字节）")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
 	tlsCert := fs.String("tls-cert", "", "TLS 证书文件（配 -tls-key 后 node 走 https）")
@@ -240,6 +353,20 @@ func runNode(args []string, stderr io.Writer) int {
 	n := node.New(*dataDir, *masterURL, adv, *totalBytes)
 	n.SetToken(auth.Token(*token))
 	n.SetTLS(outTLS)
+	if *secureNode {
+		if !*allowInsecureNode && (*tlsCert == "" || *tlsKey == "" || *tlsSkip) {
+			fmt.Fprintln(stderr, "secure node requires TLS certificates and certificate verification")
+			return 1
+		}
+		keyPath := *identityPath
+		if keyPath == "" {
+			keyPath = filepath.Join(*dataDir, "identity.key")
+		}
+		if err := n.EnableSecurity(keyPath, os.Getenv(*inviteEnv), *allowInsecureNode); err != nil {
+			fmt.Fprintln(stderr, "secure node:", err)
+			return 1
+		}
+	}
 	if err := n.InitUsedBytes(); err != nil {
 		fmt.Fprintf(stderr, "atoll node: %v\n", err)
 		return 1
@@ -278,6 +405,9 @@ func runMount(args []string, stderr io.Writer) int {
 	cacheDir := fset.String("cache", filepath.Join(os.TempDir(), "atoll-cache"), "写缓冲临时目录")
 	debug := fset.Bool("debug", false, "输出 FUSE 调试日志")
 	token := fset.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
+	sessionEnv := fset.String("session-env", "ATOLL_SESSION", "安全用户会话环境变量")
+	space := fset.Uint64("space", securitySpaceEnv(), "安全用户空间 ID")
+	allowInsecure := fset.Bool("allow-insecure", false, "仅供隔离测试：允许安全会话明文 HTTP")
 	tlsCA := fset.String("tls-ca", "", "校验服务端证书用的 CA（master 走 https 时）")
 	tlsSkip := fset.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
 	if err := fset.Parse(args); err != nil {
@@ -298,7 +428,11 @@ func runMount(args []string, stderr io.Writer) int {
 		return 1
 	}
 
-	c := client.NewWithTLS(*masterURL, auth.Token(*token), tlsCfg)
+	c, err := configuredClient(*masterURL, auth.Token(*token), tlsCfg, os.Getenv(*sessionEnv), *space, *allowInsecure)
+	if err != nil {
+		fmt.Fprintln(stderr, "atoll mount:", err)
+		return 1
+	}
 	m, err := mount.NewWithTLS(c, *cacheDir, *replicas, auth.Token(*token), tlsCfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "atoll mount: %v\n", err)
@@ -347,9 +481,12 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
-	replicas := fs.Int("replicas", 2, "副本数（仅 put 使用，含主副本）")
-	minCopies := fs.Int("min-copies", 0, "put 提交前每块需落盘的副本数下限（0=仅主副本，最快；=replicas 则等全部副本，最稳）")
+	replicas := fs.Int("replicas", 2, "兼容模式副本数（计划模式由调度器决定）")
+	minCopies := fs.Int("min-copies", 0, "兼容模式提交确认下限（计划模式不采用此参数）")
 	force := fs.Bool("f", false, "强制覆盖远程已存在的同名文件（仅 put 使用）")
+	sessionEnv := fs.String("session-env", "ATOLL_SESSION", "安全用户会话环境变量")
+	space := fs.Uint64("space", securitySpaceEnv(), "安全用户空间 ID")
+	allowInsecure := fs.Bool("allow-insecure", false, "仅供隔离测试：允许安全会话明文 HTTP")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
 	tlsCA := fs.String("tls-ca", "", "校验服务端证书用的 CA（master 走 https 时）")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
@@ -361,7 +498,11 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "atoll %s: %v\n", cmd, err)
 		return 1
 	}
-	c := client.NewWithTLS(*masterURL, auth.Token(*token), tlsCfg)
+	c, err := configuredClient(*masterURL, auth.Token(*token), tlsCfg, os.Getenv(*sessionEnv), *space, *allowInsecure)
+	if err != nil {
+		fmt.Fprintln(stderr, "atoll client:", err)
+		return 1
+	}
 
 	switch cmd {
 	case "put":
@@ -402,8 +543,32 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 		if *force {
 			action = "已覆盖"
 		}
-		fmt.Fprintf(stdout, "%s %s → %s（%d 副本，%s）\n", action, fs.Arg(0), fs.Arg(1), *replicas,
-			humanSize(st.Size()))
+		if planned, err := c.WritePlanning(context.Background()); err == nil && planned {
+			fmt.Fprintf(stdout, "%s %s → %s（调度器确认条件已满足，%s）\n", action, fs.Arg(0), fs.Arg(1), humanSize(st.Size()))
+		} else {
+			fmt.Fprintf(stdout, "%s %s → %s（%d 副本，%s）\n", action, fs.Arg(0), fs.Arg(1), *replicas, humanSize(st.Size()))
+		}
+	case "protection":
+		if fs.NArg() < 1 || fs.NArg() > 2 {
+			fmt.Fprintln(stderr, "用法: atoll protection <远程路径> [performance|normal|security|inherit]")
+			return 2
+		}
+		var policy types.ProtectionResponse
+		var err error
+		if fs.NArg() == 2 {
+			tier := types.ProtectionTier(fs.Arg(1))
+			if tier == "inherit" {
+				tier = ""
+			}
+			policy, err = c.SetProtection(fs.Arg(0), tier)
+		} else {
+			policy, err = c.GetProtection(fs.Arg(0))
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, "protection 失败:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "%s: %s（来源 inode %d，策略版本 %d；仅影响新写入的优化权重）\n", fs.Arg(0), policy.Policy.Tier, policy.Policy.SourceInodeID, policy.Policy.Revision)
 	case "get":
 		if fs.NArg() != 2 {
 			fmt.Fprintln(stderr, "用法: atoll get <远程路径> <本地文件>")

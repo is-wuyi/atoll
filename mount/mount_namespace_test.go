@@ -146,6 +146,10 @@ func TestNamespaceErrorsPreserveMeaning(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/capabilities" {
+					json.NewEncoder(w).Encode(map[string]any{"write_planning": false, "features": []string{}})
+					return
+				}
 				w.WriteHeader(tc.code)
 				if err := json.NewEncoder(w).Encode(map[string]string{"error": tc.text}); err != nil {
 					t.Error(err)

@@ -386,7 +386,7 @@ func TestReadHandleConcurrentReads(t *testing.T) {
 			}
 			rh := &readHandle{ino: 2, size: int64(len(data)), checksum: crc,
 				cands: []client.Replica{{ID: 2, Addr: srv.Listener.Addr().String(), Done: true}},
-				http: srv.Client(), scheme: "http"}
+				http:  srv.Client(), scheme: "http"}
 			start := make(chan struct{})
 			var wg sync.WaitGroup
 			for g := 0; g < 8; g++ {
@@ -469,6 +469,116 @@ func TestReadHandleRejectsBadLength(t *testing.T) {
 	}
 }
 
+// TestReadHandleSharesMountCache 同一 Mount 的两个句柄读同一小对象：整对象校验读取
+// 合并为 1 次 GET（Mount 级缓存跨句柄共享，而非句柄私有 retained 副本）。
+func TestReadHandleSharesMountCache(t *testing.T) {
+	data := []byte("shared-verified-object")
+	var gets atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/objects/500" {
+			gets.Add(1)
+		}
+		w.Write(data)
+	}))
+	t.Cleanup(srv.Close)
+	masterSrv := httptest.NewServer(http.NotFoundHandler()) // 成功路径不触 master
+	t.Cleanup(masterSrv.Close)
+	m, err := New(client.New(masterSrv.URL), t.TempDir(), 1)
+	if err != nil {
+		t.Fatalf("mount.New: %v", err)
+	}
+	mk := func() *readHandle {
+		return &readHandle{ino: 2, objID: 500, size: int64(len(data)), checksum: types.CRC32C(data),
+			generation: 1, cands: []client.Replica{{ID: 2, Addr: srv.Listener.Addr().String(), Done: true}},
+			http: srv.Client(), scheme: "http", m: m}
+	}
+	for i, rh := range []*readHandle{mk(), mk()} {
+		got, errno := readBytes(rh, context.Background(), 0, len(data))
+		if errno != 0 || !bytes.Equal(got, data) {
+			t.Fatalf("rh%d read: %q %v", i, got, errno)
+		}
+	}
+	if gets.Load() != 1 {
+		t.Fatalf("跨句柄未共享缓存: %d GETs", gets.Load())
+	}
+}
+
+// TestReadHandleLargeLegacyUsesStrictRange 超过 ChunkSize 的 legacy 整对象即使有
+// checksum 也走严格 Range（整块校验需缓冲整对象，会突破在飞内存界）；Range 响应
+// Content-Range 逐字节匹配时照常服务。
+func TestReadHandleLargeLegacyUsesStrictRange(t *testing.T) {
+	total := types.ChunkSize + 1
+	var wholeGET atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "" {
+			wholeGET.Add(1)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-1/%d", total))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte("ab"))
+	}))
+	t.Cleanup(srv.Close)
+	// checksum 非 0：若误走整块校验会先发整对象 GET 并因长度不符失败。
+	rh := &readHandle{ino: 2, size: total, checksum: 12345,
+		cands: []client.Replica{{ID: 2, Addr: srv.Listener.Addr().String(), Done: true}},
+		http:  srv.Client(), scheme: "http"}
+	got, errno := readBytes(rh, context.Background(), 0, 2)
+	if errno != 0 || string(got) != "ab" {
+		t.Fatalf("大 legacy 对象 Range 读: %q %v", got, errno)
+	}
+	if wholeGET.Load() != 0 {
+		t.Fatalf("大 legacy 对象不应整对象 GET: %d 次", wholeGET.Load())
+	}
+}
+
+// TestReadHandleSuspectRotation 小路径（readRange，checksum=0 不缓存）同句柄连续读：
+// suspect 副本殿后兜底、不参与轮转；健康失败轮到 suspect 成功后，下一次仍先试健康。
+func TestReadHandleSuspectRotation(t *testing.T) {
+	var healthyGets, suspectGets atomic.Int64
+	var healthyBroken atomic.Bool
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		healthyGets.Add(1)
+		if healthyBroken.Load() {
+			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.Write([]byte("abcdef"))
+	}))
+	t.Cleanup(healthy.Close)
+	suspect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		suspectGets.Add(1)
+		w.Write([]byte("abcdef"))
+	}))
+	t.Cleanup(suspect.Close)
+	rh := &readHandle{ino: 2, objID: 500, size: 6, checksum: 0, // 未知 checksum：严格 Range、不缓存
+		cands:    []client.Replica{{ID: 2, Addr: healthy.Listener.Addr().String(), Done: true}},
+		suspects: []client.Replica{{ID: 1, Addr: suspect.Listener.Addr().String()}},
+		http:     healthy.Client(), scheme: "http"}
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		if got, errno := readBytes(rh, ctx, 0, 6); errno != 0 || string(got) != "abcdef" {
+			t.Fatalf("读 %d: %q %v", i, got, errno)
+		}
+	}
+	if n := suspectGets.Load(); n != 0 {
+		t.Fatalf("suspect 副本被轮转首选: %d 次", n)
+	}
+	healthyBroken.Store(true) // 健康段全败 → suspect 兜底成功
+	if got, errno := readBytes(rh, ctx, 0, 6); errno != 0 || string(got) != "abcdef" {
+		t.Fatalf("兜底读: %q %v", got, errno)
+	}
+	healthyBroken.Store(false) // 下一次必须先回健康段
+	if got, errno := readBytes(rh, ctx, 0, 6); errno != 0 || string(got) != "abcdef" {
+		t.Fatalf("回归健康读: %q %v", got, errno)
+	}
+	if n := suspectGets.Load(); n != 1 {
+		t.Fatalf("suspect 兜底后仍被轮转首选: %d 次", n)
+	}
+	if n := healthyGets.Load(); n != 5 {
+		t.Fatalf("健康副本应始终先试: %d 次", n)
+	}
+}
+
 func TestStatfsAliveOnly(t *testing.T) {
 	rc := newReadTestCluster(t, 3)
 	root := rc.m.Root().(*node)
@@ -512,6 +622,10 @@ func TestStatfsAliveOnly(t *testing.T) {
 func TestStatfsDoesNotInventCapacity(t *testing.T) {
 	var healthy atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/capabilities" {
+			json.NewEncoder(w).Encode(types.Capabilities{WritePlanning: false})
+			return
+		}
 		if !healthy.Load() {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)
 			return

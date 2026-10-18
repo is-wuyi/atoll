@@ -200,10 +200,10 @@ func TestRangeRequests(t *testing.T) {
 // parseRange 的纯函数测试。
 func TestParseRange(t *testing.T) {
 	cases := []struct {
-		in          string
-		size        int64
-		start, end  int64
-		ok          bool
+		in         string
+		size       int64
+		start, end int64
+		ok         bool
 	}{
 		{"bytes=0-0", 10, 0, 0, true},
 		{"bytes=9-", 10, 9, 9, true},
@@ -211,7 +211,7 @@ func TestParseRange(t *testing.T) {
 		{"bytes=-99", 10, 0, 9, true},
 		{"bytes=0-99", 10, 0, 9, true},
 		{"bytes=5-2", 10, 0, 0, false},
-		{"bytes=10-", 10, 0, 0, false},  // start == size
+		{"bytes=10-", 10, 0, 0, false},     // start == size
 		{"bytes=0-1,3-4", 10, 0, 0, false}, // 多区间
 		{"bytes=abc", 10, 0, 0, false},
 		{"chars=1-2", 10, 0, 0, false},
@@ -285,7 +285,8 @@ func TestPullObject(t *testing.T) {
 	}
 
 	// 目标节点：收到 pull 请求后应异步拉取。
-	_, targetTS := newTestNode(t)
+	target, targetTS := newTestNode(t)
+	configureIntegrityMaster(t, target, map[uint64][]byte{100: data}, []types.NodeInfo{{ID: 1, Addr: sourceTS.Listener.Addr().String()}})
 	// sourceTS.URL 形如 "http://127.0.0.1:PORT"，需要去掉 "http://" 前缀。
 	sourceAddr := sourceTS.URL[len("http://"):]
 	pullBody, _ := json.Marshal(map[string]any{
@@ -357,7 +358,8 @@ func TestPullVerifiesChecksum(t *testing.T) {
 	}
 	sourceAddr := sourceTS.URL[len("http://"):]
 
-	_, targetTS := newTestNode(t)
+	target, targetTS := newTestNode(t)
+	configureIntegrityMaster(t, target, map[uint64][]byte{200: data, 202: data}, []types.NodeInfo{{ID: 1, Addr: sourceAddr}})
 	pull := func(id uint64, checksum uint32) {
 		body, _ := json.Marshal(map[string]any{"inode_id": id, "source_addr": sourceAddr, "checksum": checksum})
 		resp, err := http.Post(targetTS.URL+"/pull", "application/json", bytes.NewReader(body))
@@ -387,8 +389,9 @@ func TestPullVerifiesChecksum(t *testing.T) {
 
 // /replicate 收到 CRC 头与实际字节不符（传输撕裂）必须拒绝、不落盘。
 func TestReplicateVerifiesChecksum(t *testing.T) {
-	_, ts := newTestNode(t)
+	n, ts := newTestNode(t)
 	good := []byte("replicate payload abcxyz")
+	configureIntegrityMaster(t, n, map[uint64][]byte{300: good, 301: good}, nil)
 	crc := types.CRC32C(good)
 
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/replicate/300", bytes.NewReader(good))
@@ -432,9 +435,9 @@ func TestAdminObjects(t *testing.T) {
 			t.Fatalf("PUT /objects/%s 状态码 = %d", id, resp.StatusCode)
 		}
 	}
-	put("1", []byte("aaa"))  // 3 bytes
-	put("10", []byte("bb"))  // 2 bytes
-	put("256", []byte("c"))  // 1 byte
+	put("1", []byte("aaa")) // 3 bytes
+	put("10", []byte("bb")) // 2 bytes
+	put("256", []byte("c")) // 1 byte
 
 	// 手动创建一个 .tmp-* 文件，应被跳过。
 	tmpPath := filepath.Join(n.DataDirForTest(), "objects", "01", ".tmp-fake")

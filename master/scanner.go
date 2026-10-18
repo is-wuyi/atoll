@@ -22,12 +22,13 @@ import (
 
 // Scanner 是 master 的后台扫描器，负责死亡判定、副本修复和 GC。
 type Scanner struct {
-	store      *meta.Store
-	nodeMaxAge time.Duration
-	repairIntv time.Duration
-	gcIntv     time.Duration
-	httpClient *http.Client
-	scheme     string // 出站访问节点的 URL scheme：http（默认）或 https
+	store        *meta.Store
+	nodeMaxAge   time.Duration
+	repairIntv   time.Duration
+	gcIntv       time.Duration
+	httpClient   *http.Client
+	scheme       string // 出站访问节点的 URL scheme：http（默认）或 https
+	additiveOnly bool
 
 	wg sync.WaitGroup // 后台循环生命周期，供 Wait() 优雅关闭
 
@@ -80,6 +81,10 @@ func (s *Scanner) SetTLS(cfg *tls.Config) {
 	s.httpClient.Transport = auth.HTTPTransport(tok, cfg, nil)
 	s.scheme = "https"
 }
+
+// SetAdditiveOnly leaves failed positions in place while the autonomy loop adds protection.
+// Configure before Start; existing healthy or pending copies may still be repaired in place.
+func (s *Scanner) SetAdditiveOnly(enabled bool) { s.additiveOnly = enabled }
 
 // Start 启动三个后台扫描器，ctx 取消时退出。
 func (s *Scanner) Start(ctx context.Context) {
@@ -249,6 +254,7 @@ type repairTask struct {
 	ObjectID    uint64 // 物理对象地址（ObjIDFor / ChunkObjID）；probe/pull/上报全链路用它
 	InodeID     uint64 // 元数据身份（ReplaceObjectReplica/ReplaceReplica 的 CAS 主体）
 	Generation  uint64 // 内容代（对象 CAS 拒绝过期修复）
+	Integrity   types.ObjectIntegrity
 }
 
 // planRepairs 对单个文件产出修复计划（纯函数，便于单测）。
@@ -272,7 +278,9 @@ func planRepairs(inode types.Inode, nodes []types.NodeInfo, maxAge time.Duration
 	// （27472 "单副本裸奔无人知晓" 的元数据侧根因）。
 	doneSet := make(map[uint64]bool, len(inode.DoneReplicas))
 	for _, id := range inode.DoneReplicas {
-		doneSet[id] = true
+		if !types.ContainsUint64(inode.SuspectReplicas, id) {
+			doneSet[id] = true
+		}
 	}
 	healthySeen := make(map[uint64]bool, len(inode.Replicas)) // 已计入健康的去重节点集
 	var aliveDoneAddrs []string                               // 可用源地址（去重）
@@ -426,11 +434,8 @@ func (s *Scanner) repairLegacyInode(in types.Inode, nodes []types.NodeInfo, now 
 // 退避 key 用 chunkID（staging inode 与已提交 inode 的块都修——
 // staging 的块也要保持副本数，客户端可能传得很慢）。
 func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now time.Time) {
-	// 主副本 Done 探测兜底（27348 事故）：块的 Done 标记挂在"节点查推送目标"的上报
-	// 链上；节点到 master 的 DNS/网络一抖，PUT 已成功的块就谁都没标记 →
-	// planRepairs 视为"无可用源"永远跳过，commit 409 循环到 15 分钟超时、
-	// 大文件上传整体失败。扫描时先探测副本槽位：对象在、节点活、却未标 Done → 补标。
-	// 下一轮 planRepairs 即有源，正常 pull，死锁解除。
+	// Missing receipts must not strand a completed upload without any repair source.
+	// Known checksums require node-side verification; existence alone is only legacy fallback.
 	nodeByID := make(map[uint64]types.NodeInfo, len(nodes))
 	for _, n := range nodes {
 		nodeByID[n.ID] = n
@@ -445,7 +450,7 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 			done[id] = true
 		}
 		for _, id := range c.Replicas {
-			if done[id] {
+			if done[id] || types.ContainsUint64(c.Suspect, id) {
 				continue
 			}
 			n, ok := nodeByID[id]
@@ -453,11 +458,11 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 				continue
 			}
 			chunkID := types.ChunkObjID(c, in.ID)
-			if s.probeChunkObject(n.Addr, chunkID) {
-				// 采纳式替换后对象 ID 前缀不再是文件 ID，必须按文件记录补标
-				//（MarkChunkDone 的对象 ID 反查在此处查不到已删除的 staging）。
-				_ = s.store.MarkChunkDoneAt(in.ID, c.Index, id)
-				log.Printf("inode %d chunk %d: 探测兜底——副本 %d 对象在而未标 Done，补标", in.ID, c.Index, id)
+			if c.ChecksumKnown || c.Checksum != 0 {
+				verifyReplicaAt(s.httpClient, s.scheme, n.Addr, chunkID)
+			} else if s.probeChunkObject(n.Addr, chunkID) {
+				_, _ = s.store.MarkObjectPresent(types.ObjectIntegrity{ObjectID: chunkID, InodeID: in.ID, Generation: in.Generation,
+					Chunked: true, ChunkIndex: c.Index, Size: c.Size, IntegrityEpoch: c.IntegrityEpoch}, id)
 			}
 		}
 	}
@@ -469,11 +474,12 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 		s.trackDegradedChunk(in, c, chunkID, nodes, now)
 		// 块任务以 ChunkInfo 为"迷你 inode"复用 planRepairs。
 		pseudo := types.Inode{
-			ID:           chunkID,
-			Replicas:     c.Replicas,
-			DoneReplicas: c.Done,
-			Size:         c.Size,
-			Checksum:     c.Checksum, // 供 planRepairs 把块校验和随 pull 下发给目标节点
+			ID:              chunkID,
+			Replicas:        c.Replicas,
+			DoneReplicas:    c.Done,
+			SuspectReplicas: c.Suspect,
+			Size:            c.Size,
+			Checksum:        c.Checksum, // 供 planRepairs 把块校验和随 pull 下发给目标节点
 		}
 		tasks := planRepairs(pseudo, nodes, s.nodeMaxAge)
 		if len(tasks) == 0 {
@@ -491,6 +497,9 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 		}
 		s.bumpRepairBackoff(chunkID)
 		for _, t := range tasks {
+			t.Integrity = types.ObjectIntegrity{ObjectID: chunkID, InodeID: in.ID, Generation: in.Generation,
+				Chunked: true, ChunkIndex: c.Index, Size: c.Size, Checksum: c.Checksum,
+				ChecksumKnown: c.ChecksumKnown || c.Checksum != 0, IntegrityEpoch: c.IntegrityEpoch}
 			s.executeChunkRepair(chunkID, in.ID, c.Index, t)
 		}
 	}
@@ -567,12 +576,22 @@ func (s *Scanner) executeChunkRepair(chunkID, inodeID uint64, index int, t repai
 	case repairSkipNoTarget:
 		log.Printf("inode %d chunk %d: 无合格新目标（dead node %d），跳过", inodeID, index, t.OldNodeID)
 	case repairReplaceDead:
+		if s.additiveOnly {
+			return
+		}
 		if !s.probeSource(t.SourceAddr, chunkID) {
 			log.Printf("inode %d chunk %d: 源 %s 上对象缺失（404），跳过修复", inodeID, index, t.SourceAddr)
 			return
 		}
-		if err := s.store.ReplaceChunkReplica(inodeID, index, t.OldNodeID, t.NewNodeID); err != nil {
-			if errors.Is(err, meta.ErrNotExist) || errors.Is(err, meta.ErrChunkNotExist) || errors.Is(err, meta.ErrReplicaDup) {
+		if t.Integrity.ObjectID == 0 {
+			var err error
+			t.Integrity, err = s.store.ObjectIntegrity(chunkID)
+			if err != nil || t.Integrity.InodeID != inodeID || t.Integrity.ChunkIndex != index {
+				return
+			}
+		}
+		if err := s.store.ReplaceChunkReplicaIfCurrent(t.Integrity, t.OldNodeID, t.NewNodeID); err != nil {
+			if errors.Is(err, meta.ErrNotExist) || errors.Is(err, meta.ErrChunkNotExist) || errors.Is(err, meta.ErrReplicaDup) || errors.Is(err, meta.ErrObjectChanged) {
 				return // 文件/块被并发删除 / 候选已是副本（下轮换一个），静默跳过
 			}
 			log.Printf("inode %d chunk %d: ReplaceChunkReplica 失败: %v", inodeID, index, err)
@@ -616,6 +635,9 @@ func (s *Scanner) executeRepair(t repairTask) {
 	case repairSkipNoTarget:
 		log.Printf("inode %d slot %d: 无合格新目标（dead node %d），跳过", t.InodeID, t.SlotIdx, t.OldNodeID)
 	case repairReplaceDead:
+		if s.additiveOnly {
+			return
+		}
 		// 先探源：源上对象已丢失（404）时，换目标 + 重拉只会永远失败，
 		// 白白 churn 元数据与流量——跳过并保持退避，等源恢复或人工介入。
 		if !s.probeSource(t.SourceAddr, objectID) {
@@ -625,7 +647,7 @@ func (s *Scanner) executeRepair(t repairTask) {
 		// 副本槽位替换：新对象布局按 (FileID, ObjectID, Generation) CAS——
 		// 修复期间文件被覆盖时 Generation 已变，过期替换被拒，绝不改错版本。
 		var err error
-		if t.Generation != 0 && t.ObjectID >= types.ObjectIDBase {
+		if t.ObjectID != 0 {
 			err = s.store.ReplaceObjectReplica(t.InodeID, t.ObjectID, t.Generation, t.OldNodeID, t.NewNodeID)
 		} else {
 			err = s.store.ReplaceReplica(t.InodeID, t.OldNodeID, t.NewNodeID)
@@ -848,6 +870,10 @@ func (s *Scanner) runGC(execute bool) ([]GCNodeReport, error) {
 // sweepStaging 清扫超时 staging inode（客户端崩溃残留）：
 // 删 staging 元数据 + 通知节点回收已落盘的块。TTL 默认 24h。
 func (s *Scanner) sweepStaging() {
+	if _, err := s.store.ExpirePlannedWrites(time.Now()); err != nil {
+		log.Printf("planned write expiry: %v", err)
+		return
+	}
 	var expired []types.Inode
 	if err := s.store.ForEachStaging(func(in types.Inode) error {
 		if time.Since(in.Mtime) > s.stagingTTL {
@@ -860,6 +886,9 @@ func (s *Scanner) sweepStaging() {
 	}
 	for _, in := range expired {
 		if err := s.store.AbortStaging(in.ID); err != nil {
+			if errors.Is(err, meta.ErrWritePlanRequired) {
+				continue
+			}
 			log.Printf("staging 清扫: 回收 %d 失败: %v", in.ID, err)
 			continue
 		}

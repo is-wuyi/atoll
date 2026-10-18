@@ -40,6 +40,16 @@ type Mount struct {
 	tlsCfg   *tls.Config  // 读句柄直连节点的 TLS 配置（nil = 普通 HTTP）
 	readHTTP *http.Client // 读句柄共享的 HTTP 客户端（连接池复用；此前每次 Open 新建）
 
+	// chunkVerifySem 限制跨所有 chunked 读句柄同时进行的整块校验读取数（每个在飞
+	// 校验至多缓冲 ChunkSize+1 字节），校验飞行内存有界，见 chunk_read_handle.go。
+	chunkVerifySem chan struct{}
+	// chunkCache 是 Mount 级共享的已校验整块缓存：全局字节预算有界（不随句柄数放大），
+	// LRU 淘汰 + 跨句柄 singleflight，见 chunk_read_handle.go。
+	chunkCache *mountChunkCache
+	// verifyHTTP 整块校验 GET 专用：与 readHTTP 共享同一 Transport（连接池复用），
+	// 无全程 Timeout——deadline 由按字节数缩放的 per-request ctx 给（chunkVerifyTimeout）。
+	verifyHTTP *http.Client
+
 	// NoSmallPath 测试钩子：禁用小文件单请求通道，强制走 chunked/流式路径。
 	// 专测分块/流式机制的测试用（真实负载恒为 false）。
 	NoSmallPath bool
@@ -83,23 +93,64 @@ func NewWithToken(c *client.Client, cacheDir string, replicas int, token auth.To
 }
 
 // NewWithTLS 创建带认证 + TLS 的挂载会话。tlsCfg 为空等价于 NewWithToken。
+//
+// secure 会话客户端（NewSecure 创建）下，读句柄的节点直连请求不复用 auth.HTTPTransport
+// （静态 token 会无差别发往节点、且完全绕过 client 的票据协议）：统一换用
+// client.ObjectTransport() 共享的 secure transport——节点 GET 自动向 master 换短期
+// 票据，用户会话绝不外发；重定向一律拒跨源。30s 全程 Timeout / verify 的 ctx deadline
+// 语义保持不变。
 func NewWithTLS(c *client.Client, cacheDir string, replicas int, token auth.Token, tlsCfg *tls.Config) (*Mount, error) {
+	if _, err := c.WritePlanning(context.Background()); err != nil {
+		return nil, fmt.Errorf("discover write protocol: %w", err)
+	}
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
-	return &Mount{
-		client:    c,
-		replicas:  replicas,
-		cacheDir:  cacheDir,
-		token:     token,
-		tlsCfg:    tlsCfg,
-		readHTTP:  &http.Client{Timeout: 30 * time.Second, Transport: auth.HTTPTransport(token, tlsCfg, nil)},
-		writes:    make(map[string]*writeHandle),
-		attrTTL:   2 * time.Second,
-		attrs:     make(map[string]attrCacheEntry),
-		inoByPath: make(map[string]uint64),
-		nextIno:   localInoBase,
-	}, nil
+	// 两个 Client 共享同一 Transport（连接池一处复用）：readHTTP 有 30s 全程 Timeout
+	// 服务 Range/小请求，verifyHTTP 无全程 Timeout、deadline 按整块字节数缩放。
+	var readTransport http.RoundTripper = auth.HTTPTransport(token, tlsCfg, nil)
+	secure := false
+	if ot := c.ObjectTransport(); ot != nil {
+		readTransport = ot
+		secure = true
+	}
+	readHTTP := &http.Client{Timeout: 30 * time.Second, Transport: readTransport}
+	verifyHTTP := &http.Client{Transport: readTransport}
+	if secure {
+		// 30x 不得把请求（连带票据/数据）引到其它主机（secure client 的 c.HTTP 同规）。
+		readHTTP.CheckRedirect = client.SecureRedirectPolicy
+		verifyHTTP.CheckRedirect = client.SecureRedirectPolicy
+	}
+	// secure 模式禁用已校验块缓存（预算 0，singleflight 保留）：缓存命中会绕过
+	// master 对每次节点读的在线权限裁决——每次读重新取票据即重新鉴权，权限回收后
+	// 新网络请求立即被拒。已读进内核页缓存的字节不可撤（文档既定边界），fd 语义不动。
+	cacheBytes := int64(defaultChunkCacheBytes)
+	if secure {
+		cacheBytes = 0
+	}
+	m := &Mount{
+		client:         c,
+		replicas:       replicas,
+		cacheDir:       cacheDir,
+		token:          token,
+		tlsCfg:         tlsCfg,
+		readHTTP:       readHTTP,
+		chunkVerifySem: make(chan struct{}, chunkVerifyInFlight),
+		chunkCache:     newMountChunkCache(cacheBytes),
+		verifyHTTP:     verifyHTTP,
+		writes:         make(map[string]*writeHandle),
+		attrTTL:        2 * time.Second,
+		attrs:          make(map[string]attrCacheEntry),
+		inoByPath:      make(map[string]uint64),
+		nextIno:        localInoBase,
+	}
+	if secure {
+		// secure 模式关掉小文件单请求通道：非空上传统一走 chunked（节点 PUT 持票据，
+		// master 对 /objects/* 数据面按 ObjectID/ACL 裁决），不再把数据面 body 交给
+		// master 代理，票据 body 绑定面也更小。PutSmall 接口保留给直接调用方。
+		m.NoSmallPath = true
+	}
+	return m, nil
 }
 
 // lookupCached 查路径 inode，命中未过期缓存则直接返回，否则打 master 并回填。
@@ -461,21 +512,25 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 		for _, r := range reps {
 			addr[r.ID] = r.Addr
 		}
-		if len(addr) == 0 {
+		if len(addr) == 0 && in.Size != 0 {
 			return nil, 0, syscall.EIO
 		}
 		return &chunkedReadHandle{
-			ino:    in.ID,
-			size:   in.Size,
-			chunks: in.Chunks,
-			addr:   addr,
-			next:   make(map[int]int),
-			http:   hc,
-			scheme: scheme,
+			ino:        in.ID,
+			size:       in.Size,
+			generation: in.Generation,
+			chunks:     in.Chunks,
+			addr:       addr,
+			next:       make(map[int]int),
+			http:       hc,
+			scheme:     scheme,
+			m:          n.m,
 		}, 0, 0
 	}
-	cands := candidateReplicas(reps)
-	if len(cands) == 0 {
+	healthy, suspects := candidateReplicas(reps, in.SuspectReplicas)
+	// 0 字节文件（secure /auth/files/empty 建档）无副本节点也无数据对象：Read 在
+	// off>=size 即 EOF，绝不触网——空候选列表合法。非空文件零副本才是元数据故障。
+	if len(healthy) == 0 && len(suspects) == 0 && in.Size != 0 {
 		return nil, 0, syscall.EIO
 	}
 	return &readHandle{
@@ -487,7 +542,8 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 		size:       in.Size,
 		checksum:   in.Checksum,
 		generation: in.Generation,
-		cands:      cands,
+		cands:      healthy,
+		suspects:   suspects,
 		http:       hc,
 		scheme:     scheme,
 		m:          n.m,
@@ -608,19 +664,24 @@ func (n *node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
 	return 0
 }
 
-// candidateReplicas 从副本列表构造读取候选：done 优先，组内随机打散做负载均衡。
-// 保留节点 ID（读端发现内容损坏时上报自愈用）。
-func candidateReplicas(reps []client.Replica) []client.Replica {
+// candidateReplicas 拆分副本读取候选：healthy 为健康副本（done 在前、组内随机打散
+// 做负载均衡），suspects 为 master 标记内容待修的副本（固定殿后兜底，不参与轮转，
+// 保证轮转永远不会把请求直接带进 suspect 段）。保留节点 ID（读端发现内容损坏时
+// 上报自愈用）。
+func candidateReplicas(reps []client.Replica, suspect []uint64) (healthy, suspects []client.Replica) {
 	var done, pending []client.Replica
 	for _, r := range reps {
-		if r.Done {
+		if types.ContainsUint64(suspect, r.ID) {
+			suspects = append(suspects, r)
+		} else if r.Done {
 			done = append(done, r)
 		} else {
 			pending = append(pending, r)
 		}
 	}
 	rand.Shuffle(len(done), func(i, j int) { done[i], done[j] = done[j], done[i] })
-	return append(done, pending...)
+	healthy = append(done, pending...)
+	return healthy, suspects
 }
 
 // mapErrno 把 client 错误映射为 errno。
@@ -666,6 +727,9 @@ func mapErrno(err error) syscall.Errno {
 //
 // 其余错误（网络失败、5xx 可重试、旧 master 未实现该通道的 404/405/501）不禁止回退。
 func smallConflictErrno(err error) (syscall.Errno, bool) {
+	if client.IsPlannedWriteError(err) {
+		return mapErrno(err), true
+	}
 	var he *client.HTTPError
 	if !errors.As(err, &he) {
 		return 0, false
@@ -681,126 +745,9 @@ func smallConflictErrno(err error) (syscall.Errno, bool) {
 	return 0, false
 }
 
-// ---- 分块读句柄：按块表定位 → 块内 Range 读取 ----
-
-// chunkedReadHandle 分块文件的流式读句柄。
-// offset → (块 index, 块内偏移) 的换算由块表顺序推累计基址；
-// 每个块的候选节点：Done 副本优先、组内随机打散（打开时预排，读时轮换故障转移）。
-type chunkedReadHandle struct {
-	ino    uint64
-	size   int64
-	chunks []types.ChunkInfo
-	addr   map[uint64]string // 节点 ID → 地址（lookup 的地址表）
-	next   map[int]int       // 块 index → 下一个候选起点（读时记忆可用节点）
-	http   *http.Client
-	scheme string
-	mu     sync.Mutex
-}
-
-var _ fs.FileReader = (*chunkedReadHandle)(nil)
-
-// readChunkRange 读块的 [start, end] 闭区间；失败在该块候选节点间轮换。
-func (ch *chunkedReadHandle) readChunkRange(c types.ChunkInfo, start, end int64) ([]byte, syscall.Errno) {
-	want := end - start + 1
-	// done 优先、组内打散（与 candidateAddrs 同语义，但面向节点 ID）。
-	var primary, pending []uint64
-	for _, id := range c.Replicas {
-		if len(c.Done) > 0 && types.ContainsUint64(c.Done, id) {
-			primary = append(primary, id)
-		} else {
-			pending = append(pending, id)
-		}
-	}
-	rand.Shuffle(len(primary), func(i, j int) { primary[i], primary[j] = primary[j], primary[i] })
-	candidates := append(append([]uint64{}, primary...), pending...)
-
-	chunkID := types.ChunkObjID(c, ch.ino) // v2 块表自描述 ID 优先（采纳式替换后不可派生）
-	ch.mu.Lock()
-	next := ch.next[c.Index]
-	ch.mu.Unlock()
-
-	var lastErr error
-	for i := 0; i < len(candidates); i++ {
-		id := candidates[(next+i)%len(candidates)]
-		a, ok := ch.addr[id]
-		if !ok || a == "" {
-			lastErr = fmt.Errorf("节点 %d 地址未知", id)
-			continue
-		}
-		req, err := http.NewRequest(http.MethodGet,
-			fmt.Sprintf("%s://%s/objects/%d", ch.scheme, a, chunkID), nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-		resp, err := ch.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("node %s: status %d", a, resp.StatusCode)
-			continue
-		}
-		buf := make([]byte, want)
-		n, err := io.ReadFull(resp.Body, buf)
-		resp.Body.Close()
-		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-			lastErr = err
-			continue
-		}
-		ch.mu.Lock()
-		ch.next[c.Index] = (next + i + 1) % len(candidates)
-		ch.mu.Unlock()
-		return buf[:n], 0
-	}
-	_ = lastErr
-	return nil, syscall.EIO
-}
-
-// Read 读取 [off, off+len(dest)) ：按块表顺序切分，逐块发 Range，跨块自动循环。
-func (ch *chunkedReadHandle) Read(_ context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	if off >= ch.size {
-		return fuse.ReadResultData(nil), 0 // EOF
-	}
-	end := off + int64(len(dest)) - 1
-	if end >= ch.size {
-		end = ch.size - 1
-	}
-	// 定位起始块：块表按 Index 升序，块基址 = Σ前序块大小。
-	var base int64
-	idx := 0
-	for i, c := range ch.chunks {
-		if off < base+c.Size {
-			idx = i
-			break
-		}
-		base += c.Size
-	}
-	// 逐块读取拼装（dest 一次 Read 最多跨若干块）。
-	out := make([]byte, 0, end-off+1)
-	cur := off
-	for cur <= end && idx < len(ch.chunks) {
-		c := ch.chunks[idx]
-		chunkStart := cur - base            // 块内偏移（cur 是绝对偏移）
-		chunkEnd := min(end-base, c.Size-1) // 同为块内偏移：end 绝对 → 相对
-		n := chunkEnd - chunkStart + 1
-		data, errno := ch.readChunkRange(c, chunkStart, chunkEnd)
-		if errno != 0 {
-			return nil, errno
-		}
-		if int64(len(data)) != n {
-			return nil, syscall.EIO // 块数据不完整（大小与块表不符）
-		}
-		out = append(out, data...)
-		cur += n
-		base += c.Size
-		idx++
-	}
-	return fuse.ReadResultData(out), 0
-}
+// ---- 分块读句柄：实现见 chunk_read_handle.go ----
+// （整块校验 + per-Mount 有界缓存 + 严格 legacy Range；此前 readChunkRange 对
+// 200/206 一律接受、不验 Content-Range/CRC 的缺陷在该文件修复。）
 
 // ---- 写句柄：本地缓冲 + 流式分块上传 ----
 //
@@ -812,16 +759,17 @@ func (ch *chunkedReadHandle) Read(_ context.Context, dest []byte, off int64) (fu
 // Flush 走旧的整传路径（复用覆盖写原子换名），不值得为罕见场景拆块。
 
 type writeHandle struct {
-	m       *Mount
-	remote  string
-	local   string
-	f       *os.File
-	mu      sync.Mutex
-	dirty   bool
-	created bool // 经 Create 新建：即使 0 字节也要上传（否则 Finder 建的空占位文件凭空消失→-43）
-	dropped bool
-	refs    int   // 引用计数：并发写同一路径共享一个句柄，最后一个 Release 才清理
-	size    int64 // 缓冲的逻辑大小；attr 在本地文件已被删/关时用它兜底，避免误报 0 字节
+	m          *Mount
+	remote     string
+	local      string
+	f          *os.File
+	mu         sync.Mutex
+	dirty      bool
+	created    bool // 经 Create 新建：即使 0 字节也要上传（否则 Finder 建的空占位文件凭空消失→-43）
+	dropped    bool
+	plannedErr error
+	refs       int   // 引用计数：并发写同一路径共享一个句柄，最后一个 Release 才清理
+	size       int64 // 缓冲的逻辑大小；attr 在本地文件已被删/关时用它兜底，避免误报 0 字节
 
 	// 流式上传会话（仅新建/截断写入时启用；trunc=false 就地编辑为 nil 走旧整传）。
 	// 整块从本地缓冲文件按"连续写入水位"读出后推入，对 FUSE 并发/乱序写鲁棒
@@ -860,7 +808,13 @@ func (w *writeHandle) Read(_ context.Context, dest []byte, off int64) (fuse.Read
 // 多写者交错让"连续写入水位"不再可靠，故降级为 Flush 整传；已推 staging 块由 GC/TTL 回收。
 func (w *writeHandle) dropStreamingLocked() {
 	if w.stream != nil {
+		if err := w.stream.Err(); w.plannedErr == nil && client.IsPlannedWriteError(err) {
+			w.plannedErr = err
+		}
 		_ = w.stream.Close()
+		if err := w.stream.Err(); w.plannedErr == nil && client.IsPlannedWriteError(err) {
+			w.plannedErr = err
+		}
 		w.stream = nil
 	}
 	w.streamOn = false
@@ -956,6 +910,13 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 	if w.dropped {
 		return 0, syscall.EIO // 句柄已被 Unlink/Release 丢弃：拒绝对已关闭 fd 写入
 	}
+	if w.plannedErr != nil {
+		return 0, mapErrno(w.plannedErr)
+	}
+	if w.stream != nil && client.IsPlannedWriteError(w.stream.Err()) {
+		w.plannedErr = w.stream.Err()
+		return 0, mapErrno(w.plannedErr)
+	}
 	n, err := w.f.WriteAt(data, off)
 	if err != nil {
 		return 0, syscall.EIO
@@ -967,9 +928,10 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 	// 回写到"已作为整块推送过"的区域（off < sentIdx）：推出去的块内容已过期、且无法
 	// 重推 → 放弃流式，回退整传（Flush 从完整本地文件重传），绝不提交旧数据。
 	if w.streamOn && w.stream != nil && off < w.sentIdx {
-		_ = w.stream.Close()
-		w.stream = nil
-		w.streamOn = false
+		w.dropStreamingLocked()
+		if w.plannedErr != nil {
+			return 0, mapErrno(w.plannedErr)
+		}
 		return uint32(n), 0
 	}
 	if !w.streamOn {
@@ -1003,7 +965,10 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 	// 小文件留给 Flush 单请求提交；整块可推送时才需要远端会话。
 	if w.stream == nil && w.contigEnd >= types.ChunkSize && (w.m.NoSmallPath || w.size > types.SmallFileMax) {
 		if err := w.startStream(); err != nil {
-			return 0, syscall.EIO
+			if client.IsPlannedWriteError(err) {
+				w.plannedErr = err
+			}
+			return 0, mapErrno(err)
 		}
 	}
 	// 连续区每够一整块，从文件读出推入（并发 ≤2，满则在此背压等待）。
@@ -1014,7 +979,10 @@ func (w *writeHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 				return 0, syscall.EIO
 			}
 			if err := w.stream.Push(blk); err != nil {
-				return 0, syscall.EIO
+				if client.IsPlannedWriteError(err) {
+					w.plannedErr = err
+				}
+				return 0, mapErrno(err)
 			}
 			w.sentIdx += types.ChunkSize
 		}
@@ -1031,6 +999,13 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	if (!w.dirty && !w.created) || w.dropped {
 		return 0
 	}
+	if w.plannedErr != nil {
+		return mapErrno(w.plannedErr)
+	}
+	if w.stream != nil && client.IsPlannedWriteError(w.stream.Err()) {
+		w.plannedErr = w.stream.Err()
+		return mapErrno(w.plannedErr)
+	}
 	st, err := w.f.Stat()
 	if err != nil {
 		return syscall.EIO
@@ -1040,11 +1015,10 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 	// 客户端 1 次往返（对比流式/整传的 4-5 次）。先放弃流式会话（未推块，abort 无副作用）；
 	// 失败则落回下方通用路径重试（网络抖动不放弃写入）。
 	if !w.m.NoSmallPath && st.Size() > 0 && st.Size() <= types.SmallFileMax {
-		if w.stream != nil {
-			_ = w.stream.Close()
-			w.stream = nil
+		w.dropStreamingLocked()
+		if w.plannedErr != nil {
+			return mapErrno(w.plannedErr)
 		}
-		w.streamOn = false
 		data, rerr := os.ReadFile(w.local)
 		if rerr == nil {
 			if _, serr := w.m.client.PutSmall(w.remote, data, w.m.replicas, true); serr == nil {
@@ -1053,6 +1027,9 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 				w.m.attrInvalidate(w.remote)
 				return 0
 			} else if errno, blocked := smallConflictErrno(serr); blocked {
+				if client.IsPlannedWriteError(serr) {
+					w.plannedErr = serr
+				}
 				return errno
 			}
 		}
@@ -1066,27 +1043,33 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 		if size == 0 {
 			// 0 字节文件（如 Finder 的空占位）：放弃流式会话，走下方整传的
 			// 0 字节路径提交（提交 0 块的 chunked staging 语义不稳，避开）。
-			_ = w.stream.Close()
-			w.stream = nil
-			w.streamOn = false
+			w.dropStreamingLocked()
+			if w.plannedErr != nil {
+				return mapErrno(w.plannedErr)
+			}
 		} else if w.contigEnd < size {
 			// 文件尾部存在未连续覆盖的空洞（乱序/稀疏写未闭合）：放弃流式、
 			// 回退到下方整传路径，从完整的本地文件重传，保证正确性。
-			_ = w.stream.Close()
-			w.stream = nil
-			w.streamOn = false
+			w.dropStreamingLocked()
+			if w.plannedErr != nil {
+				return mapErrno(w.plannedErr)
+			}
 		} else {
 			var tail []byte
 			if size > w.sentIdx { // [sentIdx, size) 必 < 一整块（WRITE 已推完所有整块）
 				tail = make([]byte, size-w.sentIdx)
 				if _, err := w.f.ReadAt(tail, w.sentIdx); err != nil && err != io.EOF {
-					w.stream = nil
+					w.plannedErr = err
+					w.dropStreamingLocked()
 					return syscall.EIO
 				}
 			}
 			if err := w.stream.Finish(tail, size); err != nil {
+				if client.IsPlannedWriteError(err) {
+					w.plannedErr = err
+				}
 				w.stream = nil
-				return syscall.EIO
+				return mapErrno(err)
 			}
 			w.stream = nil
 			w.streamOn = false
@@ -1116,7 +1099,10 @@ func (w *writeHandle) Flush(_ context.Context) syscall.Errno {
 		err2 = w.m.client.PutReaderOverwrite(w.remote, st.Size(), w.f, w.m.replicas, true)
 	}
 	if err2 != nil {
-		return syscall.EIO
+		if client.IsPlannedWriteError(err2) {
+			w.plannedErr = err2
+		}
+		return mapErrno(err2)
 	}
 	w.dirty = false
 	w.created = false // 已上传一次，后续 Flush 只在再次 dirty 时重传
@@ -1186,12 +1172,10 @@ func (w *writeHandle) truncate(size uint64) syscall.Errno {
 	// Finder 的 close 拖超时（「设备已消失」）。因此：只有截断到"已推整块之下"才
 	// 真冲突（会孤立已推块），才放弃流式回退整传；否则保留流式，按新大小夹逼水位。
 	if w.stream != nil && sz < w.sentIdx {
-		_ = w.stream.Close() // abort 本轮 staging
-		w.stream = nil
-		w.streamOn = false
-		w.sentIdx = 0
-		w.contigEnd = 0
-		w.ooo = nil
+		w.dropStreamingLocked()
+		if w.plannedErr != nil {
+			return mapErrno(w.plannedErr)
+		}
 	} else if w.streamOn && sz < w.contigEnd {
 		w.contigEnd = sz
 		for k := range w.ooo {

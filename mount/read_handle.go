@@ -23,7 +23,8 @@ type readHandle struct {
 	size       int64
 	checksum   uint32
 	generation uint64
-	cands      []client.Replica
+	cands      []client.Replica // 健康副本段（轮转只在此段内进行）
+	suspects   []client.Replica // master 标记待修的副本段：固定殿后兜底，不参与轮转
 	http       *http.Client
 	scheme     string
 	m          *Mount
@@ -90,43 +91,93 @@ func (rh *readHandle) reportSuspect(nodeID uint64) {
 }
 
 func (rh *readHandle) fetchWholeVerified(ctx context.Context) ([]byte, syscall.Errno) {
+	if rh.size <= 0 || rh.size > types.ChunkSize {
+		return nil, syscall.EIO // 坏元数据：make(rh.size+1) 前拒绝
+	}
+	// 整对象 GET 用无全程 Timeout 的共享 Transport 客户端，deadline 按字节数缩放；
+	// 无 Mount 的测试句柄退回 rh.http。
+	httpClient := rh.http
+	if rh.m != nil && rh.m.verifyHTTP != nil {
+		httpClient = rh.m.verifyHTTP
+	}
 	start := rh.candidateStart()
+	buf := make([]byte, rh.size+1) // 多读 1 字节探测超长；复用于所有候选
+	try := func(r client.Replica) ([]byte, bool) {
+		attemptCtx, cancel := context.WithTimeout(ctx, chunkVerifyTimeoutFn(rh.size))
+		defer cancel()
+		req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet,
+			fmt.Sprintf("%s://%s/objects/%d", rh.scheme, r.Addr, rh.objectID()), nil)
+		if err != nil {
+			return nil, false
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, false
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, false
+		}
+		n, err := io.ReadFull(resp.Body, buf)
+		resp.Body.Close()
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			return nil, false // 传输中断不等于损坏：不误报
+		}
+		if int64(n) != rh.size || types.CRC32C(buf[:n]) != rh.checksum {
+			rh.reportSuspect(r.ID)
+			return nil, false
+		}
+		return buf[:n], true
+	}
 	for i := range rh.cands {
 		if ctx.Err() != nil {
 			return nil, syscall.EINTR
 		}
 		index := (start + i) % len(rh.cands)
-		r := rh.cands[index]
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-			fmt.Sprintf("%s://%s/objects/%d", rh.scheme, r.Addr, rh.objectID()), nil)
-		if err != nil {
-			continue
+		if data, ok := try(rh.cands[index]); ok {
+			rh.rememberCandidate(index) // 轮转只记健康段；suspect 成功不改基准
+			return data, 0
 		}
-		resp, err := rh.http.Do(req)
-		if err != nil {
-			continue
+	}
+	for _, r := range rh.suspects { // 健康全败才试
+		if ctx.Err() != nil {
+			return nil, syscall.EINTR
 		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			continue
+		if data, ok := try(r); ok {
+			return data, 0
 		}
-		// 多读一字节以检测超长响应，同时限制不可信节点的内存占用。
-		data, err := io.ReadAll(io.LimitReader(resp.Body, rh.size+1))
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-		if int64(len(data)) != rh.size || types.CRC32C(data) != rh.checksum {
-			rh.reportSuspect(r.ID)
-			continue
-		}
-		rh.rememberCandidate(index)
-		return data, 0
 	}
 	if ctx.Err() != nil {
 		return nil, syscall.EINTR
 	}
 	return nil, syscall.EIO
+}
+
+// loadVerified 返回整对象已校验数据：Mount 级共享缓存 + singleflight（跨句柄合并、
+// 字节预算与在飞校验数有界）。release 必须在 copy-out 完成后调用：校验 permit 覆盖
+// fetch 与 copy-out，已校验数据在被消费前始终计入在飞预算；命中缓存快路径的
+// release 为 no-op。无 Mount（测试直接构造句柄）退化为句柄内缓存、permit no-op。
+func (rh *readHandle) loadVerified(ctx context.Context) ([]byte, syscall.Errno, func()) {
+	if rh.m == nil || rh.m.chunkCache == nil {
+		data, errno := rh.loadSmall(ctx)
+		return data, errno, func() {}
+	}
+	key := chunkCacheKey{obj: rh.objectID(), size: rh.size, crc: rh.checksum}
+	if data, ok := rh.m.chunkCache.get(key); ok {
+		return data, 0, func() {}
+	}
+	release, errno := rh.m.acquireVerify(ctx)
+	if errno != 0 {
+		return nil, errno, nil
+	}
+	data, errno := rh.m.chunkCache.load(ctx, key, func(ctx context.Context) ([]byte, syscall.Errno) {
+		return rh.fetchWholeVerified(ctx)
+	})
+	if errno != 0 {
+		release()
+		return nil, errno, nil
+	}
+	return data, 0, release
 }
 
 // 同一句柄并发首次读取共用一次请求；失败不缓存，等待者可以取消。
@@ -166,37 +217,50 @@ func (rh *readHandle) loadSmall(ctx context.Context) ([]byte, syscall.Errno) {
 func (rh *readHandle) readRange(ctx context.Context, start, end int64) ([]byte, syscall.Errno) {
 	want := end - start + 1
 	next := rh.candidateStart()
-	for i := range rh.cands {
-		if ctx.Err() != nil {
-			return nil, syscall.EINTR
-		}
-		// 起点在本次请求内固定，其他并发读不能令本轮重复访问同一副本。
-		index := (next + i) % len(rh.cands)
-		r := rh.cands[index]
+	buf := make([]byte, want+1) // 多读 1 字节探测超长；复用于所有候选
+	try := func(r client.Replica) ([]byte, bool) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 			fmt.Sprintf("%s://%s/objects/%d", rh.scheme, r.Addr, rh.objectID()), nil)
 		if err != nil {
-			continue
+			return nil, false
 		}
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 		resp, err := rh.http.Do(req)
 		if err != nil {
-			continue
+			return nil, false
 		}
 		validRange := resp.StatusCode == http.StatusPartialContent &&
 			resp.Header.Get("Content-Range") == fmt.Sprintf("bytes %d-%d/%d", start, end, rh.size)
 		wholeObject := resp.StatusCode == http.StatusOK && start == 0 && want == rh.size
 		if !validRange && !wholeObject {
 			resp.Body.Close()
-			continue
+			return nil, false
 		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, want+1))
+		n, err := io.ReadFull(resp.Body, buf)
 		resp.Body.Close()
-		if err != nil || int64(len(data)) != want {
-			continue
+		if (err != nil && err != io.EOF && err != io.ErrUnexpectedEOF) || int64(n) != want {
+			return nil, false
 		}
-		rh.rememberCandidate(index)
-		return data, 0
+		return buf[:want], true
+	}
+	// 起点在本次请求内固定；轮转只在健康段内，suspect 段固定殿后兜底。
+	for i := range rh.cands {
+		if ctx.Err() != nil {
+			return nil, syscall.EINTR
+		}
+		index := (next + i) % len(rh.cands)
+		if data, ok := try(rh.cands[index]); ok {
+			rh.rememberCandidate(index)
+			return data, 0
+		}
+	}
+	for _, r := range rh.suspects {
+		if ctx.Err() != nil {
+			return nil, syscall.EINTR
+		}
+		if data, ok := try(r); ok {
+			return data, 0
+		}
 	}
 	if ctx.Err() != nil {
 		return nil, syscall.EINTR
@@ -215,12 +279,23 @@ func (rh *readHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Re
 		return nil, syscall.EINTR
 	}
 	count := min(int64(len(dest)), rh.size-off)
-	if rh.size <= types.SmallFileMax && rh.checksum != 0 {
-		data, errno := rh.loadSmall(ctx)
+	// 已知 checksum 且对象 ≤ ChunkSize：整对象校验读取（在飞内存界 chunkVerifyInFlight
+	// × (ChunkSize+1)，Mount 共享缓存跨句柄复用）。已知判定：v2 显式对象（objID ≥
+	// ObjectIDBase）的 CRC 恰为 0 也算已记录；v1 旧数据的 0 = 未记录。更大的 legacy
+	// 整对象（v1 遗留，新写入全部 chunked）明确放弃内容校验走严格 Range——整块校验
+	// 需缓冲整对象，超过 ChunkSize 会突破在飞内存界。
+	known := rh.checksum != 0 || rh.objID >= types.ObjectIDBase
+	if known && rh.size <= types.ChunkSize {
+		data, errno, release := rh.loadVerified(ctx)
 		if errno != 0 {
 			return nil, errno
 		}
+		if int64(len(data)) != rh.size {
+			release()
+			return nil, syscall.EIO // 防御：整块校验路径保证长度
+		}
 		copy(dest, data[off:off+count])
+		release() // copy-out 完成：校验 permit 归还
 		return fuse.ReadResultData(dest[:count]), 0
 	}
 	data, errno := rh.readRange(ctx, off, off+count-1)

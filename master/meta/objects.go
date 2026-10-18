@@ -25,16 +25,18 @@ var ErrObjectChanged = fmt.Errorf("%w: content object changed", ErrCommitFailed)
 
 // ObjectRecord also protects reserved uploads from GC before their inode is published.
 type ObjectRecord struct {
-	ID         uint64           `json:"id"`
-	FileID     uint64           `json:"file_id,omitempty"`
-	Generation uint64           `json:"generation,omitempty"`
-	State      string           `json:"state"`
-	Size       int64            `json:"size"`
-	Checksum   uint32           `json:"checksum"`
-	Replicas   []uint64         `json:"replicas"`
-	Done       []uint64         `json:"done,omitempty"`
-	ExpiresAt  time.Time        `json:"expires_at,omitempty"`
-	Target     *SmallFileTarget `json:"target,omitempty"`
+	ID             uint64           `json:"id"`
+	FileID         uint64           `json:"file_id,omitempty"`
+	Generation     uint64           `json:"generation,omitempty"`
+	State          string           `json:"state"`
+	Size           int64            `json:"size"`
+	Checksum       uint32           `json:"checksum"`
+	Replicas       []uint64         `json:"replicas"`
+	Done           []uint64         `json:"done,omitempty"`
+	Suspect        []uint64         `json:"suspect,omitempty"`
+	IntegrityEpoch uint64           `json:"integrity_epoch,omitempty"`
+	ExpiresAt      time.Time        `json:"expires_at,omitempty"`
+	Target         *SmallFileTarget `json:"target,omitempty"`
 }
 
 type SmallFileTarget struct {
@@ -248,7 +250,12 @@ func (s *Store) CommitSmallFile(objectID uint64) (types.Inode, types.Inode, bool
 		out.ObjID, out.Chunked, out.Chunks = obj.ID, false, nil
 		out.Size, out.Checksum, out.Mtime = t.Size, t.Checksum, t.Mtime
 		out.Replicas = append([]uint64(nil), obj.Replicas...)
+		if types.ContainsUint64(obj.Suspect, t.PrimaryID) {
+			return ErrCommitFailed
+		}
 		out.DoneReplicas = appendUnique(append([]uint64(nil), obj.Done...), t.PrimaryID)
+		out.SuspectReplicas = append([]uint64(nil), obj.Suspect...)
+		out.IntegrityEpoch = obj.IntegrityEpoch
 		if err := w.putInode(&out); err != nil {
 			return err
 		}
@@ -287,6 +294,8 @@ func (w *txw) updateObjectIndex(in *types.Inode) error {
 	obj.ExpiresAt = time.Time{}
 	obj.Replicas = append([]uint64(nil), in.Replicas...)
 	obj.Done = append([]uint64(nil), in.DoneReplicas...)
+	obj.Suspect = append([]uint64(nil), in.SuspectReplicas...)
+	obj.IntegrityEpoch = in.IntegrityEpoch
 	return w.putObject(obj)
 }
 
@@ -405,7 +414,7 @@ func (s *Store) MarkObjectDone(id, nodeID uint64) error {
 		if obj.State != objectPending && obj.State != objectLive {
 			return nil
 		}
-		if !types.ContainsUint64(obj.Replicas, nodeID) {
+		if !types.ContainsUint64(obj.Replicas, nodeID) || types.ContainsUint64(obj.Suspect, nodeID) {
 			return nil
 		}
 		obj.Done = appendUnique(obj.Done, nodeID)
@@ -414,7 +423,7 @@ func (s *Store) MarkObjectDone(id, nodeID uint64) error {
 			if err != nil {
 				return err
 			}
-			if in.Chunked || in.ObjID != id || in.Generation != obj.Generation {
+			if in.Chunked || in.ObjID != id || in.Generation != obj.Generation || types.ContainsUint64(in.SuspectReplicas, nodeID) {
 				return nil
 			}
 			in.DoneReplicas = appendUnique(in.DoneReplicas, nodeID)
@@ -453,6 +462,10 @@ func (s *Store) ReplaceObjectReplica(fileID, objectID, generation, oldNodeID, ne
 			}
 		}
 		in.DoneReplicas = done
+		in.SuspectReplicas = withoutReplica(in.SuspectReplicas, oldNodeID)
+		if err := bumpIntegrityEpoch(&in.IntegrityEpoch); err != nil {
+			return err
+		}
 		return w.putInode(&in)
 	})
 }

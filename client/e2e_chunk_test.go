@@ -279,7 +279,7 @@ func TestChunkedReadReportsCorruptAndSelfHeals(t *testing.T) {
 
 	// 强制读到坏副本：只给 victim 地址调 fetchChunkInto → 校验失败并触发上报。
 	only := map[uint64]string{victim: vnode.addr()}
-	if err := c.fetchChunkInto(in.ID, ch, only, io.Discard); err == nil {
+	if err := c.fetchChunkInto(in, ch, only, io.Discard); err == nil {
 		t.Fatalf("读坏副本应失败")
 	}
 

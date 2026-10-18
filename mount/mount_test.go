@@ -58,7 +58,7 @@ func newTestCluster(t *testing.T, numNodes int) (*client.Client, *Mount) {
 	return c, m
 }
 
-// 纯函数：candidateReplicas 的 done 优先语义（保留节点 ID 供损坏上报）。
+// 纯函数：candidateReplicas 的 done 优先 + suspect 殿后语义（保留节点 ID 供损坏上报）。
 func TestCandidateReplicas(t *testing.T) {
 	reps := []client.Replica{
 		{ID: 1, Addr: "a", Done: false},
@@ -67,17 +67,34 @@ func TestCandidateReplicas(t *testing.T) {
 		{ID: 4, Addr: "d", Done: false},
 	}
 	for i := 0; i < 20; i++ { // 随机打散下 done 组内顺序会变，但组间次序不变
-		got := candidateReplicas(reps)
-		if len(got) != 4 {
-			t.Fatalf("长度: %v", got)
+		healthy, suspects := candidateReplicas(reps, nil)
+		if len(healthy) != 4 || len(suspects) != 0 {
+			t.Fatalf("长度: %v / %v", healthy, suspects)
 		}
-		set := map[uint64]bool{got[0].ID: true, got[1].ID: true}
+		set := map[uint64]bool{healthy[0].ID: true, healthy[1].ID: true}
 		if !set[2] || !set[3] {
-			t.Fatalf("done 副本应排前: %v", got)
+			t.Fatalf("done 副本应排前: %v", healthy)
 		}
-		if got[0].ID == 0 {
-			t.Fatalf("候选必须保留节点 ID: %v", got)
+		if healthy[0].ID == 0 {
+			t.Fatalf("候选必须保留节点 ID: %v", healthy)
 		}
+	}
+
+	// Suspect 副本即使 Done 也拆出殿后段兜底；健康段次序不变。
+	suspectReps := []client.Replica{
+		{ID: 1, Addr: "a", Done: true},
+		{ID: 2, Addr: "b", Done: true},
+		{ID: 3, Addr: "c", Done: false},
+	}
+	for i := 0; i < 20; i++ {
+		healthy, suspects := candidateReplicas(suspectReps, []uint64{1})
+		if len(healthy) != 2 || len(suspects) != 1 || suspects[0].ID != 1 {
+			t.Fatalf("suspect 副本应殿后: %v / %v", healthy, suspects)
+		}
+	}
+	// 全部 suspect：全部进殿后段（兜底可读），健康段为空。
+	if healthy, suspects := candidateReplicas(suspectReps, []uint64{1, 2, 3}); len(healthy) != 0 || len(suspects) != 3 {
+		t.Fatalf("全 suspect 应全进兜底段: %v / %v", healthy, suspects)
 	}
 }
 

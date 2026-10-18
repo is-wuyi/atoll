@@ -27,10 +27,13 @@ type Server struct {
 	nodeMaxAge        time.Duration // 节点心跳超时阈值
 	scanner           *Scanner      // GC 需要调用
 	backup            *MetaBackup   // 元数据备份状态查询/手动触发（可为 nil：未启用备份）
-	token             auth.Token    // 集群认证；空 = 兼容模式
-	adminToken        auth.Token    // 破坏性操作（/admin/gc）专用；空 = 回退用 token
-	scheme            string        // 出站访问节点的 scheme：http（默认）/https
-	tlsCfg            *tls.Config   // 出站 TLS 客户端配置（nil = 普通 HTTP）
+	autonomy          *Autonomy
+	writePlanner      *writePlanner
+	security          *serverSecurity
+	token             auth.Token  // 集群认证；空 = 兼容模式
+	adminToken        auth.Token  // 破坏性操作（/admin/gc）专用；空 = 回退用 token
+	scheme            string      // 出站访问节点的 scheme：http（默认）/https
+	tlsCfg            *tls.Config // 出站 TLS 客户端配置（nil = 普通 HTTP）
 	nodeTransportOnce sync.Once
 	nodeTransport     *auth.Transport
 	// commitWait 是 min_copies 提交时 master 侧等待从副本到齐的上限。
@@ -94,11 +97,15 @@ func (s *Server) nodeHTTPClient(timeout time.Duration) *http.Client {
 	s.nodeTransportOnce.Do(func() {
 		s.nodeTransport = auth.HTTPTransport(s.token, s.tlsCfg, nil)
 	})
+	if s.security != nil {
+		return &http.Client{Timeout: timeout, Transport: s.secureControlTransport(s.nodeTransport.Fallback), CheckRedirect: rejectRedirect}
+	}
 	return &http.Client{Timeout: timeout, Transport: s.nodeTransport}
 }
 
 // adminPaths 需要 adminToken 的破坏性路径。/admin/objects 是只读清单、不在内。
-var adminPaths = map[string]bool{"/admin/gc": true, "/admin/metabackup/trigger": true, "/admin/metabackup/config": true}
+var adminPaths = map[string]bool{"/admin/gc": true, "/admin/metabackup/trigger": true, "/admin/metabackup/config": true,
+	"/admin/autonomy/step": true, "/admin/autonomy/profile": true, "/admin/autonomy/cancel": true}
 
 // SetScanner 绑定扫描器，供 /admin/gc 等接口使用。
 func (s *Server) SetScanner(scanner *Scanner) {
@@ -117,6 +124,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /dirs", s.handleCreateDir)
 	mux.HandleFunc("GET /dirs/children", s.handleListChildren)
 	mux.HandleFunc("GET /meta", s.handleLookup) // ?path=/a/b
+	mux.HandleFunc("POST /writes", s.handleBeginWrite)
+	mux.HandleFunc("POST /writes/chunks", s.handlePlanWriteChunk)
+	mux.HandleFunc("POST /writes/commit", s.handleCommitWrite)
+	mux.HandleFunc("POST /writes/abort", s.handleAbortWrite)
+	mux.HandleFunc("GET /protection", s.handleProtection)
+	mux.HandleFunc("POST /protection", s.handleProtection)
 	mux.HandleFunc("POST /files", s.handleCreateFile)
 	mux.HandleFunc("POST /files/commit", s.handleCommitFile)
 	mux.HandleFunc("POST /files/chunks", s.handleAssignChunk)            // 分块：分配块副本
@@ -124,11 +137,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /files/replica-targets", s.handleReplicaTargets) // node 查询推送目标
 	mux.HandleFunc("POST /files/replicated", s.handleReplicated)         // 从副本上报同步完成
 	mux.HandleFunc("POST /files/corrupt", s.handleReportCorrupt)         // 读端上报副本内容损坏
-	mux.HandleFunc("POST /files/suspect", s.handleReportSuspect)         // 版本校验后标记整对象副本待修
-	mux.HandleFunc("POST /files/small", s.handleCreateSmall)             // 小文件单请求通道（v2-2a）
-	mux.HandleFunc("POST /files/symlink", s.handleCreateSymlink)         // 创建符号链接
-	mux.HandleFunc("POST /entry/rename", s.handleRename)                 // 同目录改名
-	mux.HandleFunc("DELETE /entry", s.handleDelete)                      // ?path=/a/b
+	mux.HandleFunc("GET /files/replication", s.handleReplicationPlan)
+	mux.HandleFunc("POST /files/replicated/verified", s.handleVerifiedReplica)
+	mux.HandleFunc("POST /files/replicated/present", s.handlePresentReplica)
+	mux.HandleFunc("POST /files/objects/suspect", s.handlePhysicalSuspect)
+	mux.HandleFunc("POST /files/chunks/suspect", s.handleChunkSuspect)
+	mux.HandleFunc("POST /files/suspect", s.handleReportSuspect) // 版本校验后标记整对象副本待修
+	mux.HandleFunc("POST /files/small", s.handleCreateSmall)     // 小文件单请求通道（v2-2a）
+	mux.HandleFunc("POST /files/symlink", s.handleCreateSymlink) // 创建符号链接
+	mux.HandleFunc("POST /entry/rename", s.handleRename)         // 同目录改名
+	mux.HandleFunc("DELETE /entry", s.handleDelete)              // ?path=/a/b
 	mux.HandleFunc("POST /nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("POST /nodes/heartbeat", s.handleNodeHeartbeat)
 	mux.HandleFunc("POST /admin/gc", s.handleGC)
@@ -137,10 +155,26 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/nodes", s.handleAdminNodes)
 	mux.HandleFunc("GET /admin/repairs", s.handleAdminRepairs)
 	mux.HandleFunc("GET /admin/integrity", s.handleAdminIntegrity)
+	mux.HandleFunc("GET /admin/autonomy", s.handleAutonomyStatus)
+	mux.HandleFunc("POST /admin/autonomy/step", s.handleAutonomyStep)
+	mux.HandleFunc("POST /admin/autonomy/profile", s.handleAutonomyProfile)
+	mux.HandleFunc("POST /admin/autonomy/cancel", s.handleAutonomyCancel)
 	mux.HandleFunc("GET /admin/metabackup", s.handleAdminMetaBackup)
 	mux.HandleFunc("POST /admin/metabackup/trigger", s.handleAdminMetaBackupTrigger)
 	mux.HandleFunc("POST /admin/metabackup/config", s.handleAdminMetaBackupConfig)
-	return auth.WrapTokens(mux, s.token, s.adminToken, adminPaths)
+	if s.security != nil {
+		return s.writePlanningGuard(s.securityHandler(mux))
+	}
+	if enabled, err := s.store.SecurityEnabled(); err != nil || enabled {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/healthz" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			httpError(w, http.StatusServiceUnavailable, "security is initialized; start master in secure mode")
+		})
+	}
+	return s.writePlanningGuard(auth.WrapTokens(mux, s.token, s.adminToken, adminPaths))
 }
 
 // ---- 目录 ----
@@ -257,92 +291,34 @@ func (s *Server) handleReplicaTargets(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "inode_id and node_id required")
 		return
 	}
-	// 内容对象 ID（≥ 2^63，不可变对象布局）：节点持有的是物理对象地址，
-	// 反解到对象登记表取副本集；顺带把查询方标 Done（同 chunk 路径的闭环约定）。
-	if inodeID >= types.ObjectIDBase {
-		obj, err := s.store.GetObject(inodeID)
-		if err != nil {
-			httpErrorFromMeta(w, err)
-			return
-		}
-		if err := s.store.MarkObjectDone(inodeID, nodeID); err != nil {
-			httpErrorFromMeta(w, err)
-			return
-		}
-		var targets []types.NodeInfo
-		for _, id := range obj.Replicas {
-			if id == nodeID || types.ContainsUint64(obj.Done, id) {
-				continue
-			}
-			n, err := s.store.GetNode(id)
-			if err != nil {
-				continue
-			}
-			if time.Since(n.LastHeartbeat) > s.nodeMaxAge {
-				continue
-			}
-			targets = append(targets, n)
-		}
-		writeJSON(w, http.StatusOK, targets)
-		return
-	}
-	// 块对象 ID ≥ 2^40：反解出所属 staging inode（必为 Chunked）。
-	if inodeID >= types.StagingInodeBase<<8 {
-		own, index := types.ParseChunkID(inodeID)
-		in, err := s.store.GetInode(own)
-		if err != nil {
-			httpErrorFromMeta(w, err)
-			return
-		}
-		// 查询推送目标 = 查询者（主副本）已落盘：顺带把它标记为块 Done。
-		// 主副本的 Done 由此闭环（客户端 PUT → node 落盘 → replicateToPeers
-		// 查询目标 → 此处标记），不依赖单独的上报接口。
-		if err := s.store.MarkChunkDone(inodeID, nodeID); err != nil && !errors.Is(err, meta.ErrChunkNotExist) {
-			httpError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		var targets []types.NodeInfo
-		for _, c := range in.Chunks {
-			if c.Index != index {
-				continue
-			}
-			for _, id := range c.Replicas {
-				if id == nodeID || types.ContainsUint64(c.Done, id) {
-					continue
-				}
-				n, err := s.store.GetNode(id)
-				if err != nil {
-					continue
-				}
-				if time.Since(n.LastHeartbeat) > s.nodeMaxAge {
-					continue
-				}
-				targets = append(targets, n)
-			}
-			break
-		}
-		writeJSON(w, http.StatusOK, targets)
-		return
-	}
-	// legacy 整对象路径（原行为）。
-	in, err := s.store.GetInode(inodeID)
+	description, err := s.store.ObjectIntegrity(inodeID)
 	if err != nil {
 		httpErrorFromMeta(w, err)
 		return
 	}
-	var targets []types.NodeInfo
-	for _, id := range in.Replicas {
-		if id == nodeID || types.ContainsUint64(in.DoneReplicas, id) {
-			continue // 跳过自己和已完成的
+	if description.ChecksumKnown {
+		httpError(w, http.StatusUpgradeRequired, "integrity-v1 replication required")
+		return
+	}
+	if !types.ContainsUint64(description.Replicas, nodeID) {
+		httpError(w, http.StatusForbidden, "node is not an assigned replica")
+		return
+	}
+	if description.Chunked {
+		if _, err := s.store.MarkObjectPresent(description, nodeID); err != nil {
+			httpErrorFromMeta(w, err)
+			return
 		}
-		n, err := s.store.GetNode(id)
-		if err != nil {
+	}
+	var targets []types.NodeInfo
+	for _, id := range description.Replicas {
+		if id == nodeID || types.ContainsUint64(description.Done, id) {
 			continue
 		}
-		if time.Since(n.LastHeartbeat) > s.nodeMaxAge {
-			continue // 已判定宕机的节点不作为推送目标
+		n, err := s.store.GetNode(id)
+		if err == nil && time.Since(n.LastHeartbeat) <= s.nodeMaxAge {
+			targets = append(targets, n)
 		}
-		targets = append(targets, n)
 	}
 	writeJSON(w, http.StatusOK, targets)
 }
@@ -362,65 +338,25 @@ func (s *Server) handleReplicated(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "inode_id and node_id required")
 		return
 	}
-	// 内容对象 ID：写入对象登记表的 Done（live 时同步推进 inode 的 DoneReplicas）。
-	if req.InodeID >= types.ObjectIDBase {
-		if err := s.store.MarkObjectDone(req.InodeID, req.NodeID); err != nil {
-			httpErrorFromMeta(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	description, err := s.store.ObjectIntegrity(req.InodeID)
+	if err != nil {
+		httpErrorFromMeta(w, err)
 		return
 	}
-	// 块对象 ID：写入块 Done 集合（staging 与已提交的分块文件都合法）。
-	if req.InodeID >= types.StagingInodeBase<<8 {
-		if err := s.store.MarkChunkDone(req.InodeID, req.NodeID); err != nil {
-			httpErrorFromMeta(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	if description.ChecksumKnown {
+		httpError(w, http.StatusUpgradeRequired, "verified receipt required")
 		return
 	}
-	if err := s.store.AddReplicaDone(req.InodeID, req.NodeID); err != nil {
+	if _, err := s.store.MarkObjectPresent(description, req.NodeID); err != nil {
 		httpErrorFromMeta(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleReportCorrupt 读端发现某副本内容校验和不符时上报：POST /files/corrupt
-// {inode_id, node_id}。inode_id 对分块是块对象 ID（ChunkID），对 legacy 是文件 inode ID
-// （与 /files/replicated 同一编码约定）。处理：先删该节点上的坏对象、再清其 Done。
-//
-// 顺序关键：必须先删对象再清 Done。否则修复扫描的"探测兜底"只看对象是否存在（1 字节 Range）、
-// 不看内容，会在清 Done 后立刻把这份坏副本重新标 Done，自愈被抵消。删掉后探测得 404，
-// 修复扫描才会从完好副本重新 pull（带 CRC 校验）覆盖它，闭环才真正闭合。
+// Reports without a content identity cannot safely mutate or delete a replica.
 func (s *Server) handleReportCorrupt(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		InodeID uint64 `json:"inode_id"`
-		NodeID  uint64 `json:"node_id"`
-	}
-	if err := decodeJSON(w, r, &req); err != nil {
-		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
-		return
-	}
-	if req.InodeID == 0 || req.NodeID == 0 {
-		httpError(w, http.StatusBadRequest, "inode_id and node_id required")
-		return
-	}
-	// 先删坏对象（同步、单节点、5s 上限），再清 Done——见上文顺序说明。
-	s.notifyObjectDelete(req.InodeID, []uint64{req.NodeID})
-	var err error
-	if req.InodeID >= types.StagingInodeBase<<8 {
-		err = s.store.MarkChunkUndone(req.InodeID, req.NodeID)
-	} else {
-		err = s.store.RemoveReplicaDone(req.InodeID, req.NodeID)
-	}
-	if err != nil {
-		httpErrorFromMeta(w, err)
-		return
-	}
-	log.Printf("副本损坏上报: 对象 %d 节点 %d 内容校验和不符，已删坏对象并清 Done 待修复", req.InodeID, req.NodeID)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	httpError(w, http.StatusUpgradeRequired, "version-bound suspect report required")
 }
 
 // ---- 文件 ----
@@ -619,8 +555,8 @@ func (s *Server) handleAssignChunk(w http.ResponseWriter, r *http.Request) {
 		Size     int64    `json:"size"`
 		Replicas int      `json:"replicas"`
 		Reassign bool     `json:"reassign"`
-		Checksum uint32   `json:"checksum"` // 块内容 CRC32C（0 = 未提供）
-		Exclude  []uint64 `json:"exclude"`  // reassign 时排除的节点（刚卡死/失败的）
+		Checksum *uint32  `json:"checksum"`
+		Exclude  []uint64 `json:"exclude"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
@@ -633,19 +569,23 @@ func (s *Server) handleAssignChunk(w http.ResponseWriter, r *http.Request) {
 	if req.Replicas <= 0 {
 		req.Replicas = 1
 	}
-	// 已分配且非 reassign → 幂等返回（不重复扣容量决策）。
-	if !req.Reassign {
-		if c, err := s.store.GetInode(req.InodeID); err == nil && c.Staging {
-			for _, ch := range c.Chunks {
-				if ch.Index == req.Index {
-					nodes, err := s.store.NodeInfos(ch.Replicas)
-					if err != nil {
-						httpError(w, http.StatusInternalServerError, err.Error())
-						return
-					}
-					writeJSON(w, http.StatusOK, chunkAssignResp{Chunk: ch, Nodes: nodes})
+	if current, err := s.store.GetInode(req.InodeID); err == nil && current.Staging {
+		for _, ch := range current.Chunks {
+			if ch.Index != req.Index {
+				continue
+			}
+			if ch.Size != req.Size || ((ch.ChecksumKnown || ch.Checksum != 0) && req.Checksum != nil && ch.Checksum != *req.Checksum) {
+				httpError(w, http.StatusConflict, "chunk contents changed; allocate a new upload")
+				return
+			}
+			if !req.Reassign {
+				nodes, err := s.store.NodeInfos(ch.Replicas)
+				if err != nil {
+					httpError(w, http.StatusInternalServerError, err.Error())
 					return
 				}
+				writeJSON(w, http.StatusOK, chunkAssignResp{Chunk: ch, Nodes: nodes})
+				return
 			}
 		}
 	}
@@ -666,10 +606,14 @@ func (s *Server) handleAssignChunk(w http.ResponseWriter, r *http.Request) {
 		nodeIDs[i] = nd.ID
 	}
 	var chunk types.ChunkInfo
+	var checksum uint32
+	if req.Checksum != nil {
+		checksum = *req.Checksum
+	}
 	if req.Reassign {
-		chunk, err = s.store.ReassignChunk(req.InodeID, req.Index, nodeIDs, req.Checksum)
+		chunk, err = s.store.ReassignChunk(req.InodeID, req.Index, nodeIDs, checksum, req.Checksum != nil)
 	} else {
-		chunk, err = s.store.AssignChunk(req.InodeID, req.Index, req.Size, nodeIDs, req.Checksum)
+		chunk, err = s.store.AssignChunk(req.InodeID, req.Index, req.Size, nodeIDs, checksum, req.Checksum != nil)
 	}
 	if err != nil {
 		httpErrorFromMeta(w, err)
@@ -779,11 +723,8 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// 主副本 Done 兜底：客户端 PUT 成功与 node 查询推送目标（顺带标记 Done）
-		// 之间有竞态窗口——commit 前对每块主副本做一次同步探测，确认落盘即标记。
-		// 探测失败的块由 ErrCommitFailed 拒绝（客户端应重试或 reassign）。
-		// 同时校验主副本节点存活（改进项1）：死节点上的 Done 不可信——
-		// 27472 宕机期间它的块仍标记 Done，commit 若不查心跳会把数据承诺到死节点。
+		// PUT and the asynchronous receipt can race. Recheck the node's content before
+		// rejecting an otherwise complete upload; a probe response alone never marks Done.
 		if st, err := s.store.GetInode(req.InodeID); err == nil && st.Staging {
 			for _, c := range st.Chunks {
 				if len(c.Replicas) == 0 || types.ContainsUint64(c.Done, c.Replicas[0]) {
@@ -796,8 +737,15 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 				if time.Since(n.LastHeartbeat) > s.nodeMaxAge {
 					continue // 节点已死，探测无意义
 				}
-				if s.probeObject(n.Addr, types.ChunkID(req.InodeID, c.Index)) {
-					_ = s.store.MarkChunkDone(types.ChunkID(req.InodeID, c.Index), c.Replicas[0])
+				if types.ContainsUint64(c.Suspect, c.Replicas[0]) {
+					continue
+				}
+				objectID := types.ChunkObjID(c, st.ID)
+				if c.ChecksumKnown || c.Checksum != 0 {
+					verifyReplicaAt(s.nodeHTTPClient(30*time.Second), s.nodeScheme(), n.Addr, objectID)
+				} else if s.probeObject(n.Addr, objectID) {
+					_, _ = s.store.MarkObjectPresent(types.ObjectIntegrity{ObjectID: objectID, InodeID: st.ID, Generation: st.Generation,
+						Chunked: true, ChunkIndex: c.Index, Size: c.Size, IntegrityEpoch: c.IntegrityEpoch}, c.Replicas[0])
 				}
 			}
 		}
@@ -826,7 +774,12 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 				time.Sleep(200 * time.Millisecond)
 			}
 		}
-		in, old, hadOld, err := s.store.CommitStagingFile(req.InodeID, req.Name, req.Size)
+		binding, secureCommit := secureCommitFrom(r.Context())
+		var bindings []meta.SecureCommitBinding
+		if secureCommit {
+			bindings = append(bindings, binding)
+		}
+		in, old, hadOld, err := s.store.CommitStagingFile(req.InodeID, req.Name, req.Size, bindings...)
 		if err != nil {
 			httpErrorFromMeta(w, err)
 			return
@@ -836,7 +789,7 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 			s.reclaimReplacedObject(old)
 		}
 		// v2-3a：记录 op 结果供重试回放（仅分块提交路径；legacy commit 天然幂等安全）。
-		if req.OpID != "" {
+		if req.OpID != "" && !secureCommit {
 			if err := s.store.PutOpResult(req.OpID, "commit", in); err != nil {
 				httpErrorFromMeta(w, err)
 				return
@@ -1171,7 +1124,12 @@ func (s *Server) countCommitReadyChunks(st types.Inode, minCopies int) int {
 	ready := 0
 	for _, c := range st.Chunks {
 		n := 0
+		seen := make(map[uint64]bool)
 		for _, nodeID := range c.Done {
+			if seen[nodeID] || types.ContainsUint64(c.Suspect, nodeID) || !types.ContainsUint64(c.Replicas, nodeID) {
+				continue
+			}
+			seen[nodeID] = true
 			ok, has := aliveDone[nodeID]
 			if !has {
 				nd, err := s.store.GetNode(nodeID)
@@ -1236,14 +1194,15 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		NodeID    uint64 `json:"node_id"`
-		UsedBytes int64  `json:"used_bytes"`
+		NodeID    uint64           `json:"node_id"`
+		UsedBytes int64            `json:"used_bytes"`
+		Usage     *types.NodeUsage `json:"usage,omitempty"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
-	if err := s.store.Heartbeat(req.NodeID, req.UsedBytes); err != nil {
+	if err := s.store.HeartbeatWithUsage(req.NodeID, req.UsedBytes, req.Usage); err != nil {
 		httpErrorFromMeta(w, err)
 		return
 	}
@@ -1317,7 +1276,7 @@ func httpErrorFromMeta(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, meta.ErrNotExist):
 		httpError(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, meta.ErrExist), errors.Is(err, meta.ErrCommitFailed), errors.Is(err, meta.ErrOpConflict):
+	case errors.Is(err, meta.ErrExist), errors.Is(err, meta.ErrCommitFailed), errors.Is(err, meta.ErrOpConflict), errors.Is(err, meta.ErrProtectionConflict), errors.Is(err, meta.ErrProtectionBudget):
 		httpError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, meta.ErrNotEmpty), errors.Is(err, meta.ErrNotDir), errors.Is(err, meta.ErrNotFile),
 		errors.Is(err, meta.ErrNotStaging), errors.Is(err, meta.ErrChunkBadIndex), errors.Is(err, meta.ErrChunkBadSize),
