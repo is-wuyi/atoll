@@ -20,6 +20,13 @@ import (
 
 var errIntegrityMismatch = errors.New("object integrity mismatch")
 
+// aeadChunkObjectLimit 是 aead 块对象的物理上限：密文比明文多 33B/64KiB 记录，
+// 末块明文 ≤64MiB-1 时密文 ≤ ChunkSize + 528B；再留余量防奇数几何。
+// plain 块仍以 ChunkSize 为限。
+func aeadChunkObjectLimit() int64 {
+	return types.ChunkSize + (types.ChunkSize/types.AeadRecordPlaintext+1)*types.AeadRecordOverhead
+}
+
 // verifyTimeout 约束控制面 POST /verify 的完整流程（master 元数据 + 本地全量 CRC + 回执）。
 // verify 由 master 异步探测触发，超时后 master 会按自身节奏重试；本批仅加上界，
 // 不重写其生命周期。ctx 无法打断 fsync/目录 fsync（OS 限制），上界只约束网络与
@@ -96,7 +103,7 @@ func (n *Node) replicationPlan(ctx context.Context, objectID uint64, planID ...s
 	}
 	if plan.Protocol != types.IntegrityProtocol || d.ObjectID != objectID || d.Size < 0 || d.Size == int64(^uint64(0)>>1) ||
 		!types.ContainsUint64(d.Replicas, uint64(n.nodeID.Load())) ||
-		(d.Chunked && (d.Size <= 0 || d.Size > types.ChunkSize || d.ChunkIndex < 0)) {
+		(d.Chunked && (d.Size <= 0 || d.Size > aeadChunkObjectLimit() || d.ChunkIndex < 0)) {
 		return plan, fmt.Errorf("invalid or unsupported replication metadata")
 	}
 	for _, nd := range append(append([]types.NodeInfo(nil), plan.Targets...), plan.Sources...) {

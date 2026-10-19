@@ -14,7 +14,7 @@ func TestRunUsage(t *testing.T) {
 	if code := run([]string{"help"}, &out, &errBuf); code != 0 {
 		t.Fatalf("help 退出码 = %d", code)
 	}
-	if !strings.Contains(out.String(), "atoll master") {
+	if !strings.Contains(out.String(), "atoll master") || !strings.Contains(out.String(), "atoll content-key-init") {
 		t.Fatalf("帮助文本应包含命令列表: %q", out.String())
 	}
 	if code := run(nil, &out, &errBuf); code != 2 {

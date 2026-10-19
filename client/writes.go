@@ -229,7 +229,29 @@ func validatePlannedChunk(req types.PlanWriteChunkRequest, out types.PlanWriteCh
 }
 
 func (c *Client) uploadPlannedChunk(ctx context.Context, u types.WriteUpload, index int, data []byte) error {
-	request := types.PlanWriteChunkRequest{WriteBinding: plannedBinding(u), Index: index, LogicalSize: int64(len(data)), StoredSize: int64(len(data)), Encoding: types.PlainEncoding, Checksum: types.CRC32C(data)}
+	return c.uploadPlannedChunkAEAD(ctx, u, index, data, nil)
+}
+
+// uploadPlannedChunkAEAD 是计划块上传的完整入口：aead 为 nil 或未启用时按
+// plain 几何上传（旧行为）；启用时先取块 DEK、密封为 aead-record-v1 密文，
+// 以密文字节构造 Reserve（CRC 与存储长度都按密文计），再向计划节点直传。
+func (c *Client) uploadPlannedChunkAEAD(ctx context.Context, u types.WriteUpload, index int, data []byte, aead *aeadUpload) error {
+	encoding := types.PlainEncoding
+	upload := data
+	if aead != nil && aead.enabled {
+		dek, err := aead.chunkDEK(ctx, c, u, index)
+		if err != nil {
+			return err
+		}
+		if dek != nil {
+			sealed, err := sealChunk(dek, u, index, data)
+			if err != nil {
+				return err
+			}
+			encoding, upload = types.AeadRecordEncoding, sealed
+		}
+	}
+	request := types.PlanWriteChunkRequest{WriteBinding: plannedBinding(u), Index: index, LogicalSize: int64(len(data)), StoredSize: int64(len(upload)), Encoding: encoding, Checksum: types.CRC32C(upload)}
 	var out types.PlanWriteChunkResponse
 	if err := c.writeJSONRetry(ctx, "/writes/chunks", request, &out); err != nil {
 		return err
@@ -260,7 +282,7 @@ func (c *Client) uploadPlannedChunk(ctx context.Context, u types.WriteUpload, in
 		go func(id uint64) {
 			defer wg.Done()
 			defer func() { <-slots }()
-			err := c.putPlannedObject(ctx, addresses[id], out.Plan.Object.ID, request.Checksum, data)
+			err := c.putPlannedObject(ctx, addresses[id], out.Plan.Object.ID, request.Checksum, upload)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -333,7 +355,7 @@ func (c *Client) commitPlannedWrite(ctx context.Context, u types.WriteUpload, to
 			if out.Inode.ID == 0 || out.Inode.Staging || out.Inode.Type != types.TypeFile || out.Inode.Size != total || out.Inode.Content == nil || out.Inode.Content.ID != u.ID || out.Inode.Content.LogicalSize != total || len(out.Inode.Chunks) != count {
 				return out.Inode, errors.New("master returned invalid committed contents")
 			}
-			if err := types.ValidatePlainContent(out.Inode); err != nil {
+			if err := types.ValidateContentManifest(out.Inode); err != nil {
 				return out.Inode, err
 			}
 			return out.Inode, nil

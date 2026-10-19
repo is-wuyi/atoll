@@ -27,11 +27,14 @@ type plannedStream struct {
 	finishDone chan struct{}
 	result     types.Inode
 	commitOp   string
+	aead       *aeadUpload
 }
 
 func newPlannedStream(c *Client, u types.WriteUpload, ctx context.Context) *plannedStream {
 	ctx, cancel := context.WithCancel(ctx)
-	return &plannedStream{c: c, upload: u, ctx: ctx, cancel: cancel, slots: make(chan struct{}, 2), commitOp: newOpID()}
+	a := newAeadUpload()
+	a.probe(ctx, c, u)
+	return &plannedStream{c: c, upload: u, ctx: ctx, cancel: cancel, slots: make(chan struct{}, 2), commitOp: newOpID(), aead: a}
 }
 
 func (p *plannedStream) enqueue(data []byte) error {
@@ -56,7 +59,7 @@ func (p *plannedStream) enqueue(data []byte) error {
 	go func() {
 		defer p.wg.Done()
 		defer func() { <-p.slots }()
-		err := p.c.uploadPlannedChunk(p.ctx, p.upload, index, owned)
+		err := p.c.uploadPlannedChunkAEAD(p.ctx, p.upload, index, owned, p.aead)
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		if err != nil {

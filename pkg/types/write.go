@@ -130,6 +130,23 @@ type Capabilities struct {
 	WritePlanning bool     `json:"write_planning"`
 }
 
+// ContentKeyResponse 是 GET /auth/content-key 的响应：授权空间/对象/代际下
+// 解包出的对象 DEK（base64）。经用户会话 + TLS 传输；密钥 ID 用于轮换比对。
+type ContentKeyResponse struct {
+	ObjectID   uint64 `json:"object_id"`
+	Generation uint64 `json:"generation"`
+	KeyID      string `json:"key_id"`
+	DEK        string `json:"dek"`
+}
+
+// PrepareContentKeyRequest 请求为计划上传的某个块对象预创建（或幂等取回）wrapped
+// DEK。UploadID 即 Begin 返回的 staging ID，也是加密记录 AAD 的内容身份；
+// 块对象 ID 由 (UploadID, Index) 派生。SpaceID 由 X-Atoll-Space 头提供。
+type PrepareContentKeyRequest struct {
+	UploadID uint64 `json:"upload_id"`
+	Index    int    `json:"index"`
+}
+
 type ProtectionRequest struct {
 	Path string         `json:"path"`
 	Tier ProtectionTier `json:"tier"`

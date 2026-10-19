@@ -115,7 +115,7 @@ func (w *txw) del(bucketCode byte, bkt, key []byte) error {
 
 func (w *txw) putInode(in *types.Inode) error {
 	if in.Content != nil {
-		if err := types.ValidatePlainContent(*in); err != nil {
+		if err := types.ValidateContentManifest(*in); err != nil {
 			return err
 		}
 	}

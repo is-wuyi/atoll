@@ -13,7 +13,7 @@
 
 本批**没有**完成下列能力：
 
-- **节点侧内容机密性。** `pkg/contentcrypto` 仍为独立基础库，尚未接入上传、下载或密钥托管。节点仍不可信，磁盘对象仍是明文；TLS 只保护传输。不要将本批当作向不可信节点存放敏感数据的完整方案。
+- **节点侧内容机密性（aead-record-v1 已接入计划写入）。** secure Master 配置 `-content-key-file`（`atoll content-key-init` 创建，0600、原子发布、不进数据库/WAL）后，计划上传的每块在客户端按 64KiB AES-256-GCM 记录加密（`pkg/contentcrypto`），节点只接收、校验、落盘密文；CRC 与容量预算按密文计。块 DEK 由 Master 生成并只保存 wrapped DEK（`keyID + base64 包裹`），经 `POST /auth/content-key/prepare`（上传）与 `GET /auth/content-key`（读取）按空间 ACL 发放；KEK 与明文 DEK 不落库。记录 AAD 绑定对象 ID、内容身份（ContentVersion.ID = Begin 冻结的 staging ID）与记录序号。未配置 KEK 的集群与已有 plain 数据完全不受影响；master 未配 KEK 时客户端自动按 plain 上传，不报错。密钥的集群外灾备、KEK 轮换迁移与旧数据重加密尚未实现——**丢失 KEK 文件 = 丢失此后全部加密内容**，务必离线备份该文件。
 - **安全模式的集群元数据灾备。** 在账号元数据加密和独立恢复包完成之前，secure Master 拒绝 `-seeds`，封禁 `/admin/metabackup*`，并禁止远程备份传输。当前须保管离线本地数据库备份；正常重启读取同一个数据库不等于已验证集群灾备恢复。
 - **回收站、桌面登录界面、正式 EC 或内置 P2P 接线。** 删除仍立即从命名空间移除，物理对象另行回收，没有 30 天回收站。现有 console 未接入本批用户会话体系。
 - **去 EasyTier 的现网迁移。** 应用按 HTTP(S) 地址访问节点，现有部署仍使用 EasyTier 地址通道；`prototypes/peertransport` 是独立原型，尚未替换生产传输。本批不拆除或重启 EasyTier。

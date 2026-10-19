@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"atoll/master/meta"
 	"atoll/pkg/access"
 	"atoll/pkg/auth"
+	"atoll/pkg/contentcrypto"
 	"atoll/pkg/types"
 )
 
@@ -416,6 +418,78 @@ func (s *Server) serveUserAuth(w http.ResponseWriter, r *http.Request, user meta
 			return
 		}
 		writeJSON(w, 200, map[string]bool{"changed": true})
+	case "GET /auth/content-key":
+		if s.contentKEK == nil {
+			httpError(w, http.StatusConflict, "content key service is not configured")
+			return
+		}
+		objectID, err := strconv.ParseUint(r.URL.Query().Get("object_id"), 10, 64)
+		generation, genErr := strconv.ParseUint(r.URL.Query().Get("generation"), 10, 64)
+		spaceID, spaceErr := requestSpace(r)
+		if err != nil || genErr != nil || spaceErr != nil || objectID == 0 || generation == 0 || spaceID == 0 {
+			httpError(w, http.StatusBadRequest, "object_id, generation and space are required")
+			return
+		}
+		key, keyErr := s.store.GetContentKey(user.ID, spaceID, objectID, generation)
+		if keyErr != nil {
+			httpError(w, http.StatusForbidden, "content key unavailable")
+			return
+		}
+		wrapped, decodeErr := base64.RawStdEncoding.DecodeString(key.WrappedDEK)
+		if decodeErr != nil {
+			httpError(w, http.StatusInternalServerError, "content key is corrupt")
+			return
+		}
+		dek, unwrapErr := contentcrypto.UnwrapDEK(s.contentKEK, objectID, wrapped)
+		if unwrapErr != nil {
+			httpError(w, http.StatusInternalServerError, "content key cannot be opened")
+			return
+		}
+		// The user is authorized for this exact space/object/generation; return only
+		// the DEK bytes over the already authenticated session/TLS channel.
+		writeJSON(w, http.StatusOK, types.ContentKeyResponse{
+			ObjectID: objectID, Generation: generation, KeyID: key.KeyID,
+			DEK: base64.RawStdEncoding.EncodeToString(dek[:]),
+		})
+	case "POST /auth/content-key/prepare":
+		if s.contentKEK == nil {
+			httpError(w, http.StatusConflict, "content key service is not configured")
+			return
+		}
+		var req types.PrepareContentKeyRequest
+		if decodeJSON(w, r, &req) != nil {
+			httpError(w, http.StatusBadRequest, "invalid content key request")
+			return
+		}
+		if req.UploadID < types.StagingInodeBase || req.UploadID > types.MaxStagingInode || req.Index < 0 || req.Index >= types.MaxChunksPerFile {
+			httpError(w, http.StatusBadRequest, "invalid content key request")
+			return
+		}
+		spaceID, spaceErr := requestSpace(r)
+		if spaceErr != nil || spaceID == 0 {
+			httpError(w, http.StatusBadRequest, "space is required")
+			return
+		}
+		key, keyErr := s.store.PrepareContentKey(user.ID, spaceID, types.ChunkID(req.UploadID, req.Index), req.UploadID, s.contentKEK, time.Now())
+		if keyErr != nil {
+			httpError(w, http.StatusForbidden, "content key denied")
+			return
+		}
+		// 创建/幂等确认 wrapped DEK 后按授权通道解包发放（与 GET 同一出口）。
+		wrapped, decodeErr := base64.RawStdEncoding.DecodeString(key.WrappedDEK)
+		if decodeErr != nil {
+			httpError(w, http.StatusInternalServerError, "content key is corrupt")
+			return
+		}
+		dek, unwrapErr := contentcrypto.UnwrapDEK(s.contentKEK, types.ChunkID(req.UploadID, req.Index), wrapped)
+		if unwrapErr != nil {
+			httpError(w, http.StatusInternalServerError, "content key cannot be opened")
+			return
+		}
+		writeJSON(w, http.StatusOK, types.ContentKeyResponse{
+			ObjectID: types.ChunkID(req.UploadID, req.Index), Generation: req.UploadID, KeyID: key.KeyID,
+			DEK: base64.RawStdEncoding.EncodeToString(dek[:]),
+		})
 	case "GET /auth/capacity":
 		spaceID, err := requestSpace(r)
 		if err != nil {

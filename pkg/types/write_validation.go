@@ -9,8 +9,11 @@ func ValidateWriteChunkPlan(req PlanWriteChunkRequest, plan WriteChunkPlan) erro
 	if req.UploadID < StagingInodeBase || req.UploadID > MaxStagingInode || req.Revision != 1 || req.PlanID == "" || len(req.PlanID) > 128 || strings.ContainsAny(req.PlanID, " \t\r\n") {
 		return errors.New("invalid write binding")
 	}
-	if req.Index < 0 || req.Index >= MaxChunksPerFile || req.LogicalSize <= 0 || req.LogicalSize > ChunkSize || req.StoredSize != req.LogicalSize || req.Encoding != PlainEncoding {
+	if req.Index < 0 || req.Index >= MaxChunksPerFile || req.LogicalSize <= 0 || req.LogicalSize > ChunkSize {
 		return errors.New("unsupported write object geometry")
+	}
+	if err := ValidateChunkGeometry(req.Encoding, req.LogicalSize, req.StoredSize); err != nil {
+		return errors.New("unsupported write object geometry: " + err.Error())
 	}
 	o := plan.Object
 	if plan.Index != req.Index || o.ID != ChunkID(req.UploadID, req.Index) || o.Version != 1 || o.LogicalSize != req.LogicalSize || o.StoredSize != req.StoredSize || o.Encoding != req.Encoding || !o.ChecksumKnown || o.Checksum != req.Checksum {

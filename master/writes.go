@@ -301,8 +301,12 @@ func (s *Server) handlePlanWriteChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if req.Index < 0 || req.Index >= types.MaxChunksPerFile || req.LogicalSize <= 0 || req.LogicalSize > types.ChunkSize || req.StoredSize != req.LogicalSize || req.Encoding != types.PlainEncoding {
-		writePlanningError(w, http.StatusBadRequest, "invalid_write_request", "unsupported chunk encoding or size")
+	if req.Index < 0 || req.Index >= types.MaxChunksPerFile || req.LogicalSize <= 0 || req.LogicalSize > types.ChunkSize {
+		writePlanningError(w, http.StatusBadRequest, "invalid_write_request", "unsupported chunk size")
+		return
+	}
+	if err := types.ValidateChunkGeometry(req.Encoding, req.LogicalSize, req.StoredSize); err != nil {
+		writePlanningError(w, http.StatusBadRequest, "invalid_write_request", "unsupported chunk encoding: "+err.Error())
 		return
 	}
 	snapshot, err := s.store.AutonomySnapshot()

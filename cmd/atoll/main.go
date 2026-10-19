@@ -28,6 +28,7 @@ import (
 	"atoll/mount"
 	"atoll/node"
 	"atoll/pkg/auth"
+	"atoll/pkg/keyfile"
 	"atoll/pkg/types"
 )
 
@@ -66,7 +67,8 @@ const usageText = `usage: atoll <command> [args]
   atoll rm  <远程路径>              删除文件/空目录（立即生效，无回收站）
   atoll mount <挂载点>              FUSE 挂载为本地目录 [-cache 缓冲目录 -replicas N]
   atoll gc [--execute]              垃圾回收（dry-run 默认；--execute 执行删除）
-  atoll auth gen                    生成随机集群认证 token
+	atoll auth gen                    生成随机集群认证 token
+	atoll content-key-init -path FILE  创建受保护的内容 KEK 文件（不写数据库/WAL）
 
 认证与空间选择:
   兼容模式（默认）：全部角色支持 -token 或 ATOLL_TOKEN（集群各组件须一致；
@@ -103,6 +105,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runConsole(rest, stdout, stderr)
 	case "auth":
 		return runAuth(rest, stdout, stderr)
+	case "content-key-init":
+		return runContentKeyInit(rest, stdout, stderr)
 	case "login", "logout", "spaces", "team-create", "team-member":
 		return runUserSecurity(cmd, rest, stdout, stderr)
 	case "help", "-h", "--help":
@@ -152,6 +156,7 @@ func runMaster(args []string, stderr io.Writer) int {
 	autonomyReplicas := fs.Int("autonomy-max-replicas", 8, "自治副本候选上限，不是固定副本数")
 	writePlanning := fs.Bool("write-planning", false, "由调度器规划新写入（启用状态持久化，重启须保留此开关）")
 	writeReplicas := fs.Int("write-max-replicas", 8, "新写入复制布局搜索上限，不是固定副本数")
+	contentKeyFile := fs.String("content-key-file", "", "secure 内容主密钥文件（加密对象功能启用时必需；不进入数据库/WAL）")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
 	adminToken := fs.String("admin-token", envDefault("ATOLL_ADMIN_TOKEN", ""), "破坏性操作(/admin/gc)专用 token（空 = 回退用集群 token）")
 	tlsCert := fs.String("tls-cert", "", "TLS 证书文件（配 -tls-key 后 master 走 https）")
@@ -255,10 +260,23 @@ func runMaster(args []string, stderr io.Writer) int {
 	srv.SetAdminToken(auth.Token(*adminToken))
 	srv.SetTLS(outTLS)
 	if *secure {
+		if *contentKeyFile != "" {
+			kek, keyErr := keyfile.Load(*contentKeyFile)
+			if keyErr != nil {
+				store.Close()
+				fmt.Fprintln(stderr, "secure master content key file:", keyErr)
+				return 1
+			}
+			srv.SetContentKEK(kek)
+		}
 		if err := srv.EnableSecurity(master.SecurityConfig{ControlToken: auth.Token(os.Getenv(*controlEnv)), AllowInsecure: *allowInsecure}); err != nil {
 			fmt.Fprintln(stderr, "secure master:", err)
 			return 1
 		}
+	} else if *contentKeyFile != "" {
+		store.Close()
+		fmt.Fprintln(stderr, "content key file requires -secure")
+		return 1
 	}
 	if *writePlanning {
 		if err := srv.EnableWritePlanning(master.WritePlanningConfig{MaxReplicas: *writeReplicas}); err != nil {

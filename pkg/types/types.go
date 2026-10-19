@@ -95,8 +95,14 @@ type ChunkInfo struct {
 	// （覆盖写保留 FileID，新内容的块对象挂在 staging 派生的 ID 上），
 	// 故块表必须自描述；0 = 旧数据，按 (所属inodeID<<8)|Index 派生（v1 兼容）。
 	ID uint64 `json:"id,omitempty"`
-	// Size 块实际字节数（末块可以小于 ChunkSize）。
+	// Size 块对象的物理存储字节数（node 眼中的对象长度；末块可以小于 ChunkSize）。
+	// aead 编码下含记录开销，可大于逻辑长度——读取端按编码解出明文。
 	Size int64 `json:"size"`
+	// LogicalSize 块逻辑字节数（文件内容长度）。0 = 旧数据，等价于 Size
+	// （plain 几何下两者恒等）。aead 块必填。
+	LogicalSize int64 `json:"logical_size,omitempty"`
+	// Encoding 块对象编码；空 = 旧数据（plain-v1 语义）。
+	Encoding string `json:"encoding,omitempty"`
 	// Replicas 该块的目标副本节点 ID（第一个为主副本）。
 	Replicas []uint64 `json:"replicas"`
 	// Done 已确认落盘的副本节点 ID（含主副本），是 Replicas 的子集。

@@ -73,12 +73,15 @@ type chunkedReadHandle struct {
 	ino        uint64 // 逻辑 FileID（suspect 上报身份，与物理寻址分离）
 	size       int64
 	generation uint64 // Open 时快照的内容版本：suspect 按 (FileID, generation) 比对
-	chunks     []types.ChunkInfo
-	addr       map[uint64]string // 节点 ID → 地址（lookup 的地址表）
-	next       map[int]int       // 块 index → 下一个候选起点（读时记忆可用节点）
-	http       *http.Client
-	scheme     string
-	m          *Mount // nil 兼容直接构造句柄的测试：无上报、无共享缓存与全局限流
+	// content 是 Open 时快照的内容清单：aead 块解密需要 ContentVersion.ID 作
+	// 记录 AAD 的内容身份；nil = 旧数据（无清单，块必然是 plain）。
+	content *types.ContentVersion
+	chunks  []types.ChunkInfo
+	addr    map[uint64]string // 节点 ID → 地址（lookup 的地址表）
+	next    map[int]int       // 块 index → 下一个候选起点（读时记忆可用节点）
+	http    *http.Client
+	scheme  string
+	m       *Mount // nil 兼容直接构造句柄的测试：无上报、无共享缓存与全局限流
 
 	mu       sync.Mutex
 	reported map[[2]uint64]bool // (nodeID, chunkObjID) → 已上报过，去重
@@ -207,10 +210,35 @@ func (cc *mountChunkCache) insertLocked(key chunkCacheKey, data []byte) {
 
 // ---- 句柄实现 ----
 
-// loadChunk 返回整块已校验数据（Mount 共享缓存 + singleflight）。release 必须在
-// 调用方 copy-out 完成后调用：校验 permit 覆盖 fetch 与 copy-out，已校验数据在被
-// 消费前始终计入在飞预算；命中缓存快路径的 release 为 no-op（数据已计费）。无
-// Mount（直接构造句柄的测试）permit 为 no-op。
+// plainChunkData 返回整块已验证的最终数据：plain 块直接返回密文缓冲（物理即
+// 逻辑）；aead 块解密全部记录返回明文。解密失败不返回部分明文。
+func (ch *chunkedReadHandle) plainChunkData(ctx context.Context, c types.ChunkInfo) ([]byte, syscall.Errno) {
+	data, errno := ch.fetchChunkWholeVerified(ctx, c)
+	if errno != 0 {
+		return nil, errno
+	}
+	if types.ChunkEncoding(c) != types.AeadRecordEncoding {
+		return data, 0
+	}
+	plain, err := ch.m.client.DecryptChunk(ctx, ch.contentManifest(c), c, data)
+	if err != nil {
+		log.Printf("aead chunk %d inode %d decrypt: %v", c.Index, ch.ino, err)
+		return nil, syscall.EIO
+	}
+	return plain, 0
+}
+
+// contentManifest 以 Open 快照构造解密用的 inode 视图（ContentVersion.ID 即
+// 记录 AAD 的内容身份）。
+func (ch *chunkedReadHandle) contentManifest(c types.ChunkInfo) types.Inode {
+	return types.Inode{ID: ch.ino, Generation: ch.generation, Content: ch.content}
+}
+
+// loadChunk 返回整块已校验的最终交付数据（Mount 共享缓存 + singleflight）：
+// plain 块即密文整块；aead 块为解密后的明文。release 必须在调用方 copy-out
+// 完成后调用：校验 permit 覆盖 fetch 与 copy-out，已校验数据在被消费前始终
+// 计入在飞预算；命中缓存快路径的 release 为 no-op（数据已计费）。无 Mount
+// （直接构造句柄的测试）permit 为 no-op。
 func (ch *chunkedReadHandle) loadChunk(ctx context.Context, c types.ChunkInfo) ([]byte, syscall.Errno, func()) {
 	key := chunkCacheKey{obj: types.ChunkObjID(c, ch.ino), size: c.Size, crc: c.Checksum, isChunk: true}
 	if ch.m == nil || ch.m.chunkCache == nil {
@@ -218,22 +246,37 @@ func (ch *chunkedReadHandle) loadChunk(ctx context.Context, c types.ChunkInfo) (
 		if errno != 0 {
 			return nil, errno, nil
 		}
-		data, errno := ch.fetchChunkWholeVerified(ctx, c)
+		plain, errno := ch.plainChunkData(ctx, c)
 		if errno != 0 {
 			release()
 			return nil, errno, nil
 		}
-		return data, 0, release
+		return plain, 0, release
 	}
 	if data, ok := ch.m.chunkCache.get(key); ok {
+		// 缓存里存的是已验证的最终交付字节：plain 即密文，aead 已解密成明文。
 		return data, 0, func() {}
 	}
 	release, errno := ch.acquireVerify(ctx)
 	if errno != 0 {
 		return nil, errno, nil
 	}
+	// 缓存层存"已验证的最终交付字节"：plain 块即密文本身；aead 块存解密后
+	// 明文（密钥/记录 AAD 由句柄快照固定，同键即同明文）。
 	data, errno := ch.m.chunkCache.load(ctx, key, func(ctx context.Context) ([]byte, syscall.Errno) {
-		return ch.fetchChunkWholeVerified(ctx, c)
+		data, errno := ch.fetchChunkWholeVerified(ctx, c)
+		if errno != 0 {
+			return nil, errno
+		}
+		if types.ChunkEncoding(c) != types.AeadRecordEncoding {
+			return data, 0
+		}
+		plain, err := ch.m.client.DecryptChunk(ctx, ch.contentManifest(c), c, data)
+		if err != nil {
+			log.Printf("aead chunk %d inode %d decrypt: %v", c.Index, ch.ino, err)
+			return nil, syscall.EIO
+		}
+		return plain, 0
 	})
 	if errno != 0 {
 		release()
@@ -319,7 +362,7 @@ func (m *Mount) acquireVerify(ctx context.Context) (func(), syscall.Errno) {
 // 副本。缓冲循环外分配一次复用于所有候选；坏块大小在任何 GET/alloc 前拒绝。
 // 轮转只在健康段内：next 是健康候选起点，suspect 段固定殿后，健康全败才依序试。
 func (ch *chunkedReadHandle) fetchChunkWholeVerified(ctx context.Context, c types.ChunkInfo) ([]byte, syscall.Errno) {
-	if c.Size <= 0 || c.Size > types.ChunkSize {
+	if c.Size <= 0 || c.Size > chunkStoredBound(ch.chunks) {
 		return nil, syscall.EIO // 坏元数据：make(c.Size+1) 前拒绝，防按块表无限分配
 	}
 	// 整块 GET 用无全程 Timeout 的共享 Transport 客户端，deadline 按字节数缩放
@@ -409,7 +452,7 @@ func (ch *chunkedReadHandle) rememberChunkNext(c types.ChunkInfo, next int) {
 //   - 短读/超长拒绝并上报 suspect；状态/头不符仅轮换副本。
 //     轮转只在健康段内（next 为健康候选起点），suspect 段固定殿后兜底。
 func (ch *chunkedReadHandle) fetchChunkRangeStrict(ctx context.Context, c types.ChunkInfo, start, end int64) ([]byte, syscall.Errno) {
-	if c.Size <= 0 || c.Size > types.ChunkSize {
+	if c.Size <= 0 || c.Size > chunkStoredBound(ch.chunks) {
 		return nil, syscall.EIO // 坏元数据：alloc/GET 前拒绝
 	}
 	want := end - start + 1
@@ -495,20 +538,23 @@ func (ch *chunkedReadHandle) Read(ctx context.Context, dest []byte, off int64) (
 	count := min(int64(len(dest)), ch.size-off)
 	end := off + count - 1
 
-	// 定位起始块：块表按 Index 升序，块基址 = Σ前序块大小。逐块先验大小：
-	// 上界 ChunkSize 保证 base 累加 ≤ MaxChunks×ChunkSize 永不溢出，
-	// 且超大/0/负长在任何 GET/alloc 前被拒（fetch 侧另有同款防御兜底）。
+	// 定位起始块：块表按 Index 升序，块基址 = Σ前序块逻辑长度。逐块先验大小：
+	// 上界保证 base 累加 ≤ MaxChunks×(ChunkSize+记录开销) 永不溢出，且超大/0/
+	// 负长在任何 GET/alloc 前被拒（fetch 侧另有同款防御兜底）。aead 块的物理
+	// Size 含记录开销，几何由逻辑长度与编码共同约束。
+	bound := chunkStoredBound(ch.chunks)
 	idx := len(ch.chunks)
 	var base int64
 	for i, c := range ch.chunks {
-		if c.Size <= 0 || c.Size > types.ChunkSize {
+		logical := types.ChunkLogicalSize(c)
+		if logical <= 0 || logical > types.ChunkSize || c.Size <= 0 || c.Size > bound {
 			return nil, syscall.EIO
 		}
-		if off < base+c.Size {
+		if off < base+logical {
 			idx = i
 			break
 		}
-		base += c.Size
+		base += logical
 	}
 	if idx >= len(ch.chunks) {
 		return nil, syscall.EIO // 块表覆盖不住文件大小：元数据不一致
@@ -517,10 +563,11 @@ func (ch *chunkedReadHandle) Read(ctx context.Context, dest []byte, off int64) (
 	cur := off
 	for cur <= end && idx < len(ch.chunks) {
 		c := ch.chunks[idx]
-		chunkStart := cur - base            // 块内偏移（cur 是绝对偏移）
-		chunkEnd := min(end-base, c.Size-1) // 同为块内偏移：end 绝对 → 相对
+		logical := types.ChunkLogicalSize(c)
+		chunkStart := cur - base              // 块内偏移（cur 是绝对偏移）
+		chunkEnd := min(end-base, logical-1)   // 同为块内偏移：end 绝对 → 相对
 		n := chunkEnd - chunkStart + 1
-		if c.Size <= 0 || c.Size > types.ChunkSize || chunkStart < 0 || chunkEnd < chunkStart || chunkStart >= c.Size {
+		if logical <= 0 || logical > types.ChunkSize || c.Size <= 0 || c.Size > bound || chunkStart < 0 || chunkEnd < chunkStart || chunkStart >= logical {
 			return nil, syscall.EIO // 块表损坏：拒绝而不是 panic / 读出错误字节
 		}
 		if c.ChecksumKnown || c.Checksum != 0 {
@@ -528,9 +575,9 @@ func (ch *chunkedReadHandle) Read(ctx context.Context, dest []byte, off int64) (
 			if errno != 0 {
 				return nil, errno
 			}
-			if int64(len(whole)) != c.Size {
+			if int64(len(whole)) != logical {
 				release()
-				return nil, syscall.EIO // 防御：整块校验路径保证长度
+				return nil, syscall.EIO // 防御：交付数据必须等于逻辑长度
 			}
 			out = append(out, whole[chunkStart:chunkEnd+1]...)
 			release() // copy-out 完成：校验 permit 归还
@@ -545,11 +592,27 @@ func (ch *chunkedReadHandle) Read(ctx context.Context, dest []byte, off int64) (
 			out = append(out, part...)
 		}
 		cur += n
-		base += c.Size
+		base += logical
 		idx++
 	}
 	if cur <= end {
 		return nil, syscall.EIO // 块表提前耗尽：元数据与块表不符
 	}
 	return fuse.ReadResultData(out), 0
+}
+
+// chunkStoredBound 给出一个块表内物理对象长度的安全上界：plain 块 = ChunkSize，
+// aead 块 = ChunkSize + 最大记录开销（64MiB 明文至多 1025 条记录）。
+func chunkStoredBound(chunks []types.ChunkInfo) int64 {
+	bound := types.ChunkSize
+	for _, c := range chunks {
+		if types.ChunkEncoding(c) != types.AeadRecordEncoding {
+			continue
+		}
+		if want, err := types.AeadStoredSize(types.ChunkSize); err == nil && want > bound {
+			bound = want
+		}
+		break
+	}
+	return bound
 }

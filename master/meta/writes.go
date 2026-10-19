@@ -148,7 +148,7 @@ func plannedWriteTx(tx *bolt.Tx, id uint64) (plannedWriteRecord, error) {
 		}
 		previous = chunk.Index
 	}
-	if u.State == types.WriteCommitted && (u.Result == nil || rec.Commit == nil || u.Result.Content == nil || u.Result.Content.ID != u.ID || types.ValidatePlainContent(*u.Result) != nil) {
+	if u.State == types.WriteCommitted && (u.Result == nil || rec.Commit == nil || u.Result.Content == nil || u.Result.Content.ID != u.ID || types.ValidateContentManifest(*u.Result) != nil) {
 		return rec, ErrWritePlanConflict
 	}
 	return rec, nil
@@ -522,7 +522,7 @@ func (s *Store) ReserveWriteChunk(actor WriteActor, req types.PlanWriteChunkRequ
 				return ErrWriteBudget
 			}
 		}
-		chunk = types.ChunkInfo{ID: choice.Object.ID, Index: req.Index, Size: req.StoredSize, Checksum: req.Checksum, ChecksumKnown: true, Replicas: append([]uint64(nil), choice.Layout.Nodes...)}
+		chunk = types.ChunkInfo{ID: choice.Object.ID, Index: req.Index, Size: req.StoredSize, LogicalSize: req.LogicalSize, Encoding: req.Encoding, Checksum: req.Checksum, ChecksumKnown: true, Replicas: append([]uint64(nil), choice.Layout.Nodes...)}
 		in.Chunks = append(in.Chunks, chunk)
 		sort.Slice(in.Chunks, func(i, j int) bool { return in.Chunks[i].Index < in.Chunks[j].Index })
 		rec.Upload.Chunks = append(rec.Upload.Chunks, choice)
@@ -543,7 +543,17 @@ func (s *Store) ReserveWriteChunk(actor WriteActor, req types.PlanWriteChunkRequ
 }
 
 func chunkMatchesPlan(c types.ChunkInfo, p types.WriteChunkPlan) bool {
-	return c.ID == p.Object.ID && c.Index == p.Index && c.Size == p.Object.StoredSize && c.ChecksumKnown && c.Checksum == p.Object.Checksum && reflect.DeepEqual(c.Replicas, p.Layout.Nodes)
+	return c.ID == p.Object.ID && c.Index == p.Index && c.Size == p.Object.StoredSize && c.LogicalSize == p.Object.LogicalSize && ChunkInfoEncodes(c, p.Object.Encoding) && c.ChecksumKnown && c.Checksum == p.Object.Checksum && reflect.DeepEqual(c.Replicas, p.Layout.Nodes)
+}
+
+// ChunkInfoEncodes 判断块表编码与 manifest 编码是否同一语义：空编码等价 plain-v1
+// （旧数据），plain 下允许任一写法；新编码必须逐字相等。
+func ChunkInfoEncodes(c types.ChunkInfo, encoding string) bool {
+	e := c.Encoding
+	if e == "" {
+		e = types.PlainEncoding
+	}
+	return e == encoding || (encoding == types.PlainEncoding && e == types.PlainEncoding)
 }
 
 func (s *Store) CommitPlannedWrite(actor WriteActor, req types.CommitWriteRequest, nodeMaxAge time.Duration, now time.Time) (types.Inode, types.Inode, bool, error) {

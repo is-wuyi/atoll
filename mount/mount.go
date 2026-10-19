@@ -519,6 +519,7 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 			ino:        in.ID,
 			size:       in.Size,
 			generation: in.Generation,
+			content:    in.Content,
 			chunks:     in.Chunks,
 			addr:       addr,
 			next:       make(map[int]int),

@@ -18,6 +18,7 @@ import (
 
 	"atoll/master/meta"
 	"atoll/pkg/auth"
+	"atoll/pkg/contentcrypto"
 	"atoll/pkg/types"
 )
 
@@ -40,6 +41,7 @@ type Server struct {
 	// 与 nodeMaxAge 解耦（后者可能长达小时级）：这里只吸收秒级同步延迟，
 	// 超时仍 409 交客户端兜底。测试可调小以免阻塞。
 	commitWait time.Duration
+	contentKEK *contentcrypto.KEK
 	// healthProbe 探测节点实时可达性；nil = 用真实 probeHealthz（GET /healthz）。
 	// 测试注入桩绕过真实网络（单测节点是假地址，无 /healthz 服务）。
 	healthProbe func(addr string) bool
@@ -65,6 +67,9 @@ func NewServer(store *meta.Store, nodeMaxAge time.Duration) *Server {
 
 // SetCommitWait 覆盖 min_copies 提交的等待上限（测试用，避免 20s 阻塞）。
 func (s *Server) SetCommitWait(d time.Duration) { s.commitWait = d }
+
+// SetContentKEK enables content-key metadata and authorized DEK retrieval.
+func (s *Server) SetContentKEK(kek *contentcrypto.KEK) { s.contentKEK = kek }
 
 // SetHealthProbe 覆盖节点可达性探测（测试用，注入桩绕过真实 /healthz 网络请求）。
 func (s *Server) SetHealthProbe(fn func(addr string) bool) { s.healthProbe = fn }

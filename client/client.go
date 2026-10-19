@@ -39,6 +39,10 @@ type Client struct {
 	writeMu      sync.Mutex
 	writeEnabled bool
 	writeChecked time.Time
+	// keyCache 是读取侧按对象缓存的内容 DEK（secure 会话下经 /auth/content-key
+	// 获取）。仅 aead 块使用；plain 块不触碰。
+	keyCacheMu sync.Mutex
+	keyCache   *chunkKeyCache
 }
 
 // SetPutTimeout 覆盖块 PUT 超时（测试用，注入小值快速验证超时+换节点）。
@@ -182,7 +186,7 @@ func (c *Client) Lookup(path string) (types.Inode, []Replica, error) {
 		return types.Inode{}, nil, err
 	}
 	if out.Inode.Content != nil {
-		if err := types.ValidatePlainContent(out.Inode); err != nil {
+		if err := types.ValidateContentManifest(out.Inode); err != nil {
 			return types.Inode{}, nil, err
 		}
 	}
@@ -660,8 +664,18 @@ func (c *Client) getChunked(in types.Inode, nodes []Replica, localPath string) e
 }
 
 // fetchChunkInto 下载一个块追加到 w。done 副本优先随机打散，失败轮换副本。
+// aead 块先按密文校验（长度/CRC），全部验证通过后才解密成明文写 w——
+// 任何记录解密失败都不写部分明文。plain 块行为不变。
 func (c *Client) fetchChunkInto(in types.Inode, ch types.ChunkInfo, addr map[uint64]string, w io.Writer) error {
-	if ch.Size <= 0 || ch.Size > types.ChunkSize {
+	maxStored := types.ChunkSize
+	if types.ChunkEncoding(ch) == types.AeadRecordEncoding {
+		if logical := types.ChunkLogicalSize(ch); logical > 0 {
+			if want, err := types.AeadStoredSize(logical); err == nil && want > maxStored {
+				maxStored = want
+			}
+		}
+	}
+	if ch.Size <= 0 || ch.Size > maxStored {
 		return fmt.Errorf("invalid chunk size %d", ch.Size)
 	}
 	var primary, fallback []uint64
@@ -715,6 +729,19 @@ func (c *Client) fetchChunkInto(in types.Inode, ch types.ChunkInfo, addr map[uin
 			lastErr = fmt.Errorf("节点 %s: 块 %d 校验和不符", a, ch.Index)
 			go c.reportChunkSuspect(in, ch, id)
 			continue
+		}
+		if types.ChunkEncoding(ch) == types.AeadRecordEncoding {
+			ctx2, cancel2 := context.WithTimeout(context.Background(), c.ioTimeout(types.ChunkLogicalSize(ch)))
+			plain, derr := c.DecryptChunk(ctx2, in, ch, buf)
+			cancel2()
+			if derr != nil {
+				lastErr = fmt.Errorf("节点 %s: 块 %d 解密失败: %w", a, ch.Index, derr)
+				continue
+			}
+			if _, err := w.Write(plain); err != nil {
+				return err
+			}
+			return nil
 		}
 		if _, err := w.Write(buf); err != nil {
 			return err
