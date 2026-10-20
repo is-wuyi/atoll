@@ -100,13 +100,50 @@ func TestAEADProbeFallsBackToPlain(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := newAeadUpload()
-	if a.probe(context.Background(), c, types.WriteUpload{ID: types.StagingInodeBase + 1}) {
-		t.Fatal("probe enabled aead without a master key service")
+	if err := a.probe(context.Background(), c, types.WriteUpload{ID: types.StagingInodeBase + 1}); err != nil || a.enabled {
+		t.Fatalf("409 should be compliant fallback: enabled=%v err=%v", a.enabled, err)
 	}
 	if a.enabled {
 		t.Fatal("fallback upload stayed enabled")
 	}
 	if hits.Load() == 0 {
 		t.Fatal("probe did not query the master")
+	}
+}
+
+// TestProbeDowngradeLoggedNotSilent：探测遇 500 时默认按 plain 继续（老集群
+// 兼容），requireEncryption 打开后同错误必须阻止 enabled 且不吞日志语义。
+func TestProbeDowngradePolicy(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/content-key/prepare", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	master := httptest.NewServer(mux)
+	t.Cleanup(master.Close)
+
+	c, err := NewSecure(master.URL, &tls.Config{InsecureSkipVerify: true}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetSession("sess"); err != nil {
+		t.Fatal(err)
+	}
+	u := types.WriteUpload{ID: types.StagingInodeBase + 5}
+
+	plain := newAeadUpload()
+	if err := plain.probe(context.Background(), c, u); err != nil {
+		t.Fatalf("default policy should tolerate 500: %v", err)
+	}
+	if plain.enabled {
+		t.Fatal("fallback upload stayed enabled")
+	}
+
+	c.SetRequireEncryption()
+	strict := newAeadUpload()
+	if err := strict.probe(context.Background(), c, u); err == nil {
+		t.Fatal("strict policy swallowed probe failure")
+	}
+	if !c.RequireEncryption() {
+		t.Fatal("require flag not retained")
 	}
 }

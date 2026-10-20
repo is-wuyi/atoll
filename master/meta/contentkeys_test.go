@@ -96,3 +96,69 @@ func TestContentKeyDoesNotExposeKEK(t *testing.T) {
 		t.Fatal("KEK representation leaked into envelope")
 	}
 }
+
+// 已发布（WriteCommitted）的加密对象：团队 read 成员可取钥，跨空间拒绝；
+// 在途（Pending）上传仍只有 Actor 本人可取。
+func TestPublishedContentKeySharedAfterCommit(t *testing.T) {
+	s := newTestStore(t)
+	admin, _ := bootstrapAdmin(t, s)
+	guest, _ := inviteAndRegister(t, s, admin.ID, "guest", time.Now())
+
+	// admin 建团队空间并加 guest 为 read 成员。
+	team, err := s.CreateTeam(admin.ID, "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTeamMember(admin.ID, team.ID, guest.ID, RoleRead); err != nil {
+		t.Fatalf("add read member: %v", err)
+	}
+
+	if err := s.EnableWritePlanning(); err != nil {
+		t.Fatal(err)
+	}
+	u, err := s.BeginPlannedWrite(WriteActor{UserID: admin.ID, SpaceID: team.ID}, team.RootID, "teamfile",
+		types.BeginWriteRequest{Path: "/teamfile", OpID: "op-team", Size: 8, Overwrite: false}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	kek, _ := contentcrypto.NewKEK("team-kek")
+	objectID := types.ChunkID(u.ID, 0)
+	if _, err := s.PrepareContentKey(admin.ID, team.ID, objectID, u.ID, kek, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// Pending：非上传人被拒（在途上传私有）。
+	if _, err := s.GetContentKey(guest.ID, team.ID, objectID, u.ID); err == nil {
+		t.Fatal("pending upload key leaked to non-actor")
+	}
+
+	// 补全合规 Committed 记录。
+	result := types.Inode{ID: u.ID, Type: types.TypeFile, Chunked: true, Size: 8, Generation: 1,
+		Content: &types.ContentVersion{ID: u.ID, LogicalSize: 8,
+			Extents: []types.ContentExtent{{Offset: 0, Length: 8, Object: types.ContentObject{
+				ID: objectID, Version: 1, LogicalSize: 8, StoredSize: 8, Encoding: types.PlainEncoding, ChecksumKnown: true}}}},
+		Chunks: []types.ChunkInfo{{ID: objectID, Index: 0, Size: 8, ChecksumKnown: true, Replicas: []uint64{1}, Done: []uint64{1}}}}
+	commit := types.CommitWriteRequest{WriteBinding: writeBinding(u), OpID: "op-team", Size: 8, ChunkCount: 1}
+	if err := s.write(func(w *txw) error {
+		rec, err := plannedWriteTx(w.tx, u.ID)
+		if err != nil {
+			return err
+		}
+		rec.Upload.State = types.WriteCommitted
+		rec.Upload.Result = &result
+		rec.Commit = &commit
+		return putPlannedWrite(w, rec)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Committed：上传人与团队 read 成员都可取——修复点。
+	if _, err := s.GetContentKey(admin.ID, team.ID, objectID, u.ID); err != nil {
+		t.Fatalf("owner denied after publish: %v", err)
+	}
+	if _, err := s.GetContentKey(guest.ID, team.ID, objectID, u.ID); err != nil {
+		t.Fatalf("team read member denied after publish: %v", err)
+	}
+	// 跨空间仍拒：guest 用个人空间取团队对象的钥。
+	if _, err := s.GetContentKey(guest.ID, guest.PersonalSpaceID, objectID, u.ID); err == nil {
+		t.Fatal("cross-space key fetch accepted")
+	}
+}

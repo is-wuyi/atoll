@@ -130,6 +130,14 @@ func NewSecure(masterURL string, tlsCfg *tls.Config, allowInsecure bool) (*Clien
 	}, nil
 }
 
+// SetRequireEncryption 在 secure 会话下要求加密写入：探测 master content-key
+// 服务因故障失败（非 409/404/405 的明确"无密钥服务"答复）时硬停上传，
+// 不静默降级明文。老集群未配 KEK 的合规回退不受影响。
+func (c *Client) SetRequireEncryption() { c.requireEncryption = true }
+
+// RequireEncryption 报告当前是否要求加密写入。
+func (c *Client) RequireEncryption() bool { return c.requireEncryption }
+
 // ObjectTransport 返回 secure 模式下供直连节点的调用方（FUSE 读句柄等）复用的
 // transport：节点请求自动换取票据，用户会话绝不外发。非 secure 模式返回 nil——
 // 调用方保持原有 auth.HTTPTransport 行为。与 c.HTTP 的 Transport 是同一实例

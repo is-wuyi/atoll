@@ -252,11 +252,17 @@ func readKeyPackRecord(body *bytes.Reader) (ContentKeyRecord, error) {
 // security bucket 后，只要配上原 KEK 文件即可重新发放 DEK。已有同对象记录必须
 // 完全一致（幂等重放），不一致拒绝——防跨集群混灌。
 // ImportKeyPack 把恢复包记录回放到当前库（灾备重建用）。记录回到 security
+// ImportKeyPack 把恢复包记录回放到当前库（灾备重建用）。记录回到 security
 // bucket 后，只要配上原 KEK 文件即可重新发放 DEK。已有同对象记录必须完全一致
 // （幂等重放），不一致拒绝——防跨集群混灌。createdAt 参数已并入各记录
 // （ReadKeyPack 以包头导出时间统一填充），保留参数以兼容显式传入的调用方；
 // 与记录内时间不一致时以记录为准。
-func (s *Store) ImportKeyPack(records []ContentKeyRecord, createdAt time.Time) (imported, unchanged int, err error) {
+//
+// expectKeyID 非空时作为护栏：记录的 keyID 与本机 KEK 不一致则整包拒绝——
+// 防止"拿错 KEK 文件的 keypack"导入成功而实际内容不可解（恢复演练会显示
+// 成功但全部 DEK 无法 Unwrap）。它不是认证：HMAC 只绑定公开 keyID，能防
+// 手滑不能防有意伪造（见 SECURITY.md 保管边界）。
+func (s *Store) ImportKeyPack(records []ContentKeyRecord, createdAt time.Time, expectKeyID string) (imported, unchanged int, err error) {
 	if len(records) == 0 || createdAt.IsZero() {
 		return 0, 0, ErrWritePlanConflict
 	}
@@ -264,6 +270,9 @@ func (s *Store) ImportKeyPack(records []ContentKeyRecord, createdAt time.Time) (
 		for _, rec := range records {
 			if rec.ObjectID == 0 || rec.Generation == 0 || rec.SpaceID == 0 || rec.KeyID == "" || rec.WrappedDEK == "" {
 				return ErrWritePlanConflict
+			}
+			if expectKeyID != "" && rec.KeyID != expectKeyID {
+				return fmt.Errorf("keypack: record key id %q does not match the local KEK %q", rec.KeyID, expectKeyID)
 			}
 			raw, err := json.Marshal(rec)
 			if err != nil {

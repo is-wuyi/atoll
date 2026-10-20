@@ -43,6 +43,9 @@ type Client struct {
 	// 获取）。仅 aead 块使用；plain 块不触碰。
 	keyCacheMu sync.Mutex
 	keyCache   *chunkKeyCache
+	// requireEncryption：secure 会话下加密探测因故障（非 409/404/405）失败时
+	// 硬停上传，而不是静默降级明文。CLI -require-encryption / mount 同名开关。
+	requireEncryption bool
 }
 
 // SetPutTimeout 覆盖块 PUT 超时（测试用，注入小值快速验证超时+换节点）。

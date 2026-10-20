@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 
@@ -17,8 +18,11 @@ import (
 // KEK 时退回 plain——加密是可选能力，不是硬前提。
 type aeadUpload struct {
 	enabled bool
-	mu      sync.Mutex
-	deks    map[uint64]*contentcrypto.DEK
+	// fatal：requireEncryption 下探测失败的硬错误；首个块上传前返回它，
+	// 阻止明文继续。
+	fatal error
+	mu    sync.Mutex
+	deks  map[uint64]*contentcrypto.DEK
 }
 
 func newAeadUpload() *aeadUpload {
@@ -26,25 +30,30 @@ func newAeadUpload() *aeadUpload {
 }
 
 // probe 决定本次上传是否走加密通道：只有 secure 会话才探测 master 的
-// content-key 服务（409 = 未配置 KEK、404/405 = 旧 master 不支持，都回退 plain）；
-// 其他错误（会话失效、网络）如实上抛——静默吞掉会掩盖真实故障。
-func (a *aeadUpload) probe(ctx context.Context, c *Client, u types.WriteUpload) bool {
+// content-key 服务（409 = 未配置 KEK、404/405 = 旧 master 不支持，都回退 plain）。
+// 其他错误（会话失效、网络、服务故障）分两种策略：默认记录日志后按 plain 继续
+// （老集群兼容优先）；设置 RequireEncryption 后返回错误硬停上传——配置了加密
+// 的集群不允许在 master 故障窗口静默降级成明文落盘。
+func (a *aeadUpload) probe(ctx context.Context, c *Client, u types.WriteUpload) error {
 	if c.sec == nil {
-		return false
+		return nil
 	}
 	probe := newAeadUpload()
 	probe.enabled = true
 	if _, err := probe.chunkDEK(ctx, c, u, 0); err != nil {
 		var he *HTTPError
 		if errors.As(err, &he) && (he.StatusCode == http.StatusConflict || he.StatusCode == http.StatusNotFound || he.StatusCode == http.StatusMethodNotAllowed) {
-			return false
+			return nil // master 明确表示无密钥服务：合规回退
 		}
-		// 探测期错误不硬停上传：记录后按 plain 继续，块级取密钥失败会再如实报错。
-		return false
+		if c.requireEncryption {
+			return fmt.Errorf("require-encryption: content key unavailable: %w", err)
+		}
+		log.Printf("atoll: content-key probe failed, uploading plaintext (use -require-encryption to enforce): %v", err)
+		return nil
 	}
 	a.enabled = true
 	a.deks = probe.deks
-	return true
+	return nil
 }
 
 // prepareChunkKey 为 (upload, index) 取块 DEK：先查缓存，再向 master 的

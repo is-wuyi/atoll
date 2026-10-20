@@ -136,13 +136,22 @@ func (s *Store) GetContentKey(userID, spaceID, objectID, generation uint64) (Con
 				if err != nil {
 					return err
 				}
-				if rec.Actor != (WriteActor{UserID: userID, SpaceID: spaceID}) {
-					return ErrAuthentication
+				if rec.Upload.State == types.WritePending || rec.Upload.State == types.WriteAborted {
+					// 在途/已放弃的上传仍属上传者私有：只有 Actor 本人可取钥。
+					if rec.Actor != (WriteActor{UserID: userID, SpaceID: spaceID}) {
+						return ErrAuthentication
+					}
+					if rec.Upload.State == types.WriteAborted {
+						return ErrWriteExpired
+					}
 				}
-				if rec.Upload.State == types.WriteAborted {
-					return ErrWriteExpired
-				}
+				// 已提交（WriteCommitted）：密钥随对象进入空间——授权完全由
+				// 上面的 authorizeSpaceTx(read) 决定，团队 read/write 成员与
+				// 平台管理员都可取钥。归属仍经下面的 inodeInSpaceTx 双重校验。
 			} else if _, err := getInodeTx(tx, generation); err != nil {
+				return err
+			}
+			if err := inodeInSpaceTx(tx, spaceID, anchor); err != nil {
 				return err
 			}
 		} else {

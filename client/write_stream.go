@@ -33,7 +33,12 @@ type plannedStream struct {
 func newPlannedStream(c *Client, u types.WriteUpload, ctx context.Context) *plannedStream {
 	ctx, cancel := context.WithCancel(ctx)
 	a := newAeadUpload()
-	a.probe(ctx, c, u)
+	if err := a.probe(ctx, c, u); err != nil {
+		// requireEncryption 下的硬失败：记入流错误，让首个块上传如实失败，
+		// 不允许静默明文继续。
+		a = newAeadUpload()
+		a.fatal = err
+	}
 	return &plannedStream{c: c, upload: u, ctx: ctx, cancel: cancel, slots: make(chan struct{}, 2), commitOp: newOpID(), aead: a}
 }
 

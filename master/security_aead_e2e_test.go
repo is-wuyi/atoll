@@ -9,6 +9,7 @@ package master
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -160,4 +161,66 @@ func TestSecurePlainClusterStillUploadsPlaintext(t *testing.T) {
 	if !bytes.Contains(stored, payload[:4096]) {
 		t.Fatal("plain cluster should store plaintext")
 	}
+}
+
+// TestSecureAEADTeamReadMemberDecrypts：加密文件发布后，团队 read 成员能取钥并
+// 解密读回——多人空间加密协作的核心场景（此前零覆盖，Actor 锁死缺陷的回归测试）。
+func TestSecureAEADTeamReadMemberDecrypts(t *testing.T) {
+	c := newSecureCluster(t, 2)
+	if err := c.srv.EnableWritePlanning(WritePlanningConfig{MaxReplicas: 2}); err != nil {
+		t.Fatal(err)
+	}
+	kek, err := contentcrypto.NewKEK("aead-team-20261021")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.srv.SetContentKEK(kek)
+
+	_, adminToken := c.adminLogin()
+	aliceInfo, aliceSpace := c.secCreateUser(adminToken, "alice")
+	alice, _ := c.secLogin("alice", secUserPassword)
+	guestInfo, _ := c.secCreateUser(adminToken, "greg")
+
+	// alice 建团队，greg 为 read 成员；alice 上传加密文件到团队空间。
+	team, err := alice.CreateTeam(context.Background(), "proj")
+	if err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+	if err := alice.AddMember(context.Background(), team.ID, guestInfo.ID, "read"); err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+	if err := alice.UseSpace(team.ID); err != nil {
+		t.Fatal(err)
+	}
+	payload := secRandomBytes(96 << 10)
+	secRequireOK(t, alice.PutReaderOverwrite("/shared.bin", int64(len(payload)), bytes.NewReader(payload), 1, false), "team aead upload")
+	in, _, err := alice.Lookup("/shared.bin")
+	if err != nil || in.Content == nil || in.Content.Extents[0].Object.Encoding != types.AeadRecordEncoding {
+		t.Fatalf("team upload not encrypted: %v %+v", err, in.Content)
+	}
+
+	// greg 用团队空间读回并解密。
+	greg, _ := c.secLogin("greg", secUserPassword)
+	if err := greg.UseSpace(team.ID); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "greg.bin")
+	secRequireOK(t, greg.Get("/shared.bin", out), "guest decrypt read")
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secMD5(got) != secMD5(payload) {
+		t.Fatal("team member decrypted content mismatch")
+	}
+
+	// greg 不能用个人空间取团队对象的钥（跨空间拒绝）。
+	if err := greg.UseSpace(guestInfo.PersonalSpaceID); err != nil {
+		t.Fatal(err)
+	}
+	if err := greg.Get("/shared.bin", filepath.Join(t.TempDir(), "nope.bin")); err == nil {
+		t.Fatal("cross-space read accepted")
+	}
+	_ = aliceSpace
+	_ = aliceInfo
 }

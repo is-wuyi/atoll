@@ -236,6 +236,10 @@ func (c *Client) uploadPlannedChunk(ctx context.Context, u types.WriteUpload, in
 // plain 几何上传（旧行为）；启用时先取块 DEK、密封为 aead-record-v1 密文，
 // 以密文字节构造 Reserve（CRC 与存储长度都按密文计），再向计划节点直传。
 func (c *Client) uploadPlannedChunkAEAD(ctx context.Context, u types.WriteUpload, index int, data []byte, aead *aeadUpload) error {
+	if aead != nil && aead.fatal != nil {
+		// requireEncryption 下的探测硬失败：不做明文上传。
+		return aead.fatal
+	}
 	encoding := types.PlainEncoding
 	upload := data
 	if aead != nil && aead.enabled {

@@ -508,6 +508,7 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	sessionEnv := fs.String("session-env", "ATOLL_SESSION", "安全用户会话环境变量")
 	space := fs.Uint64("space", securitySpaceEnv(), "安全用户空间 ID")
 	allowInsecure := fs.Bool("allow-insecure", false, "仅供隔离测试：允许安全会话明文 HTTP")
+	requireEncryption := fs.Bool("require-encryption", false, "加密探测因故障失败时硬停上传，不静默降级明文（仅 put/secure 会话）")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
 	tlsCA := fs.String("tls-ca", "", "校验服务端证书用的 CA（master 走 https 时）")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
@@ -523,6 +524,9 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "atoll client:", err)
 		return 1
+	}
+	if *requireEncryption {
+		c.SetRequireEncryption()
 	}
 
 	switch cmd {

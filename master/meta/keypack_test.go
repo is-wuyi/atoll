@@ -62,7 +62,7 @@ func TestKeyPackExportImportRoundTrip(t *testing.T) {
 	// 在全新库导入：恢复出相同 wrapped DEK，可重新经 GetContentKey 发放。
 	s2 := newTestStore(t)
 	admin2, space2 := bootstrapAdmin(t, s2)
-	imported, unchanged, err := s2.ImportKeyPack(records, now)
+	imported, unchanged, err := s2.ImportKeyPack(records, now, "")
 	if err != nil || imported != 1 || unchanged != 0 {
 		t.Fatalf("ImportKeyPack: %v imported=%d unchanged=%d", err, imported, unchanged)
 	}
@@ -77,7 +77,7 @@ func TestKeyPackExportImportRoundTrip(t *testing.T) {
 	}
 	_ = space2
 	// 幂等重放：全部 unchanged，无重复写入。
-	imported2, unchanged2, err := s2.ImportKeyPack(records, now)
+	imported2, unchanged2, err := s2.ImportKeyPack(records, now, "")
 	if err != nil || imported2 != 0 || unchanged2 != 1 {
 		t.Fatalf("replay: %v imported=%d unchanged=%d", err, imported2, unchanged2)
 	}
@@ -148,7 +148,7 @@ func TestKeyPackImportRefusesForeignConflict(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s2.ImportKeyPack(records, now); err == nil {
+	if _, _, err := s2.ImportKeyPack(records, now, ""); err == nil {
 		t.Fatal("conflicting import accepted")
 	}
 }
@@ -176,8 +176,42 @@ func TestKeyPackReplayIgnoresCreatedAt(t *testing.T) {
 		t.Fatalf("夹具未制造差异：库内 %v == 包内 %v", cur.CreatedAt, records[0].CreatedAt)
 	}
 	// 同库幂等重放必须成功（修复前这里返回 ErrObjectChanged）。
-	imported, unchanged, err := s.ImportKeyPack(records, now)
+	imported, unchanged, err := s.ImportKeyPack(records, now, "")
 	if err != nil || imported != 0 || unchanged != 1 {
 		t.Fatalf("replay: %v imported=%d unchanged=%d", err, imported, unchanged)
 	}
+}
+
+// TestKeyPackImportRejectsWrongKeyID：expectKeyID 护栏——记录 keyID 与本机
+// KEK 不一致整包拒绝（防止拿错 KEK 文件的包导入"成功"而内容不可解）。
+func TestKeyPackImportRejectsWrongKeyID(t *testing.T) {
+	s := newTestStore(t)
+	admin, space := bootstrapAdmin(t, s)
+	_, objectID := seedKeyedStore(t, s, admin, space, "keyid-guard")
+
+	var buf bytes.Buffer
+	now := time.Now().Truncate(time.Second)
+	if _, err := s.ExportKeyPack(&buf, "pack-test-kek", now); err != nil {
+		t.Fatal(err)
+	}
+	_, records, err := ReadKeyPack(&buf, "pack-test-kek")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2 := newTestStore(t)
+	// 正确 keyID：导入成功。
+	if _, _, err := s2.ImportKeyPack(records, now, "pack-test-kek"); err != nil {
+		t.Fatalf("matching key id rejected: %v", err)
+	}
+	// 错误 keyID：整包拒绝。
+	s3 := newTestStore(t)
+	if _, _, err := s3.ImportKeyPack(records, now, "other-kek"); err == nil {
+		t.Fatal("wrong key id accepted (DR drill would report success with undecryptable content)")
+	}
+	// 空串：不设护栏（无 KEK 场景），保持可导入。
+	s4 := newTestStore(t)
+	if _, _, err := s4.ImportKeyPack(records, now, ""); err != nil {
+		t.Fatalf("unguarded import failed: %v", err)
+	}
+	_ = objectID
 }

@@ -131,6 +131,16 @@ func runKeyPackImport(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "keypack import:", err)
 		return 1
 	}
+	// 护栏：记录 keyID 与本机 KEK 不一致整包拒绝——防止拿错 KEK 文件的包
+	// 导入"成功"而实际内容不可解。无 key-file 时无法校验（已在上面提示）。
+	if verifyKeyID != "" && header.KeyID != verifyKeyID {
+		fmt.Fprintf(stderr, "keypack import: 包属于 keyID %q，与本机 KEK %q 不一致，拒绝导入\n", header.KeyID, verifyKeyID)
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "keypack import:", err)
+		return 1
+	}
 	if verifyKeyID == "" {
 		fmt.Fprintln(stderr, "keypack import: 未提供 -key-file，跳过完整性校验（不能排除包被篡改或来自其他 KEK）")
 	}
@@ -140,7 +150,7 @@ func runKeyPackImport(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer store.Close()
-	imported, unchanged, err := store.ImportKeyPack(records, header.CreatedAt)
+	imported, unchanged, err := store.ImportKeyPack(records, header.CreatedAt, verifyKeyID)
 	if err != nil {
 		fmt.Fprintln(stderr, "keypack import:", err)
 		return 1
