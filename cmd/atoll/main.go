@@ -69,6 +69,7 @@ const usageText = `usage: atoll <command> [args]
   atoll gc [--execute]              垃圾回收（dry-run 默认；--execute 执行删除）
 	atoll auth gen                    生成随机集群认证 token
 	atoll content-key-init -path FILE  创建受保护的内容 KEK 文件（不写数据库/WAL）
+	atoll keypack export|import        内容密钥恢复包离线导出/导入（与 KEK 分开保管）
 
 认证与空间选择:
   兼容模式（默认）：全部角色支持 -token 或 ATOLL_TOKEN（集群各组件须一致；
@@ -107,6 +108,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runAuth(rest, stdout, stderr)
 	case "content-key-init":
 		return runContentKeyInit(rest, stdout, stderr)
+	case "keypack":
+		return runKeyPack(rest, stdout, stderr)
 	case "login", "logout", "spaces", "team-create", "team-member":
 		return runUserSecurity(cmd, rest, stdout, stderr)
 	case "help", "-h", "--help":
