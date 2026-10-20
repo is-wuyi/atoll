@@ -152,3 +152,32 @@ func TestKeyPackImportRefusesForeignConflict(t *testing.T) {
 		t.Fatal("conflicting import accepted")
 	}
 }
+
+// TestKeyPackReplayIgnoresCreatedAt 复现真机（5884ba5）发现：ExportKeyPack 剥离
+// 记录的 CreatedAt（readKeyPackRecord 置零，ReadKeyPack 再统一填包头导出时间），
+// 而 ImportKeyPack 曾按 JSON 逐字节比较——同库幂等重放必然因 CreatedAt 不一致
+// 被拒。正确语义：比较只看真正落包的五个字段，忽略包内不含的 CreatedAt。
+func TestKeyPackReplayIgnoresCreatedAt(t *testing.T) {
+	s := newTestStore(t)
+	admin, space := bootstrapAdmin(t, s)
+	_, objectID := seedKeyedStore(t, s, admin, space, "replay-createdAt")
+
+	var buf bytes.Buffer
+	now := time.Now().Truncate(time.Second)
+	if _, err := s.ExportKeyPack(&buf, "pack-test-kek", now); err != nil {
+		t.Fatal(err)
+	}
+	_, records, err := ReadKeyPack(&buf, "pack-test-kek")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 包内 CreatedAt 是导出时间；库内是 Prepare 时间，两者必然不同。
+	if cur, err := s.ContentKey(objectID); err == nil && cur.CreatedAt.Equal(records[0].CreatedAt) {
+		t.Fatalf("夹具未制造差异：库内 %v == 包内 %v", cur.CreatedAt, records[0].CreatedAt)
+	}
+	// 同库幂等重放必须成功（修复前这里返回 ErrObjectChanged）。
+	imported, unchanged, err := s.ImportKeyPack(records, now)
+	if err != nil || imported != 0 || unchanged != 1 {
+		t.Fatalf("replay: %v imported=%d unchanged=%d", err, imported, unchanged)
+	}
+}

@@ -270,12 +270,10 @@ func (s *Store) ImportKeyPack(records []ContentKeyRecord, createdAt time.Time) (
 				return err
 			}
 			if current, err := contentKeyTx(w.tx, rec.ObjectID); err == nil {
-				// 幂等重放：逐字节相同（含 CreatedAt，比较走 JSON 规范序列）才接受。
-				currentRaw, err := json.Marshal(current)
-				if err != nil {
-					return err
-				}
-				if !bytes.Equal(currentRaw, raw) {
+				// 幂等重放：包内不含 CreatedAt（ReadKeyPack 以包头时间填充），比较必须
+				// 忽略该字段，只校验真正落包的五个字段。
+				if current.ObjectID != rec.ObjectID || current.Generation != rec.Generation ||
+					current.SpaceID != rec.SpaceID || current.KeyID != rec.KeyID || current.WrappedDEK != rec.WrappedDEK {
 					return ErrObjectChanged
 				}
 				unchanged++
