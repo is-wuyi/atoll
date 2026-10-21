@@ -2,6 +2,7 @@ package master
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -501,9 +502,13 @@ func TestSyncPrefixConcurrentBackupWritesRecover(t *testing.T) {
 	backupWG.Wait()
 
 	// 收尾：一笔必然成功的写把残余前缀全部补齐（故障已解除）。
+	// 决策点1：hook 失败不撤回本地提交——某次尝试可能"本地已建成但返回错误"，
+	// 重试即 ErrExist；它与成功等价（前缀闸已由该次提交承担），不算失败。
 	var finalErr error
 	for i := 0; i < 50; i++ {
-		if _, finalErr = store.CreateDir(meta.RootID, "conc-final"); finalErr == nil {
+		_, finalErr = store.CreateDir(meta.RootID, "conc-final")
+		if finalErr == nil || errors.Is(finalErr, meta.ErrExist) {
+			finalErr = nil
 			break
 		}
 		time.Sleep(10 * time.Millisecond)

@@ -80,7 +80,7 @@ ATOLL_CONSOLE_PASSWORD='你的密码' ./atoll console useradd -data-dir ./consol
 ## 限制
 
 - **单文件上限 16 GiB**：分块模型固定 64 MiB/块、每文件最多 256 块（`ChunkSize × MaxChunksPerFile`）。超过上限的 `put` 会直接报错。
-- **master 单点**：目前仍为单主；已有元数据快照/WAL 备份和恢复能力（正确性由 `master/meta/wal_test.go` 的 metaWAL 快照+重放测试证明），但不提供自动接管。账号、文件密钥的加密灾备与独立恢复包尚未实现——**安全模式下远程（集群种子）元数据备份/恢复被主动禁用**，仅可用本地库备份；本地库正常重启读取的是同库持久化内容，不等于独立的集群灾备恢复（详见 [安全说明](SECURITY.md)）。
+- **master 单点**：目前仍为单主；已有元数据快照/WAL 备份和恢复能力（正确性由 `master/meta/wal_test.go` 的 metaWAL 快照+重放测试证明），但不提供自动接管。secure Master 配置 `-content-key-file` 后远程元数据备份已解禁：快照/WAL/manifest 全加密进节点，中心全损时凭恢复公钥签名离线读取重建（详见 [安全说明](SECURITY.md)）。内容密钥的独立恢复包（keypack）已提供，账号元数据的加密灾备演练建议定期执行。
 - **安全模式下的静态加密（aead-record-v1）**：secure Master 配置 `-content-key-file` 后，计划写入自动按 64KiB AES-256-GCM 记录加密后直传节点——节点磁盘只见密文，CRC 与容量按密文计，读取在客户端/FUSE 解密；未配置 KEK 的集群行为不变（明文）。已发布对象的历史数据不迁移，仍按 plain 读取。内容密钥可用 `atoll keypack export/import` 离线导出/导入（恢复包与 KEK 分开保管；完整灾备 = 元数据快照 + KEK 文件 + 密钥恢复包）。KEK 轮换与旧数据重加密尚未实现（见 [安全说明](SECURITY.md)）。
 - **无回收站**：删除立即移除命名空间，但已发布内容的物理对象暂时保留，不用扫描次数或短宽限期证明“没有读者”。未发布的取消/过期上传可以在持久封禁和删除确认后释放容量；没有 30 天回收站或恢复接口，详见 [对象退隐说明](RETIREMENT.md)。
 

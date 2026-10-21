@@ -1,6 +1,8 @@
 package node
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -10,8 +12,14 @@ import (
 	"sort"
 	"strings"
 
+	"atoll/pkg/metacrypto"
 	"atoll/pkg/types"
 )
+
+// metadataReaderPinKey 是中心安装元数据恢复公钥用的固定 blob key。
+// 恢复方（持恢复签名）只能 GET；PUT 需要在线控制票据，中心全损时恢复方拿不到，
+// 因此 pin 不可被恢复方伪造或覆写。
+const metadataReaderPinKey = "reader.pin"
 
 // 元数据备份 blob 存储：master HA 第一阶段用节点当元数据的灾备后端。
 //
@@ -49,10 +57,34 @@ func (n *Node) metaBlobPath(key string) string {
 
 // handleMetaPut PUT /meta-backup/{key} —— 写入一个元数据 blob（同 storeObject 的
 // 临时文件+fsync+原子改名+目录 fsync 持久化模式；带可选 CRC32C 校验）。
+// key == reader.pin 时额外把恢复公钥装进安全层（该 PUT 只有持在线控制票据的
+// master 能通过——恢复凭据只支持 GET，恢复方无法伪造 pin）。
 func (n *Node) handleMetaPut(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if !validMetaKey(key) {
 		httpError(w, http.StatusBadRequest, "invalid meta key")
+		return
+	}
+	if key == metadataReaderPinKey && n.sec != nil {
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			httpError(w, http.StatusBadRequest, "read reader pin failed")
+			return
+		}
+		var info metacrypto.ReaderInfo
+		if json.Unmarshal(body, &info) != nil {
+			httpError(w, http.StatusBadRequest, "invalid reader pin")
+			return
+		}
+		if err := n.sec.SetMetadataReader(info); err != nil {
+			httpError(w, http.StatusBadRequest, "invalid reader pin")
+			return
+		}
+		if _, err := n.storeMetaBlob(key, bytes.NewReader(body), parseChecksumHeader(r)); err != nil {
+			httpError(w, http.StatusInternalServerError, "persist reader pin failed")
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]int64{"size": int64(len(body))})
 		return
 	}
 	size, err := n.storeMetaBlob(key, r.Body, parseChecksumHeader(r))
@@ -181,4 +213,24 @@ func (n *Node) storeMetaBlob(key string, r io.Reader, expectCRC uint32) (int64, 
 		dir.Close()
 	}
 	return size, nil
+}
+
+// loadMetadataReaderPin 启动时从磁盘读回持久化的恢复公钥（中心重启不要求
+// 重新下发）。损坏/缺失都不致命：缺失 = 恢复通道未安装，缺失照旧运行。
+func (n *Node) loadMetadataReaderPin() {
+	if n.sec == nil {
+		return
+	}
+	raw, err := os.ReadFile(n.metaBlobPath(metadataReaderPinKey))
+	if err != nil {
+		return
+	}
+	var info metacrypto.ReaderInfo
+	if json.Unmarshal(raw, &info) != nil {
+		log.Printf("metadata reader pin corrupt on disk; ignoring")
+		return
+	}
+	if err := n.sec.SetMetadataReader(info); err != nil {
+		log.Printf("metadata reader pin invalid on disk; ignoring: %v", err)
+	}
 }

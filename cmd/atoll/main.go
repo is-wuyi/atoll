@@ -39,7 +39,7 @@ const usageText = `usage: atoll <command> [args]
                  [-write-planning 启用调度器计划写入；启用后重启须保留开关]
                  [-secure 启用安全模式：强制 TLS 证书且拒绝 -tls-skip-verify、
                  控制凭据读 -control-token-env（默认 ATOLL_CONTROL_TOKEN，≥24 字符）、
-                 拒绝 -seeds 远程备份（安全模式仅本地库备份）；库未引导须先 auth init]
+                 远程备份须配 -content-key-file（加密后允许 -seeds）；库未引导须先 auth init]
   atoll node     启动存储节点（对象存储 + 心跳）
                  [-secure 启用节点独立身份：首次入网需设备邀请码环境变量
                  -invite-env（默认 ATOLL_NODE_INVITE），强制 TLS；此后同一身份静默续期]
@@ -188,8 +188,8 @@ func runMaster(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "secure master requires a private control token of at least 24 characters")
 		return 1
 	}
-	if *secure && len(seeds) > 0 {
-		fmt.Fprintln(stderr, "secure recovery from node backups is not enabled yet; use a local database backup")
+	if *secure && len(seeds) > 0 && *contentKeyFile == "" {
+		fmt.Fprintln(stderr, "secure remote metadata backup requires -content-key-file (account metadata must be encrypted before it reaches untrusted nodes); use an offline local backup")
 		return 1
 	}
 
@@ -243,6 +243,12 @@ func runMaster(args []string, stderr io.Writer) int {
 	// 配了种子才跑备份循环（否则退化为纯本地，无灾备）。
 	if len(seeds) > 0 {
 		backup.StartLoop(ctx, 0) // walIntv=0 → 内部取 Interval/5
+		if backup.EncryptionEnabled() {
+			// 恢复公钥 pin 到全部存活节点（失败不致命：下轮备份后再重试）。
+			if err := backup.InstallMetadataReader(); err != nil {
+				log.Printf("元数据恢复公钥下发失败（将随备份重试）: %v", err)
+			}
+		}
 		log.Printf("元数据备份进集群已启用：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
 	}
 	// 关闭顺序：等扫描器 + 备份 goroutine 全部退出后再关 store，避免关库时仍在读写。
@@ -271,6 +277,15 @@ func runMaster(args []string, stderr io.Writer) int {
 				return 1
 			}
 			srv.SetContentKEK(kek)
+			// 元数据备份加密：secure 模式 + seeds + KEK 才允许把备份进集群
+			// （无 KEK 的 secure 模式仍拒绝——账号元数据不能明文进节点）。
+			if len(seeds) > 0 {
+				if err := backup.SetMetaKEK(kek); err != nil {
+					store.Close()
+					fmt.Fprintln(stderr, "secure master metadata backup key:", err)
+					return 1
+				}
+			}
 		}
 		if err := srv.EnableSecurity(master.SecurityConfig{ControlToken: auth.Token(os.Getenv(*controlEnv)), AllowInsecure: *allowInsecure}); err != nil {
 			fmt.Fprintln(stderr, "secure master:", err)

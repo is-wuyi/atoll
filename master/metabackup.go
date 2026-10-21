@@ -17,6 +17,8 @@ import (
 
 	"atoll/master/meta"
 	"atoll/pkg/auth"
+	"atoll/pkg/contentcrypto"
+	"atoll/pkg/metacrypto"
 	"atoll/pkg/types"
 )
 
@@ -69,6 +71,8 @@ type Manifest struct {
 	Chunks        []ChunkRef  `json:"chunks"`       // 快照分块（按 idx 升序）
 	WALSegs       []WALSegRef `json:"wal_segs"`     // 快照之后的 WAL 段（按 seq 升序）
 	SnapshotBytes int64       `json:"snapshot_bytes"`
+	Encrypted bool `json:"encrypted,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // LatestSeq 返回该 manifest 覆盖到的最新 WAL seq。
@@ -146,6 +150,8 @@ type MetaBackup struct {
 	lastManifest Manifest  // 最近一次备份的 manifest（供 ShipWAL 增量追加）
 	lastBackupAt time.Time // 最近一次成功全量备份时刻
 	lastErr      string    // 最近一次备份错误（成功则空）
+	cipher *metacrypto.Cipher
+	manifestWire []byte // Randomized encrypted manifests must retain their exact published bytes.
 }
 
 // NewMetaBackup 创建备份器。token/TLS 经 SetToken/SetTLS 生效（同 Scanner）。
@@ -164,7 +170,7 @@ func NewMetaBackup(store *meta.Store, nodeMaxAge time.Duration, cfg MetaBackupCo
 
 // SetStore 设置元数据库（NewMetaBackup 可传 nil，恢复决策产出 store 后再注入）。
 // 换库（恢复/重建）后旧的前缀确认状态一律作废：宁可重新确证基线、逐帧重补，
-// 不可复用可能不可靠的旧水印。
+// 不可复用可能不可靠旧水印。
 func (b *MetaBackup) SetStore(s *meta.Store) {
 	b.mu.Lock()
 	b.store = s
@@ -173,6 +179,57 @@ func (b *MetaBackup) SetStore(s *meta.Store) {
 	b.syncSeq = 0
 	b.mu.Unlock()
 }
+
+// Configure before recovery or starting workers; the KEK never leaves the center.
+func (b *MetaBackup) SetMetaKEK(kek *contentcrypto.KEK) error {
+	c, err := metacrypto.New(kek)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cipher != nil && b.cipher.Namespace() != c.Namespace() {
+		return fmt.Errorf("metadata backup key cannot change while configured")
+	}
+	b.cipher = c
+	return nil
+}
+
+func (b *MetaBackup) EncryptionEnabled() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cipher != nil
+}
+
+func (b *MetaBackup) encodeBlob(key string, plain []byte) ([]byte, error) {
+	b.mu.Lock()
+	c := b.cipher
+	b.mu.Unlock()
+	if c == nil {
+		if b.store != nil {
+			secure, err := b.store.SecurityEnabled()
+			if err != nil || secure {
+				return nil, fmt.Errorf("secure metadata backup requires encryption")
+			}
+		}
+		return plain, nil
+	}
+	return c.Seal(key, plain)
+}
+
+func (b *MetaBackup) decodeBlob(key string, wire []byte) ([]byte, error) {
+	b.mu.Lock()
+	c := b.cipher
+	b.mu.Unlock()
+	if c == nil {
+		if metacrypto.IsEncrypted(wire) {
+			return nil, fmt.Errorf("encrypted metadata backup requires its KEK")
+		}
+		return wire, nil
+	}
+	return c.Open(key, wire)
+}
+
 
 // Config 返回当前配置快照（线程安全）。
 func (b *MetaBackup) Config() MetaBackupConfig {
@@ -277,7 +334,10 @@ func (b *MetaBackup) syncConfirmThrough(seq uint64) error {
 		if f.Seq > seq {
 			break // 更后的帧由它们自己的钩子/确认负责
 		}
-		holders := b.shipBlob(targets, fmt.Sprintf("wal-sync-%d", f.Seq), meta.EncodeFrameSyncBlob(f))
+		holders, err := b.shipBlob(targets, fmt.Sprintf("wal-sync-%d", f.Seq), meta.EncodeFrameSyncBlob(f))
+		if err != nil {
+			return fmt.Errorf("同步复制: 帧 %d 加密失败: %w", f.Seq, err)
+		}
 		if len(holders) < need {
 			return fmt.Errorf("同步复制: 帧 %d 仅 %d/%d 个节点确认（前缀 %d..%d 未补齐，拒绝 ack %d）",
 				f.Seq, len(holders), need, syncSeq+1, seq, seq)
@@ -318,6 +378,8 @@ func (b *MetaBackup) ensureSyncBaseline(cfg MetaBackupConfig) error {
 			return fmt.Errorf("同步复制: 基线确证失败（快照块 %s）: %w", ch.Key, err)
 		}
 	}
+	// manifest 的基线核验也按明文比对；重新序列化只用于推导期望 CRC，线上
+	// wire 字节由 topUpBlob 保持逐节点一致（发布字节不被重写）。
 	mfJSON, err := marshalManifest(&m)
 	if err != nil {
 		return fmt.Errorf("同步复制: 基线确证失败: %w", err)
@@ -334,36 +396,41 @@ func (b *MetaBackup) ensureSyncBaseline(cfg MetaBackupConfig) error {
 	return nil
 }
 
-// topUpBlob 核验 key 在存活节点上的持有份数（GET 回读 + CRC 校验通过才算持有），
-// 不足 need 时从任一完好副本读回、补写到缺失/损坏的节点，直到 ≥need。
-// 一个完好副本都找不到则报错（此时基线不可信，调用方 fail-closed）。
+// topUpBlob 核验 key 在存活节点上的持有份数：取回后解密，按 manifest 记录的
+// 明文尺寸/CRC 校验（随机化信封下 wire 字节每次不同，不能按线格式比对）；
+// 解密失败/不符 = 该副本不可用。不足 need 时从任一完好副本读回、补写到缺失
+// 或损坏的节点（补写的是完好节点上的原始 wire 字节，保持发布字节一致），
+// 直到 ≥need。一个完好副本都找不到则报错（基线不可信，调用方 fail-closed）。
 func (b *MetaBackup) topUpBlob(alive []types.NodeInfo, key string, size int64, crc uint32, need int) error {
 	verified := 0
 	var good []byte
 	var lacking []types.NodeInfo
 	for _, n := range alive {
-		data, found, err := b.getBlob(n.Addr, key)
-		if err == nil && found && int64(len(data)) == size && types.CRC32C(data) == crc {
-			verified++
-			if good == nil {
-				good = data
+		wire, found, err := b.getBlob(n.Addr, key)
+		if err == nil && found {
+			plain, derr := b.decodeBlob(key, wire)
+			if derr == nil && int64(len(plain)) == size && types.CRC32C(plain) == crc {
+				verified++
+				if good == nil {
+					good = wire
+				}
+				continue
 			}
-			continue
 		}
-		// 缺失或损坏：不计入持有，列入待补写（恢复端 fetchChunk 也有 CRC 兜底）。
+		// 缺失、解密失败或校验不符：不计入持有，列入待补写。
 		lacking = append(lacking, n)
 	}
 	if verified >= need {
 		return nil
 	}
 	if good == nil {
-		return fmt.Errorf("所有存活节点上都取不到 CRC 完好的副本")
+		return fmt.Errorf("所有存活节点上都取不到完好的副本")
 	}
 	for _, n := range lacking {
 		if verified >= need {
 			return nil
 		}
-		if err := b.putBlob(n.Addr, key, good, crc); err != nil {
+		if err := b.putBlobRaw(n.Addr, key, good, types.CRC32C(good)); err != nil {
 			continue
 		}
 		verified++
@@ -411,8 +478,13 @@ func (b *MetaBackup) SetTLS(cfg *tls.Config) {
 
 // ---- 节点 blob 客户端 ----
 
-// putBlob 把一段 blob PUT 到某节点的 /meta-backup/{key}，带 CRC32C 头。
+// putBlob 把一段已编码（可能已加密）的 blob PUT 到某节点的 /meta-backup/{key}，
+// 带 wire 字节的 CRC32C 头（传输层校验；真实完整性由 AEAD/明文 CRC 在读取侧把关）。
 func (b *MetaBackup) putBlob(addr, key string, data []byte, crc uint32) error {
+	return b.putBlobRaw(addr, key, data, crc)
+}
+
+func (b *MetaBackup) putBlobRaw(addr, key string, data []byte, crc uint32) error {
 	url := fmt.Sprintf("%s://%s/meta-backup/%s", b.scheme, addr, key)
 	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(data))
 	if err != nil {
@@ -521,16 +593,22 @@ func (b *MetaBackup) pickLeastLoaded(k int) ([]types.NodeInfo, error) {
 
 // shipBlob 把一段 blob 复制到给定节点集合，返回成功持有的节点 ID。
 // 部分失败不致命：只要有节点成功即记入 holders（K 副本本就是冗余）。
-func (b *MetaBackup) shipBlob(nodes []types.NodeInfo, key string, data []byte) []uint64 {
-	crc := types.CRC32C(data)
+// wire 为 nil 表示编码失败（加密开启但信封出错）：一个节点都不发，调用方按
+// 持有数不足 fail-closed，绝不把明文发出去。
+func (b *MetaBackup) shipBlob(nodes []types.NodeInfo, key string, plain []byte) ([]uint64, error) {
+	wire, err := b.encodeBlob(key, plain)
+	if err != nil {
+		return nil, err
+	}
+	crc := types.CRC32C(wire)
 	var holders []uint64
 	for _, n := range nodes {
-		if err := b.putBlob(n.Addr, key, data, crc); err != nil {
+		if err := b.putBlob(n.Addr, key, wire, crc); err != nil {
 			continue
 		}
 		holders = append(holders, n.ID)
 	}
-	return holders
+	return holders, nil
 }
 
 // metaChunkSize 是元数据快照的分块大小。元数据通常远小于此，多数快照就是单块；
@@ -601,7 +679,7 @@ func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
 	b.version = ver
 	b.mu.Unlock()
 
-	// 快照锚点：此刻的 WAL seq。快照本身包含到此 seq 的全部状态。
+	// 快照锚点：此刻的 WAL seq。快照本身包含到此 seq 的全部状态.
 	snapSeq, err := b.store.WALSeq()
 	if err != nil {
 		return Manifest{}, err
@@ -619,16 +697,16 @@ func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
 		SnapshotBytes: info.Size,
 	}
 
-	// 分块 ship。
+	// Reference lengths and CRCs describe authenticated plaintext; wire encryption is separate.
 	data := snap.Bytes()
 	for idx, off := 0, 0; off < len(data); idx++ {
-		end := off + metaChunkSize
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(off+metaChunkSize, len(data))
 		part := data[off:end]
 		key := fmt.Sprintf("snapshot-%d-%d", ver, idx)
-		holders := b.shipBlob(targets, key, part)
+		holders, err := b.shipBlob(targets, key, part)
+		if err != nil {
+			return Manifest{}, fmt.Errorf("%w: %s: %v", ErrShipIncomplete, key, err)
+		}
 		if len(holders) < need {
 			return Manifest{}, fmt.Errorf("%w: %s 仅 %d/%d 份（同步模式要求 ≥%d）", ErrShipIncomplete, key, len(holders), len(targets), need)
 		}
@@ -637,10 +715,15 @@ func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
 		})
 		off = end
 	}
-	// 空库理论上快照也非空（bbolt 头页），但兜底：至少要有一块。
 	if len(m.Chunks) == 0 {
 		return Manifest{}, fmt.Errorf("%w: 快照无数据", ErrShipIncomplete)
 	}
+	b.mu.Lock()
+	if b.cipher != nil {
+		m.Encrypted = true
+		m.Namespace = b.cipher.Namespace()
+	}
+	b.mu.Unlock()
 
 	// manifest 宽复制到所有存活节点（小指针撒一片）。
 	allAlive, err := b.store.ListAliveNodes(b.nodeMaxAge)
@@ -651,7 +734,10 @@ func (b *MetaBackup) backupOnceLocked() (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	mfHolders := b.shipBlob(allAlive, ManifestKey, mfJSON)
+	mfHolders, err := b.shipBlob(allAlive, ManifestKey, mfJSON)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("%w: manifest: %v", ErrShipIncomplete, err)
+	}
 	if len(mfHolders) < need {
 		return Manifest{}, fmt.Errorf("%w: manifest 仅 %d/%d 份（同步模式要求 ≥%d）", ErrShipIncomplete, len(mfHolders), len(allAlive), need)
 	}
@@ -809,7 +895,10 @@ func (b *MetaBackup) ShipWAL() (Manifest, bool, error) {
 	if len(targets) == 0 {
 		return Manifest{}, false, ErrNoAliveNodes
 	}
-	holders := b.shipBlob(targets, key, seg)
+	holders, err := b.shipBlob(targets, key, seg)
+	if err != nil {
+		return Manifest{}, false, fmt.Errorf("%w: %s: %v", ErrShipIncomplete, key, err)
+	}
 	if len(holders) == 0 {
 		return Manifest{}, false, fmt.Errorf("%w: %s", ErrShipIncomplete, key)
 	}
@@ -828,7 +917,10 @@ func (b *MetaBackup) ShipWAL() (Manifest, bool, error) {
 	if err != nil {
 		return Manifest{}, false, err
 	}
-	mfHolders := b.shipBlob(allAlive, ManifestKey, mfJSON)
+	mfHolders, err := b.shipBlob(allAlive, ManifestKey, mfJSON)
+	if err != nil {
+		return Manifest{}, false, fmt.Errorf("%w: manifest: %v", ErrShipIncomplete, err)
+	}
 	if len(mfHolders) < need {
 		return Manifest{}, false, fmt.Errorf("%w: manifest 仅 %d/%d 份（同步模式要求 ≥%d）", ErrShipIncomplete, len(mfHolders), len(allAlive), need)
 	}
@@ -1010,3 +1102,48 @@ func (b *MetaBackup) ClusterVersions() ([]VersionInfo, error) {
 
 // TriggerBackup 手动触发一次全量备份（控制台按钮；与后台循环互斥）。
 func (b *MetaBackup) TriggerBackup() (Manifest, error) { return b.BackupOnce() }
+
+// MetadataReaderInfo 返回元数据恢复公钥（不含任何私钥材料）；nil = 未启用加密。
+// 供控制面把恢复公钥 pin 到存储节点：master 全损后，持恢复签名的读取端
+// 可离线验签读取节点上的密文备份。
+func (b *MetaBackup) MetadataReaderInfo() *metacrypto.ReaderInfo {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cipher == nil {
+		return nil
+	}
+	info := b.cipher.ReaderInfo()
+	return &info
+}
+
+// InstallMetadataReader 经在线控制票据把恢复公钥安装/更新到全部存活节点
+// （PUT /meta-backup/reader.pin）。部分节点失败不致命（返回错误由调用方决定
+// 重试）；恢复读取只要求任一 pin 过的节点可达。
+func (b *MetaBackup) InstallMetadataReader() error {
+	info := b.MetadataReaderInfo()
+	if info == nil {
+		return fmt.Errorf("metadata backup encryption is not configured")
+	}
+	raw, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	alive, err := b.store.ListAliveNodes(b.nodeMaxAge)
+	if err != nil {
+		return err
+	}
+	if len(alive) == 0 {
+		return ErrNoAliveNodes
+	}
+	key := "reader.pin"
+	var firstErr error
+	for _, n := range alive {
+		if _, err := b.shipBlob([]types.NodeInfo{n}, key, raw); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+	}
+	return firstErr
+}

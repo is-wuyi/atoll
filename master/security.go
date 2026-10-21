@@ -93,8 +93,12 @@ func (s *Server) securityHandler(next http.Handler) http.Handler {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/admin/metabackup") {
-			httpError(w, http.StatusConflict, "secure metadata backup requires encrypted recovery support; use an offline local backup")
-			return
+			// 加密备份已开启时放行（状态/触发/配置走控制凭据或 admin 会话的
+			// 既有 adminPaths 闸）；未加密仍禁——账号元数据不能明文进节点。
+			if s.backup == nil || !s.backup.EncryptionEnabled() {
+				httpError(w, http.StatusConflict, "secure metadata backup requires an encrypted backup key; use an offline local backup")
+				return
+			}
 		}
 		if s.servePublicSecurity(w, r) {
 			return
@@ -915,10 +919,16 @@ func (s *Server) AttachSecureTransports() {
 		s.autonomy.http.CheckRedirect = rejectRedirect
 	}
 	if s.backup != nil {
-		// Account metadata cannot be copied to untrusted nodes before encrypted recovery is implemented.
-		s.backup.httpClient.Transport = securityRoundTripFunc(func(*http.Request) (*http.Response, error) {
-			return nil, errors.New("remote metadata backup is disabled in secure mode")
-		})
+		if s.backup.EncryptionEnabled() {
+			// 加密已开启：备份 blob 走在线控制票据到节点（validateControlTicket
+			// 允许 GET/PUT/DELETE /meta-backup）。节点只见密文。
+			s.backup.httpClient.Transport = s.secureControlTransport(base)
+		} else {
+			// 无加密的 secure 模式仍禁远端备份：账号元数据不能明文进陌生节点。
+			s.backup.httpClient.Transport = securityRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("remote metadata backup requires an encrypted backup key in secure mode")
+			})
+		}
 		s.backup.httpClient.CheckRedirect = rejectRedirect
 	}
 }

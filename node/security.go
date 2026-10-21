@@ -44,6 +44,7 @@ import (
 	"atoll/pkg/access"
 	"atoll/pkg/auth"
 	"atoll/pkg/edgeidentity"
+	"atoll/pkg/metacrypto"
 	"atoll/pkg/types"
 )
 
@@ -110,6 +111,10 @@ type nodeSecurity struct {
 	opMu          sync.Mutex    // 串行化 challenge→sign→session 全流程
 	renewMargin   time.Duration // 测试可调小
 	allowInsecure bool          // 显式放行明文 HTTP / TLS 跳过校验（仅本地测试）
+	// readerPin：中心在线时经控制票据安装的元数据恢复公钥（nil = 未安装）。
+	// 持私钥的恢复方在 master 全损后凭 Ed25519 签名读取 /meta-backup GET；
+	// 节点只存公钥，写删不受它影响。
+	readerPin metacrypto.ReaderInfo
 }
 
 // EnableSecurity 启用节点独立身份 + 在线访问票据模式。
@@ -787,6 +792,8 @@ func (s *nodeSecurity) postJSON(ctx context.Context, client *http.Client, path s
 // wrapHandler 包装 security 模式的对象路由：/healthz 公开，其余路由默认拒绝，
 // 逐请求在线问 master /security/check（不缓存，撤销即时生效），master 不可达
 // fail-closed。不接受集群 token 或用户会话——只把携带的票据转交 master 裁决。
+// 例外：/meta-backup 的 GET 支持离线恢复凭据（SetMetadataReader pin 过公钥后，
+// master 全损时凭 Ed25519 签名本地验签放行只读；写删仍需在线控制票据）。
 func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
@@ -797,6 +804,16 @@ func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 		// 覆盖绕过 CLI 直接使用 Handler 的用法，明文连接 fail-closed。
 		if !s.allowInsecure && r.TLS == nil {
 			httpError(w, http.StatusBadRequest, "plaintext connections are rejected")
+			return
+		}
+		// 离线恢复读取：master 全损时管理员凭恢复签名读取备份。先于在线票据
+		// 判定——此时不存在可用的在线票据；凭据头格式不同，绝不混淆。
+		if !s.readerPin.IsZero() && len(r.Header.Values(metacrypto.ReaderHeader)) != 0 {
+			if err := metacrypto.VerifyRead(s.readerPin, r, s.node.advertise, time.Now()); err != nil {
+				httpError(w, http.StatusUnauthorized, "metadata recovery read denied")
+				return
+			}
+			next.ServeHTTP(w, r)
 			return
 		}
 		tok, ok := bearerToken(r.Header.Get("Authorization"))
@@ -903,4 +920,22 @@ func bearerToken(h string) (string, bool) {
 		return "", false
 	}
 	return t, true
+}
+
+// SetMetadataReader 安装/更新元数据恢复公钥（master 经在线控制票据下发；测试
+// 也可直接调用）。校验 namespace 与公钥自洽后原子替换；nil 清除（撤销恢复通道）。
+func (s *nodeSecurity) SetMetadataReader(info metacrypto.ReaderInfo) error {
+	if info.IsZero() {
+		s.mu.Lock()
+		s.readerPin = metacrypto.ReaderInfo{}
+		s.mu.Unlock()
+		return nil
+	}
+	if err := info.Validate(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readerPin = info
+	return nil
 }

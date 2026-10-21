@@ -147,7 +147,7 @@ func (e *ErrFailStop) Error() string { return "元数据恢复需人工裁决: "
 // 本地库又不在，就绝不能把它当全新集群。
 func (b *MetaBackup) gatherClusterManifest(seeds []string) (best Manifest, found bool, unknown bool) {
 	for _, addr := range seeds {
-		raw, ok, err := b.getBlob(addr, ManifestKey)
+		wire, ok, err := b.getBlob(addr, ManifestKey)
 		if err != nil {
 			unknown = true
 			log.Printf("恢复: 种子 %s 的 manifest 不可达: %v", addr, err)
@@ -160,6 +160,12 @@ func (b *MetaBackup) gatherClusterManifest(seeds []string) (best Manifest, found
 				unknown = true
 				log.Printf("恢复: 种子 %s 缺 manifest，但不能确认备份为空（条目=%d，错误=%v）", addr, len(blobs), listErr)
 			}
+			continue
+		}
+		raw, err := b.decodeBlob(ManifestKey, wire)
+		if err != nil {
+			unknown = true
+			log.Printf("恢复: 种子 %s 的 manifest 无法解密: %v", addr, err)
 			continue
 		}
 		m, err := unmarshalManifest(raw)
@@ -369,11 +375,15 @@ func (b *MetaBackup) gatherAllFramesAfter(m Manifest, store *meta.Store, seeds [
 				continue
 			}
 			observed[seq] = true
-			data, found, err := b.getBlob(addr, bl.Key)
+			wire, found, err := b.getBlob(addr, bl.Key)
 			if err != nil || !found {
 				continue
 			}
-			fs, err := meta.DecodeWALSegment(data)
+			plain, derr := b.decodeBlob(bl.Key, wire)
+			if derr != nil {
+				continue
+			}
+			fs, err := meta.DecodeWALSegment(plain)
 			if err != nil || len(fs) != 1 || fs[0].Seq != seq {
 				continue
 			}
@@ -413,22 +423,25 @@ func parseSyncFrameSeq(key string) (uint64, bool) {
 	return v, true
 }
 
-// fetchChunk 从种子里试取一个块，校验 CRC 与大小。
+// fetchChunk 从种子里试取一个块：解密后按 manifest 记录的明文尺寸/CRC 校验
+// （加密批次 wire 每次不同，不能按线格式比对）。任一持有者解密+校验通过即用。
 func (b *MetaBackup) fetchChunk(ch ChunkRef, seeds []string) ([]byte, error) {
 	for _, addr := range seeds {
-		data, ok, err := b.getBlob(addr, ch.Key)
+		wire, ok, err := b.getBlob(addr, ch.Key)
 		if err != nil || !ok {
 			continue
 		}
-		if int64(len(data)) != ch.Size || types.CRC32C(data) != ch.CRC32C {
-			continue // 损坏/不符，试下一个持有者
+		plain, derr := b.decodeBlob(ch.Key, wire)
+		if derr == nil && int64(len(plain)) == ch.Size && types.CRC32C(plain) == ch.CRC32C {
+			return plain, nil
 		}
-		return data, nil
+		// 损坏、密文不符或解密失败：试下一个持有者。
 	}
 	return nil, fmt.Errorf("rebuild: 块 %s 在所有种子上都取不到或校验失败", ch.Key)
 }
 
-// fetchWALFrames 从种子取 manifest 记录的 WAL 段，解码成帧序列（按 seq 升序）。
+// fetchWALFrames 从种子取 manifest 记录的 WAL 段（先解密再校验/解码），成帧序列
+// （按 seq 升序）。
 func (b *MetaBackup) fetchWALFrames(m Manifest, seeds []string) ([]meta.Frame, error) {
 	segs := append([]WALSegRef(nil), m.WALSegs...)
 	sort.Slice(segs, func(i, j int) bool { return segs[i].FromSeq < segs[j].FromSeq })
@@ -437,14 +450,15 @@ func (b *MetaBackup) fetchWALFrames(m Manifest, seeds []string) ([]meta.Frame, e
 		var raw []byte
 		got := false
 		for _, addr := range seeds {
-			data, ok, err := b.getBlob(addr, seg.Key)
+			wire, ok, err := b.getBlob(addr, seg.Key)
 			if err != nil || !ok {
 				continue
 			}
-			if int64(len(data)) != seg.Size || types.CRC32C(data) != seg.CRC32C {
+			plain, derr := b.decodeBlob(seg.Key, wire)
+			if derr != nil || int64(len(plain)) != seg.Size || types.CRC32C(plain) != seg.CRC32C {
 				continue
 			}
-			raw = data
+			raw = plain
 			got = true
 			break
 		}
