@@ -36,6 +36,10 @@ type PeerConfig struct {
 	// unauthorized test peers whose reservation would be denied anyway).
 	SkipRelayReservation bool
 	Logger               *log.Logger
+	// WAN mode (zero values = historical loopback behavior):
+	ListenIP     string        // listen IP, e.g. "0.0.0.0" for cross-machine runs
+	AnnounceAddrs []ma.Multiaddr // force-announced public endpoint(s) behind NAT
+	ListenPort   int
 }
 
 // StoragePeer is one storage node of the prototype: a persistent Ed25519
@@ -92,12 +96,15 @@ func NewStoragePeer(ctx context.Context, cfg PeerConfig) (*StoragePeer, error) {
 	p.gater = gater
 
 	h, err := newHost(ctx, HostOptions{
-		Priv:       id.Priv,
-		ListenTCP:  true,
-		ListenQUIC: cfg.EnableQUIC,
-		Gater:      gater,
-		HolePunch:  true,
-		Logger:     cfg.Logger,
+		Priv:          id.Priv,
+		ListenTCP:     true,
+		ListenQUIC:    cfg.EnableQUIC,
+		Gater:         gater,
+		HolePunch:     true,
+		Logger:        cfg.Logger,
+		ListenIP:      cfg.ListenIP,
+		ListenPort:    cfg.ListenPort,
+		AnnounceAddrs: cfg.AnnounceAddrs,
 	})
 	if err != nil {
 		return nil, err
@@ -190,15 +197,21 @@ func (p *StoragePeer) Dial(expected peer.ID, policy DialPolicy, directAddrs []ma
 	return d.NewHTTPClient(), d
 }
 
-// RegisterWithControl dials the control node (direct first, then relay) and
-// announces the peer's current endpoints.
+// RegisterWithControl dials the control node and announces the peer's current
+// endpoints. The control plane is the explicitly configured bootstrap endpoint
+// (production: the master's public address) — direct by definition; a relay
+// fallback applies only when one is configured.
 func (p *StoragePeer) RegisterWithControl(ctx context.Context, control peer.AddrInfo) error {
+	policy := PolicyDirect
+	if p.cfg.Relay != nil {
+		policy = PolicyDirectThenRelay
+	}
 	d := &DialConfig{
 		Host:          p.Host,
 		Expected:      control.ID,
 		DirectAddrs:   control.Addrs,
 		Relay:         p.cfg.Relay,
-		Policy:        PolicyDirectThenRelay,
+		Policy:        policy,
 		DirectTimeout: p.cfg.DirectTimeout,
 		logf:          p.log.Printf,
 	}
@@ -225,12 +238,16 @@ func (p *StoragePeer) RegisterWithControl(ctx context.Context, control peer.Addr
 // FetchControlState retrieves the control registry (authorized list, peers,
 // relay endpoint) over the control connection.
 func (p *StoragePeer) FetchControlState(ctx context.Context, control peer.AddrInfo) (map[string]any, error) {
+	policy := PolicyDirect
+	if p.cfg.Relay != nil {
+		policy = PolicyDirectThenRelay
+	}
 	d := &DialConfig{
 		Host:          p.Host,
 		Expected:      control.ID,
 		DirectAddrs:   control.Addrs,
 		Relay:         p.cfg.Relay,
-		Policy:        PolicyDirectThenRelay,
+		Policy:        policy,
 		DirectTimeout: p.cfg.DirectTimeout,
 		logf:          p.log.Printf,
 	}

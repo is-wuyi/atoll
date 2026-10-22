@@ -9,6 +9,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // RelayConfig configures the standalone CircuitRelay v2 hop node.
@@ -28,6 +30,10 @@ type RelayConfig struct {
 	MaxReservations int
 	MaxCircuits     int
 	Logger          *log.Logger
+	// WAN mode (zero values = historical loopback behavior):
+	ListenIP     string        // listen IP, e.g. "0.0.0.0"
+	AnnounceAddrs []ma.Multiaddr // force-announced public endpoint(s)
+	ListenPort   int
 }
 
 // DefaultRelayLimit returns the prototype's default finite per-circuit limit:
@@ -75,12 +81,15 @@ func NewRelayNode(ctx context.Context, cfg RelayConfig) (*RelayNode, error) {
 	r := &RelayNode{log: cfg.Logger}
 
 	h, err := newHost(ctx, HostOptions{
-		Priv:       id.Priv,
-		ListenTCP:  true,
-		ListenQUIC: true,
+		Priv:          id.Priv,
+		ListenTCP:     true,
+		ListenQUIC:    true,
 		// Transport-level gate: only experiment peers may connect at all.
-		Gater:  NewConnGater(cfg.Allowlist),
-		Logger: cfg.Logger,
+		Gater:         NewConnGater(cfg.Allowlist),
+		Logger:        cfg.Logger,
+		ListenIP:      cfg.ListenIP,
+		ListenPort:    cfg.ListenPort,
+		AnnounceAddrs: cfg.AnnounceAddrs,
 	})
 	if err != nil {
 		return nil, err

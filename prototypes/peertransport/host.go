@@ -32,6 +32,15 @@ type HostOptions struct {
 	Gater       connmgr.ConnectionGater
 	HolePunch   bool // enable the libp2p hole punching service (idle on loopback)
 	Logger      *log.Logger
+	// WAN mode (empty = loopback default, unchanged historical behavior):
+	// ListenIP replaces the loopback listen IP (e.g. "0.0.0.0"); ListenPort
+	// fixes the TCP/QUIC port (0 = random); AnnounceAddrs force-announce the
+	// host's public addresses (behind NAT: learned out-of-band; the listen
+	// port and announced port may differ under NAT port-forwarding).
+	// AutoNAT is enabled in WAN mode so peers learn real reachability.
+	ListenIP     string
+	ListenPort   int
+	AnnounceAddrs []ma.Multiaddr
 }
 
 // newHost builds a libp2p host with:
@@ -44,16 +53,20 @@ type HostOptions struct {
 //   - NO discovery / public DHT / bootstrap: every connection is created by
 //     explicit dial to an explicitly configured, allowlisted peer.
 func newHost(ctx context.Context, o HostOptions) (host.Host, error) {
+	listenIP := o.ListenIP
+	if listenIP == "" {
+		listenIP = "127.0.0.1"
+	}
 	var addrs []ma.Multiaddr
 	if o.ListenTCP {
-		a, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/0")
+		a, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", listenIP, o.ListenPort))
 		if err != nil {
 			return nil, err
 		}
 		addrs = append(addrs, a)
 	}
 	if o.ListenQUIC {
-		a, err := ma.NewMultiaddr("/ip4/127.0.0.1/udp/0/quic-v1")
+		a, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", listenIP, o.ListenPort))
 		if err != nil {
 			return nil, err
 		}
@@ -93,6 +106,19 @@ func newHost(ctx context.Context, o HostOptions) (host.Host, error) {
 		// exercises the option plumbing. WAN traversal is NOT claimed to be
 		// verified by this prototype (see README).
 		opts = append(opts, libp2p.EnableHolePunching())
+	}
+	wan := len(o.AnnounceAddrs) > 0 || (o.ListenIP != "" && o.ListenIP != "127.0.0.1")
+	if len(o.AnnounceAddrs) > 0 {
+		// Behind NAT: the host must not announce its private listen
+		// addresses — only the operator-provided public endpoint(s).
+		opts = append(opts, libp2p.AddrsFactory(func([]ma.Multiaddr) []ma.Multiaddr {
+			return append([]ma.Multiaddr(nil), o.AnnounceAddrs...)
+		}))
+	}
+	if wan {
+		// AutoNAT service + client: peers probe each other's real
+		// reachability and drop private guesses from their announced set.
+		opts = append(opts, libp2p.EnableNATService(), libp2p.EnableAutoNATv2())
 	}
 
 	h, err := libp2p.New(opts...)

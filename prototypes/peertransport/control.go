@@ -27,6 +27,10 @@ type ControlConfig struct {
 	// RelayAddrInfo is advertised to registering peers.
 	RelayAddrInfo *peer.AddrInfo
 	Logger        *log.Logger
+	// WAN mode (zero values = historical loopback behavior):
+	ListenIP     string        // listen IP, e.g. "0.0.0.0"
+	AnnounceAddrs []ma.Multiaddr // force-announced public endpoint(s)
+	ListenPort   int
 }
 
 // RegisteredPeer is one entry of the endpoint registry: a stable PeerID
@@ -54,6 +58,12 @@ type ControlNode struct {
 
 // NewControlNode starts the control host and its HTTP service over libp2p.
 func NewControlNode(ctx context.Context, cfg ControlConfig) (*ControlNode, error) {
+	if cfg.Authorized == nil {
+		// Fail closed, never panic: a control node without an allowlist
+		// must refuse every registration rather than dereference nil.
+		cfg.Authorized = NewAllowlist()
+		cfg.Logger = log.Default()
+	}
 	id, err := LoadOrCreateIdentity(cfg.DataDir)
 	if err != nil {
 		return nil, err
@@ -62,10 +72,13 @@ func NewControlNode(ctx context.Context, cfg ControlConfig) (*ControlNode, error
 	// unauthorized peers get an explicit HTTP 403. Service-level
 	// authorization is enforced in the register handler.
 	h, err := newHost(ctx, HostOptions{
-		Priv:       id.Priv,
-		ListenTCP:  true,
-		ListenQUIC: true,
-		Logger:     cfg.Logger,
+		Priv:          id.Priv,
+		ListenTCP:     true,
+		ListenQUIC:    true,
+		Logger:        cfg.Logger,
+		ListenIP:      cfg.ListenIP,
+		ListenPort:    cfg.ListenPort,
+		AnnounceAddrs: cfg.AnnounceAddrs,
 	})
 	if err != nil {
 		return nil, err

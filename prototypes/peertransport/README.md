@@ -59,6 +59,32 @@ go test ./...                      # full test suite (~20 s)
 go run ./cmd/demo                  # isolated run: private log dir + fresh demo-state
 ```
 
+## Cross-machine WAN runs (cmd/wanrunner)
+
+`cmd/wanrunner` runs ONE role per process for cross-machine deployment — the
+same roles as the loopback demo, but each on its own host with a public
+`-announce` address, a fixed `-listen-port`, and (behind NAT) operator-provided
+public endpoints:
+
+```bash
+# host A: relay (public port 44001; authorize each storage PeerID)
+wanrunner relay   -state DIR -listen-port 44001 -announce /ip4/<A-pub>/tcp/44001                   -allow-peer <peerID>...
+# host B: control (authorizes joining peers; may advertise the relay)
+wanrunner control -state DIR -listen-port 44000 -announce /ip4/<B-pub>/tcp/44000                   [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>]
+# each storage host: register + periodic transfer probes (64 KiB + 32 MiB,
+#                    direct-first, relay fallback, checksum-verified)
+wanrunner peer    -state DIR -listen-port 44010 [-announce /ip4/<pub>/tcp/44010]                   -control /ip4/<B-pub>/tcp/44000/p2p/<controlID>                   [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>]                   -allow-peer <otherPeerID>... -probe-every 30s
+```
+
+Each role prints one JSON identity line on stdout at startup; every probe
+prints one JSON result line (op/path/fallback/bytes/sha256/match). WAN mode
+enables AutoNAT (reachability learning) in addition to the always-on hole
+punch service; `-announce` overrides the announced address set (the listen
+port and the announced port may differ under NAT port-forwarding). Smoke
+state: two peer processes on one machine exchange 64 KiB + 32 MiB probes
+direct-path with matching checksums. **Real WAN / NAT traversal runs are the
+next verification step and are NOT yet claimed as verified.**
+
 By default the demo creates its own private temp directory under the system
 temp dir (`os.MkdirTemp`, e.g. `/tmp/atoll-peer-demo.a1b2c3`, or
 `$TMPDIR/atoll-peer-demo.a1b2c3` on macOS) and prints that path at startup,
