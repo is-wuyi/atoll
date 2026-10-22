@@ -151,6 +151,9 @@ type MetaBackup struct {
 	lastBackupAt time.Time // 最近一次成功全量备份时刻
 	lastErr      string    // 最近一次备份错误（成功则空）
 	cipher *metacrypto.Cipher
+	// recoverySigner：中心全损恢复的读取签名能力（同 KEK 派生；nil = 在线模式）。
+	// Recover 前经 SetRecoverySigner 配置，恢复期 getBlob/listBlobs 带签名。
+	recoverySigner *metacrypto.Cipher
 	manifestWire []byte // Randomized encrypted manifests must retain their exact published bytes.
 }
 
@@ -504,9 +507,18 @@ func (b *MetaBackup) putBlobRaw(addr, key string, data []byte, crc uint32) error
 }
 
 // getBlob 从某节点 GET 一个 blob。found=false 表示 404（该节点没有）。
+// 中心全损恢复场景（无库签发在线票据）：配置恢复签名后，读请求带恢复凭据
+// （节点 pin 过公钥即离线验签放行）；签名只读、绑定节点地址与路径。
 func (b *MetaBackup) getBlob(addr, key string) (data []byte, found bool, err error) {
 	url := fmt.Sprintf("%s://%s/meta-backup/%s", b.scheme, addr, key)
-	resp, err := b.httpClient.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := b.signRecoveryRead(req, addr); err != nil {
+		return nil, false, err
+	}
+	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return nil, false, err
 	}
@@ -551,10 +563,17 @@ type blobEntry struct {
 	Size int64  `json:"size"`
 }
 
-// listBlobs 列出某节点上的全部元数据 blob。
+// listBlobs 列出某节点上的全部元数据 blob。恢复场景带恢复签名（同 getBlob）。
 func (b *MetaBackup) listBlobs(addr string) ([]blobEntry, error) {
 	url := fmt.Sprintf("%s://%s/meta-backup", b.scheme, addr)
-	resp, err := b.httpClient.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.signRecoveryRead(req, addr); err != nil {
+		return nil, err
+	}
+	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -568,6 +587,47 @@ func (b *MetaBackup) listBlobs(addr string) ([]blobEntry, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// SetRecoverySigner 启用中心全损恢复读取签名：从同一 KEK 派生的恢复身份
+// （与节点 pin 的公钥配对）给恢复期间的 GET 签名。应在 Recover 之前调用；
+// 仅影响读取签名，正常在线备份走控制票据不受影响。
+func (b *MetaBackup) SetRecoverySigner(kek *contentcrypto.KEK) error {
+	c, err := metacrypto.New(kek)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cipher != nil && b.cipher.Namespace() != c.Namespace() {
+		return fmt.Errorf("recovery signer does not match the configured metadata key")
+	}
+	// 恢复场景同样需要解密能力：cipher 与 signer 同源（同一 KEK 派生）。
+	// 正常在线路径的 cipher 由 SetMetaKEK 配置；这里在 Recover 前先行配置，
+	// SetMetaKEK 幂等（同 namespace 不变）。
+	b.cipher = c
+	b.recoverySigner = c
+	return nil
+}
+
+// signRecoveryRead 给恢复读取请求签名（未配置签名能力时 no-op——正常在线
+// 备份走控制票据）。每请求独立签名（nonce 随机），不复用凭据。
+func (b *MetaBackup) signRecoveryRead(req *http.Request, addr string) error {
+	b.mu.Lock()
+	c := b.recoverySigner
+	b.mu.Unlock()
+	if c == nil {
+		return nil
+	}
+	return c.SignRead(req, addr, time.Now())
+}
+
+// ClearRecoverySigner 恢复完成后清除恢复签名：在线控制票据接管备份通道，
+// 两个凭据头同时出现会被节点的恢复验签拒绝（只允许恢复凭据头单独存在）。
+func (b *MetaBackup) ClearRecoverySigner() {
+	b.mu.Lock()
+	b.recoverySigner = nil
+	b.mu.Unlock()
 }
 
 // ---- K 个负载最低节点选择 ----
@@ -946,6 +1006,11 @@ func (b *MetaBackup) StartLoop(ctx context.Context, walIntv time.Duration) {
 		if _, err := b.BackupOnce(); err != nil {
 			log.Printf("元数据备份: 首次快照失败（将重试）: %v", err)
 		}
+		// 恢复公钥随每次成功备份重试下发：启动时节点可能尚未入池（首次 pin
+		// 失败），节点后注册或 pin 丢失都能在下一轮补上。失败不致命只记日志。
+		if err := b.InstallMetadataReader(); err != nil {
+			log.Printf("元数据备份: 恢复公钥下发失败（将随备份重试）: %v", err)
+		}
 		lastSnap := time.Now()
 		lastWAL := time.Now()
 		t := time.NewTicker(tick)
@@ -966,6 +1031,9 @@ func (b *MetaBackup) StartLoop(ctx context.Context, walIntv time.Duration) {
 					} else {
 						lastSnap = time.Now()
 						lastWAL = time.Now()
+						if err := b.InstallMetadataReader(); err != nil {
+							log.Printf("元数据备份: 恢复公钥下发失败（将随备份重试）: %v", err)
+						}
 					}
 				} else if time.Since(lastWAL) >= walIntv {
 					if _, _, err := b.ShipWAL(); err != nil {
@@ -1138,7 +1206,10 @@ func (b *MetaBackup) InstallMetadataReader() error {
 	key := "reader.pin"
 	var firstErr error
 	for _, n := range alive {
-		if _, err := b.shipBlob([]types.NodeInfo{n}, key, raw); err != nil {
+		// pin 是节点的本地信任配置，不是备份数据：明文 JSON PUT（节点拦截解析并
+		// 装进安全层），绝不能走 encodeBlob 加密路径。写 pin 只可能来自持在线
+		// 控制票据的 master——恢复凭据只支持 GET，无人能借此伪造 pin。
+		if err := b.putBlob(n.Addr, key, raw, types.CRC32C(raw)); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}

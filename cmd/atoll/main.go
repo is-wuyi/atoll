@@ -200,6 +200,20 @@ func runMaster(args []string, stderr io.Writer) int {
 	backup.SetToken(auth.Token(*token))
 	backup.SetTLS(outTLS)
 
+	// 中心全损恢复的读取签名：secure + KEK + seeds 时，恢复期间对节点的
+	// GET 用恢复签名（节点 pin 过公钥即离线放行；无库签发在线票据的场景）。
+	// 正常在线备份不受影响（控制票据在 AttachSecureTransports 接管）。
+	if *secure && len(seeds) > 0 && *contentKeyFile != "" {
+		if rkek, rerr := keyfile.Load(*contentKeyFile); rerr == nil {
+			if err := backup.SetRecoverySigner(rkek); err != nil {
+				fmt.Fprintln(stderr, "secure master metadata recovery signer:", err)
+				return 1
+			}
+		} else {
+			fmt.Fprintln(stderr, "secure master content key file:", rerr)
+			return 1
+		}
+	}
 	// 恢复决策（fail-stop）：本地 vs 集群，歧义硬停。未配种子则退化为直接打开本地库。
 	store, err := backup.Recover(*dbPath, seeds, master.RecoverMode(*recoverFrom))
 	if err != nil {
@@ -218,6 +232,9 @@ func runMaster(args []string, stderr io.Writer) int {
 		return 1
 	}
 	backup.SetStore(store)
+	// 恢复完成：清除恢复签名，备份通道交还在线控制票据（AttachSecureTransports）。
+	// 两个凭据头并存会被节点恢复验签拒绝，必须显式切换。
+	backup.ClearRecoverySigner()
 	backup.InstallSyncHook() // 同步旋钮：开启时写元数据 ack 前先落集群（钩子内按配置决定）
 
 	var autonomy *master.Autonomy
@@ -240,17 +257,6 @@ func runMaster(args []string, stderr io.Writer) int {
 	scanner.SetTLS(outTLS)
 	scanner.SetAdditiveOnly(*autonomyMode == master.AutonomyAdd)
 	// Transport configuration must precede every background worker.
-	// 配了种子才跑备份循环（否则退化为纯本地，无灾备）。
-	if len(seeds) > 0 {
-		backup.StartLoop(ctx, 0) // walIntv=0 → 内部取 Interval/5
-		if backup.EncryptionEnabled() {
-			// 恢复公钥 pin 到全部存活节点（失败不致命：下轮备份后再重试）。
-			if err := backup.InstallMetadataReader(); err != nil {
-				log.Printf("元数据恢复公钥下发失败（将随备份重试）: %v", err)
-			}
-		}
-		log.Printf("元数据备份进集群已启用：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
-	}
 	// 关闭顺序：等扫描器 + 备份 goroutine 全部退出后再关 store，避免关库时仍在读写。
 	defer func() {
 		cancel()
@@ -285,6 +291,10 @@ func runMaster(args []string, stderr io.Writer) int {
 					fmt.Fprintln(stderr, "secure master metadata backup key:", err)
 					return 1
 				}
+				// KEK 已配置，备份循环从这里启动（首拍即加密；恢复公钥随
+				// 首次成功备份 pin，节点后入池由循环内重试补上）。
+				backup.StartLoop(ctx, 0)
+				log.Printf("元数据备份进集群已启用：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
 			}
 		}
 		if err := srv.EnableSecurity(master.SecurityConfig{ControlToken: auth.Token(os.Getenv(*controlEnv)), AllowInsecure: *allowInsecure}); err != nil {
@@ -295,6 +305,11 @@ func runMaster(args []string, stderr io.Writer) int {
 		store.Close()
 		fmt.Fprintln(stderr, "content key file requires -secure")
 		return 1
+	}
+	// 非 secure（兼容模式）配了种子：无 KEK 也允许明文备份进集群（legacy 行为）。
+	if !*secure && len(seeds) > 0 {
+		backup.StartLoop(ctx, 0)
+		log.Printf("元数据备份进集群已启用（兼容模式明文）：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
 	}
 	if *writePlanning {
 		if err := srv.EnableWritePlanning(master.WritePlanningConfig{MaxReplicas: *writeReplicas}); err != nil {
