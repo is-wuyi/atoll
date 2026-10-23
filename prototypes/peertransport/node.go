@@ -124,15 +124,24 @@ func NewStoragePeer(ctx context.Context, cfg PeerConfig) (*StoragePeer, error) {
 	// keep a live reservation at the hop; the hop then relays connections
 	// over it (no discovery, no DHT — the relay endpoint is configured
 	// explicitly).
+	//
+	// The first attempt still gates startup (an unreachable relay is an
+	// operator-visible failure, matching the historical contract), but a
+	// transient miss no longer kills the peer forever: a background loop
+	// retries every 30s until the reservation lands. Real WAN runs showed
+	// one-shot startup reservations failing on transient dial loss, leaving
+	// the peer without a relay path until a manual restart.
 	if cfg.Relay != nil && !cfg.SkipRelayReservation {
 		rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
-		if _, err := relayclient.Reserve(rctx, h, *cfg.Relay); err != nil {
-			rcancel()
-			_ = h.Close()
-			return nil, fmt.Errorf("peertransport: relay reservation at %s: %w", cfg.Relay.ID, err)
-		}
+		_, resErr := relayclient.Reserve(rctx, h, *cfg.Relay)
 		rcancel()
-		p.log.Printf("relay reservation held at %s", cfg.Relay.ID)
+		if resErr != nil {
+			p.log.Printf("relay reservation at %s failed (%v); retrying in background", cfg.Relay.ID, resErr)
+			go p.renewReservationLoop(ctx, *cfg.Relay)
+		} else {
+			p.log.Printf("relay reservation held at %s", cfg.Relay.ID)
+			go p.renewReservationLoop(ctx, *cfg.Relay)
+		}
 	}
 	if !cfg.SkipRelayReservation && cfg.Relay == nil {
 		p.log.Printf("no relay configured; peer is direct-reachable only")
@@ -153,6 +162,31 @@ func NewStoragePeer(ctx context.Context, cfg PeerConfig) (*StoragePeer, error) {
 	}
 	go func() { _ = p.srv.Serve(lis) }()
 	return p, nil
+}
+
+// renewReservationLoop keeps a CircuitRelay v2 reservation alive: every 30s it
+// (re)issues a Reserve call — idempotent at the hop for holders, the only path
+// to a reservation after a transient startup failure. Stops when the peer
+// context ends; errors are logged, never fatal (direct transport keeps
+// working without a relay path).
+func (p *StoragePeer) renewReservationLoop(ctx context.Context, relay peer.AddrInfo) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			rctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			_, err := relayclient.Reserve(rctx, p.Host, relay)
+			cancel()
+			if err != nil {
+				p.log.Printf("relay reservation refresh at %s failed: %v", relay.ID, err)
+				continue
+			}
+			p.log.Printf("relay reservation held at %s", relay.ID)
+		}
+	}
 }
 
 // AllowInfraPeer authorizes an infrastructure peer (e.g., an additional

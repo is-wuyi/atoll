@@ -37,6 +37,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"os/signal"
 	"syscall"
 	"time"
@@ -97,6 +99,7 @@ func main() {
 	controlAddr := addrInfoFlag(fs, "control", "control multiaddr with /p2p/<controlID> (peer role)")
 	allowed := peerIDSliceFlag(fs, "allow-peer", "authorized PeerID (repeatable)")
 	probeEvery := fs.Duration("probe-every", 30*time.Second, "probe interval; 0 = register and idle")
+	noMesh := fs.Bool("no-mesh-direct", false, "drop 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 endpoints from probe direct dials (force the relay path on an overlaid mesh)")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		os.Exit(2)
 	}
@@ -130,7 +133,7 @@ func main() {
 	case "control":
 		runControl(ctx, *state, *listenIP, *listenPort, announce, *quic, relayAddr, *allowed)
 	case "peer":
-		runPeer(ctx, *state, *listenIP, *listenPort, announce, *quic, controlAddr, relayAddr, *allowed, *probeEvery)
+		runPeer(ctx, *state, *listenIP, *listenPort, announce, *quic, controlAddr, relayAddr, *allowed, *probeEvery, *noMesh)
 	default:
 		fmt.Fprintf(os.Stderr, "wanrunner: unknown role %q\n", role)
 		os.Exit(2)
@@ -241,7 +244,7 @@ func relayPtr(ai *peer.AddrInfo) *peer.AddrInfo {
 	return ai
 }
 
-func runPeer(ctx context.Context, state, listenIP string, listenPort int, announce []ma.Multiaddr, quic bool, control, relay *peer.AddrInfo, allowed []peer.ID, probeEvery time.Duration) {
+func runPeer(ctx context.Context, state, listenIP string, listenPort int, announce []ma.Multiaddr, quic bool, control, relay *peer.AddrInfo, allowed []peer.ID, probeEvery time.Duration, noMesh bool) {
 	if control == nil || control.ID == "" {
 		fmt.Fprintln(os.Stderr, "wanrunner peer: -control is required")
 		os.Exit(2)
@@ -276,13 +279,13 @@ func runPeer(ctx context.Context, state, listenIP string, listenPort int, announ
 	}
 	t := time.NewTicker(probeEvery)
 	defer t.Stop()
-	runProbeRound(ctx, p, control, allowed)
+	runProbeRound(ctx, p, control, allowed, noMesh)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			runProbeRound(ctx, p, control, allowed)
+			runProbeRound(ctx, p, control, allowed, noMesh)
 		}
 	}
 }
@@ -300,7 +303,7 @@ type probeResult struct {
 	Err       string `json:"err,omitempty"`
 }
 
-func runProbeRound(ctx context.Context, p *pt.StoragePeer, control *peer.AddrInfo, targets []peer.ID) {
+func runProbeRound(ctx context.Context, p *pt.StoragePeer, control *peer.AddrInfo, targets []peer.ID, noMesh bool) {
 	if control == nil || control.ID == "" {
 		log.Printf("probe: no control configured; skipping round")
 		return
@@ -315,10 +318,57 @@ func runProbeRound(ctx context.Context, p *pt.StoragePeer, control *peer.AddrInf
 		if id == p.ID {
 			continue
 		}
+		direct := peers[id]
+		if noMesh {
+			direct = dropPrivate(direct)
+		}
 		for _, size := range []int64{64 << 10, 32 << 20} {
-			probeOnce(ctx, p, id, peers[id], size)
+			probeOnce(ctx, p, id, direct, size)
 		}
 	}
+}
+
+// dropPrivate removes overlay-routable components from the direct endpoint
+// set: RFC1918/loopback (EasyTier/LAN mesh) AND 100.64.0.0/10 CGNAT
+// (Tailscale uses this range; two NAS with Tailscale would otherwise "direct
+// connect" through the very overlay this flag exists to bypass, hiding the
+// public relay path under test).
+func dropPrivate(addrs []ma.Multiaddr) []ma.Multiaddr {
+	var out []ma.Multiaddr
+	for _, a := range addrs {
+		ip, err := a.ValueForProtocol(ma.P_IP4)
+		if err != nil {
+			out = append(out, a)
+			continue
+		}
+		if isOverlayRoutable(ip) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+func isOverlayRoutable(ip string) bool {
+	if ip == "127.0.0.1" {
+		return true
+	}
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return true // unknown shape: drop conservatively
+	}
+	oct := make([]int, 4)
+	for i, p := range parts {
+		v, err := strconv.Atoi(p)
+		if err != nil {
+			return true
+		}
+		oct[i] = v
+	}
+	return (oct[0] == 10) ||
+		(oct[0] == 172 && oct[1] >= 16 && oct[1] <= 31) ||
+		(oct[0] == 192 && oct[1] == 168) ||
+		(oct[0] == 100 && oct[1] >= 64 && oct[1] <= 127)
 }
 
 // peerAddrs extracts {peerID: direct multiaddrs} from the control registry.

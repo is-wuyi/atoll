@@ -266,7 +266,7 @@ func (d *DialConfig) dialDirect(ctx context.Context, addrs []ma.Multiaddr) (*cou
 	if err := d.Host.Connect(dctx, ai); err != nil {
 		return nil, fmt.Errorf("peertransport: direct connect to %s: %w", d.Expected, err)
 	}
-	stream, err := d.openVerifiedStream(ctx, pathDirect)
+	stream, err := d.openVerifiedStream(ctx, pathDirect, false)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +295,7 @@ func (d *DialConfig) dialRelay(ctx context.Context, fallback bool) (*countingCon
 	if err := d.Host.Connect(dctx, circuitAI); err != nil {
 		return nil, fmt.Errorf("peertransport: relay connect to %s via %s: %w", d.Expected, d.Relay.ID, err)
 	}
-	stream, err := d.openVerifiedStream(ctx, pathCircuit)
+	stream, err := d.openVerifiedStream(ctx, pathCircuit, fallback)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +349,7 @@ func (d *DialConfig) connectTimeout() time.Duration {
 //     public key present).
 //
 // Anything else is an error — never a silent unencrypted fallback.
-func (d *DialConfig) openVerifiedStream(ctx context.Context, path string) (network.Stream, error) {
+func (d *DialConfig) openVerifiedStream(ctx context.Context, path string, fallback bool) (network.Stream, error) {
 	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	// Explicitly allow streams over Limited (CircuitRelay v2) connections;
@@ -371,9 +371,17 @@ func (d *DialConfig) openVerifiedStream(ctx context.Context, path string) (netwo
 	}
 	isCircuit := hasCircuitComponent(conn.RemoteMultiaddr())
 	if path == pathCircuit && (!isCircuit || !conn.Stat().Limited) {
-		stream.Reset()
-		return nil, fmt.Errorf("peertransport: expected limited circuit connection, got %s (limited=%v)",
-			conn.RemoteMultiaddr(), conn.Stat().Limited)
+		// CircuitRelay v2 connection upgrade: after relay traversal the swarm
+		// may migrate the connection to a direct one (observed on a real WAN
+		// run: the relay hop upgraded the circuit to a QUIC direct
+		// connection). For DirectThenRelay fallback this upgrade is a success
+		// — the bytes DID traverse the relay first; only forced-relay keeps
+		// the strict limited-circuit requirement.
+		if !fallback {
+			stream.Reset()
+			return nil, fmt.Errorf("peertransport: expected limited circuit connection, got %s (limited=%v)",
+				conn.RemoteMultiaddr(), conn.Stat().Limited)
+		}
 	}
 	if path == pathDirect && isCircuit {
 		stream.Reset()
