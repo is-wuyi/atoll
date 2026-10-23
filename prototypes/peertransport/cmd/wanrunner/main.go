@@ -108,6 +108,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if role == "identity" {
+		// Offline helper: print the PeerID stored in -state without networking
+		// (operator workflow: create identity first, share PeerID, then the
+		// admin authorizes it before the role starts).
+		if *state == "" {
+			fmt.Fprintln(os.Stderr, "wanrunner identity: -state is required")
+			os.Exit(2)
+		}
+		id, err := pt.LoadOrCreateIdentity(*state)
+		if err != nil {
+			log.Fatalf("identity: %v", err)
+		}
+		announceJSON("identity", id.ID, nil)
+		return
+	}
+
 	switch role {
 	case "relay":
 		runRelay(ctx, *state, *listenIP, *listenPort, announce, *quic, *allowed)
@@ -179,6 +195,7 @@ func runRelay(ctx context.Context, state, listenIP string, listenPort int, annou
 		DataDir:       state,
 		Allowlist:     allow,
 		ListenIP:      listenIP,
+		ListenPort:    listenPort,
 		AnnounceAddrs: announce,
 		Logger:        log.Default(),
 	})
