@@ -37,6 +37,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"os/signal"
@@ -99,7 +100,12 @@ func main() {
 	controlAddr := addrInfoFlag(fs, "control", "control multiaddr with /p2p/<controlID> (peer role)")
 	allowed := peerIDSliceFlag(fs, "allow-peer", "authorized PeerID (repeatable)")
 	probeEvery := fs.Duration("probe-every", 30*time.Second, "probe interval; 0 = register and idle")
-	noMesh := fs.Bool("no-mesh-direct", false, "drop 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 endpoints from probe direct dials (force the relay path on an overlaid mesh)")
+	noMesh := fs.Bool("no-mesh-direct", false, "drop overlay-routable endpoints from probe direct dials (force the relay path on an overlaid mesh)")
+	perfTarget := fs.String("target", "", "perf: target PeerID")
+	perfDirect := fs.String("direct-addr", "", "perf: target direct multiaddr")
+	perfPolicy := fs.String("policy", "direct-then-relay", "perf: direct|forced-relay|direct-then-relay")
+	perfRounds := fs.Int("rounds", 20, "perf: latency rounds (4KiB PUT+GET each)")
+	perfBW := fs.Int64("bw-bytes", 16<<20, "perf: bandwidth payload size (bytes)")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		os.Exit(2)
 	}
@@ -110,6 +116,21 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if role == "perf" {
+		// Latency + bandwidth measurement against one target, one policy at a
+		// time. Emits one JSON line per phase with real timings.
+		if *state == "" || *perfTarget == "" {
+			fmt.Fprintln(os.Stderr, "wanrunner perf: -state and -target are required")
+			os.Exit(2)
+		}
+		relayAI := ""
+		if relayAddr != nil && relayAddr.ID != "" {
+			relayAI = relayAddr.Addrs[0].String() + "/p2p/" + relayAddr.ID.String()
+		}
+		runPerf(ctx, *state, *listenIP, *listenPort, announce, *perfTarget, *perfDirect, relayAI, *perfPolicy, *perfRounds, *perfBW)
+		return
+	}
 
 	if role == "identity" {
 		// Offline helper: print the PeerID stored in -state without networking
@@ -186,6 +207,106 @@ func (v addrInfoValue) Set(s string) error {
 	}
 	*v.ai = ai
 	return nil
+}
+
+type perfResult struct {
+	Phase    string  `json:"phase"` // latency | up | down
+	Path     string  `json:"path"`
+	Fallback bool    `json:"fallback"`
+	N        int     `json:"n"`
+	Bytes    int64   `json:"bytes"`
+	MinMS    float64 `json:"min_ms"` // microseconds / 1000, first dial included in round 1
+	MedMS    float64 `json:"med_ms"`
+	P95MS    float64 `json:"p95_ms"`
+	MaxMS    float64 `json:"max_ms"`
+	MBps     float64 `json:"mbps"`
+	Err      string  `json:"err,omitempty"`
+}
+
+func runPerf(ctx context.Context, state, listenIP string, listenPort int, announce []ma.Multiaddr, targetID, directAddr, relayAddr, policy string, rounds int, bwBytes int64) {
+	tid, err := peer.Decode(targetID)
+	if err != nil {
+		log.Fatalf("perf: invalid target: %v", err)
+	}
+	var directAddrs []ma.Multiaddr
+	if directAddr != "" {
+		a, err := ma.NewMultiaddr(directAddr)
+		if err != nil {
+			log.Fatalf("perf: invalid direct-addr: %v", err)
+		}
+		directAddrs = []ma.Multiaddr{a}
+	}
+	var relay *peer.AddrInfo
+	if relayAddr != "" {
+		a, err := ma.NewMultiaddr(relayAddr)
+		if err != nil {
+			log.Fatalf("perf: invalid relay: %v", err)
+		}
+		ai, err := peer.AddrInfoFromP2pAddr(a)
+		if err != nil {
+			log.Fatalf("perf: relay multiaddr needs /p2p/<relayID>: %v", err)
+		}
+		relay = ai
+	}
+	var pol pt.DialPolicy
+	switch policy {
+	case "direct":
+		pol = pt.PolicyDirect
+	case "forced-relay":
+		pol = pt.PolicyForcedRelay
+		if relay == nil {
+			log.Fatal("perf: forced-relay needs -relay")
+		}
+	default:
+		pol = pt.PolicyDirectThenRelay
+	}
+	p, err := pt.NewStoragePeer(ctx, pt.PeerConfig{
+		DataDir:    state,
+		EnableQUIC: true,
+		Peers:      pt.NewAllowlist(tid),
+		Control:    nil,
+		Relay:      relay,
+		ListenIP:   listenIP,
+		ListenPort: listenPort,
+		AnnounceAddrs: announce,
+		Logger:     log.Default(),
+	})
+	if err != nil {
+		log.Fatalf("perf: %v", err)
+	}
+	defer p.Close()
+
+	_, dial := p.Dial(tid, pol, directAddrs)
+
+	// latency: rounds x 4KiB PUT+GET. Round 1 includes the connection dial
+	// (real-world first-touch cost); the sorted stats show both the dial cost
+	// and the steady-state keep-alive RTT.
+	latMS := make([]float64, 0, rounds)
+	for i := 0; i < rounds; i++ {
+		start := time.Now()
+		probeOnce(ctx, p, tid, directAddrs, 4096)
+		latMS = append(latMS, float64(time.Since(start).Microseconds())/1000.0)
+	}
+	st := dial.LastStats()
+	if len(latMS) > 0 {
+		sort.Float64s(latMS)
+		res := perfResult{Phase: "latency", Path: st.Effective, Fallback: st.FallbackUsed, N: len(latMS),
+			MinMS: latMS[0], MedMS: latMS[len(latMS)/2], P95MS: latMS[len(latMS)*95/100], MaxMS: latMS[len(latMS)-1]}
+		_ = json.NewEncoder(os.Stdout).Encode(res)
+	}
+
+	// up: one bwBytes PUT, timed.
+	if bwBytes > 0 {
+		start := time.Now()
+		probeOnce(ctx, p, tid, directAddrs, bwBytes)
+		el := time.Since(start).Seconds()
+		st = dial.LastStats()
+		res := perfResult{Phase: "up", Path: st.Effective, Fallback: st.FallbackUsed, Bytes: bwBytes}
+		if el > 0 {
+			res.MBps = float64(bwBytes) / 1024 / 1024 / el
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(res)
+	}
 }
 
 func runRelay(ctx context.Context, state, listenIP string, listenPort int, announce []ma.Multiaddr, quic bool, allowed []peer.ID) {
