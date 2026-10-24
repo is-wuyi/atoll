@@ -805,6 +805,14 @@ func TestProbeTransferAcknowledgesBothOperations(t *testing.T) {
 		if r.WireBytes < size {
 			t.Errorf("%s wire_bytes = %d, want >= %d", r.Operation, r.WireBytes, size)
 		}
+		// Route evidence: the ACTUAL endpoints of the connection that carried
+		// the operation, recorded from the connection itself.
+		if !strings.Contains(r.RemoteMultiaddr, "/ip4/127.0.0.1/tcp/") {
+			t.Errorf("%s remote_multiaddr = %q, want the real loopback endpoint", r.Operation, r.RemoteMultiaddr)
+		}
+		if !strings.Contains(r.LocalMultiaddr, "/ip4/127.0.0.1/tcp/") {
+			t.Errorf("%s local_multiaddr = %q, want the real local endpoint", r.Operation, r.LocalMultiaddr)
+		}
 	}
 	if put.Sha256 != get.Sha256 || put.Sha256 == "" {
 		t.Errorf("shas %q / %q", put.Sha256, get.Sha256)
@@ -892,6 +900,8 @@ func TestEmitProbeIsJSONStable(t *testing.T) {
 		Policy: "direct-then-relay", Path: pt.PathCircuit,
 		Fallback: true, Bytes: 4096, WireBytes: 4120,
 		Sha256: "ab", Match: boolPtr(true), LatencyMS: 1.25,
+		RemoteMultiaddr: "/ip4/1.2.3.4/tcp/44001/p2p/relay/p2p-circuit",
+		LocalMultiaddr:  "/ip4/192.168.8.5/tcp/51000",
 	}
 	out, err := json.Marshal(r)
 	if err != nil {
@@ -901,6 +911,7 @@ func TestEmitProbeIsJSONStable(t *testing.T) {
 	for _, key := range []string{
 		`"time"`, `"op"`, `"remote"`, `"policy"`, `"path"`, `"fallback"`,
 		`"fallback_upgraded"`, `"bytes"`, `"wire_bytes"`, `"sha256"`, `"match"`, `"latency_ms"`,
+		`"remote_multiaddr"`, `"local_multiaddr"`,
 	} {
 		if !strings.Contains(got, key) {
 			t.Errorf("probe line lacks key %s: %s", key, got)
@@ -910,22 +921,33 @@ func TestEmitProbeIsJSONStable(t *testing.T) {
 		t.Errorf("probe line must omit an empty err: %s", got)
 	}
 
+	// Historical lines without the endpoint keys still decode (additive change).
+	legacy := []byte(`{"time":"t","op":"put","remote":"peer","policy":"direct","path":"direct","fallback":false,"fallback_upgraded":false,"bytes":1,"wire_bytes":1,"sha256":"ab","match":true,"latency_ms":1}`)
 	var back probeResult
+	if err := json.Unmarshal(legacy, &back); err != nil {
+		t.Fatalf("legacy line unmarshal: %v", err)
+	}
 	if err := json.Unmarshal(out, &back); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if back.Bytes != 4096 || back.WireBytes != 4120 || back.Path != pt.PathCircuit {
 		t.Errorf("round trip changed the result: %+v", back)
 	}
+	if back.RemoteMultiaddr == "" || back.LocalMultiaddr == "" {
+		t.Errorf("round trip lost the endpoint keys: %+v", back)
+	}
 }
 
-// TestEmitPerfResultIsJSONStable: same contract for the perf phase line.
+// TestEmitPerfResultIsJSONStable: same contract for the perf phase line. The
+// historical `endpoint` key keeps its meaning (remote multiaddr); the local
+// side is additive.
 func TestEmitPerfResultIsJSONStable(t *testing.T) {
 	r := perfResult{
 		Phase: "down", Policy: "direct-then-relay", Path: pt.PathDirect,
 		FallbackAttempted: true, FallbackUpgraded: true,
-		Endpoint: "/ip4/1.2.3.4/tcp/44010",
-		N:        1, Bytes: 4096, WireBytes: 4120,
+		Endpoint:       "/ip4/1.2.3.4/tcp/44010",
+		LocalMultiaddr: "/ip4/192.168.8.5/tcp/51000",
+		N:              1, Bytes: 4096, WireBytes: 4120,
 		MinMS: 1, MedMS: 1, P95MS: 1, MaxMS: 1, MBps: 2, Sha256: "ab",
 	}
 	out, err := json.Marshal(r)
@@ -936,6 +958,7 @@ func TestEmitPerfResultIsJSONStable(t *testing.T) {
 	for _, key := range []string{
 		`"phase"`, `"policy"`, `"path"`, `"fallback_attempted"`, `"fallback_upgraded"`, `"endpoint"`,
 		`"n"`, `"bytes"`, `"wire_bytes"`, `"min_ms"`, `"med_ms"`, `"p95_ms"`, `"max_ms"`, `"mbps"`, `"sha256"`,
+		`"local_multiaddr"`,
 	} {
 		if !strings.Contains(got, key) {
 			t.Errorf("perf line lacks key %s: %s", key, got)
@@ -943,5 +966,55 @@ func TestEmitPerfResultIsJSONStable(t *testing.T) {
 	}
 	if strings.Contains(got, `"err"`) {
 		t.Errorf("perf line must omit an empty err: %s", got)
+	}
+
+	// Historical perf lines without local_multiaddr still decode.
+	legacy := []byte(`{"phase":"down","policy":"direct","path":"direct","fallback_attempted":false,"fallback_upgraded":false,"endpoint":"/ip4/1.2.3.4/tcp/44010","n":1,"bytes":1,"wire_bytes":1,"min_ms":1,"med_ms":1,"p95_ms":1,"max_ms":1,"mbps":1}`)
+	var back perfResult
+	if err := json.Unmarshal(legacy, &back); err != nil {
+		t.Fatalf("legacy line unmarshal: %v", err)
+	}
+	if back.Endpoint != "/ip4/1.2.3.4/tcp/44010" || back.LocalMultiaddr != "" {
+		t.Errorf("legacy perf line changed meaning: %+v", back)
+	}
+}
+
+// TestPublicOnlyFlagRoleScope pins which roles accept -public-only; every
+// other role must reject it loudly instead of silently ignoring it.
+func TestPublicOnlyFlagRoleScope(t *testing.T) {
+	for _, role := range []string{"peer", "perf"} {
+		if !publicOnlyRoleOK(role) {
+			t.Errorf("publicOnlyRoleOK(%q) = false, want true", role)
+		}
+	}
+	for _, role := range []string{"relay", "control", "identity", "", "unknown"} {
+		if publicOnlyRoleOK(role) {
+			t.Errorf("publicOnlyRoleOK(%q) = true, want false", role)
+		}
+	}
+}
+
+// TestPerfPublicOnlyRefusesLoopbackDirect: a perf run with -public-only
+// against a loopback direct endpoint must fail as a MEASUREMENT FAILURE (n=0,
+// no path) — the gate refuses the non-public dial instead of measuring an
+// overlay connection and calling it direct.
+func TestPerfPublicOnlyRefusesLoopbackDirect(t *testing.T) {
+	c := newPerfCluster(t, 2, func(_ int, cfg *pt.PeerConfig) {
+		cfg.PublicOnly = true
+		// The loopback relay is not dialable under public-only either.
+		cfg.SkipRelayReservation = true
+	})
+	r, err := phaseConnect(context.Background(), c.peers[0], c.peers[1].ID, pt.PolicyDirect, c.directAddrs(1), 2)
+	if err == nil {
+		t.Fatalf("public-only perf measured a loopback direct connection: %+v", r)
+	}
+	if r.N != 0 {
+		t.Errorf("rejected dials counted n=%d", r.N)
+	}
+	if r.Path != "" {
+		t.Errorf("rejected phase reported path %q", r.Path)
+	}
+	if !strings.Contains(r.Err, "dial") {
+		t.Errorf("error %q does not name the dial failure", r.Err)
 	}
 }

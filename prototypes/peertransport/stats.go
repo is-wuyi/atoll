@@ -15,12 +15,17 @@ import (
 // the requested policy, `Effective` is the path actually used ("direct" or
 // "circuit"), so a silent fallback can never happen unnoticed.
 type TransferStats struct {
-	Path                string `json:"path"`
-	Effective           string `json:"effective"`
-	RemotePeer          string `json:"remote_peer"`
-	RemoteMultiaddr     string `json:"remote_multiaddr"`
-	Limited             bool   `json:"limited"`   // true for CircuitRelay v2 connections
-	Secure              bool   `json:"secure"`    // identity-locked secure handshake verified (not at-rest encryption)
+	Path            string `json:"path"`
+	Effective       string `json:"effective"`
+	RemotePeer      string `json:"remote_peer"`
+	RemoteMultiaddr string `json:"remote_multiaddr"`
+	// LocalMultiaddr is the actual local endpoint of the connection (for a
+	// relayed connection the real transport address on this side, never the
+	// circuit virtual form). Recorded next to RemoteMultiaddr so a route
+	// claim can be checked against the connection that carried the bytes.
+	LocalMultiaddr      string `json:"local_multiaddr"`
+	Limited             bool   `json:"limited"` // true for CircuitRelay v2 connections
+	Secure              bool   `json:"secure"`  // identity-locked secure handshake verified (not at-rest encryption)
 	FallbackUsed        bool   `json:"fallback_used"`
 	PayloadBytesWritten int64  `json:"payload_bytes_written"`
 	PayloadBytesRead    int64  `json:"payload_bytes_read"`

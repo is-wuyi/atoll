@@ -4,7 +4,7 @@ Atoll（环礁）面向零配置、自治调度的跨地域边缘主存储。当
 
 运行方法与边界见 [计划写入说明](WRITE_PLANNING.md)、[拓扑与带宽感知传输](TRANSFER_PLANNING.md)、[对象退隐与容量释放](RETIREMENT.md) 和 [自治多副本说明](AUTONOMY.md)；前一批协议、升级限制与原型记录见 [完整性基础说明](EDGE_FOUNDATION.md)。`-write-planning` 为默认关闭的新写入口：Master 调度器冻结复制布局与具体确认集合，满足后原子发布；保护档位只影响优化权重，不是固定副本数。
 
-`-write-transfer-planning` 在计划写入上增加方向性连接观测、多个上传入口与节点复制路线；后台补副本可为不同不可变块绑定多个来源，共享上下行预算。`pkg/peerhttp` 保留 HTTPS 与在线票据，经真实 TLS-over-peer-stream 接生产组件；libp2p 的实际装配由独立模块隔离验证，CLI 自动发现/身份绑定与公网打洞验收仍未完成。当前不替换现网 EasyTier。验收记录见 [传输批次验收](TRANSFER_PLANNING_ACCEPTANCE.md)。
+`-write-transfer-planning` 在计划写入上增加方向性连接观测、多个上传入口与节点复制路线；后台补副本可为不同不可变块绑定多个来源，共享上下行预算。`pkg/peerhttp` 保留 HTTPS 与在线票据，经真实 TLS-over-peer-stream 接生产组件；libp2p 的实际装配由独立模块隔离验证，CLI 自动发现/身份绑定与公网打洞验收仍未完成。当前不替换现网 EasyTier。验收记录见 [传输批次验收](TRANSFER_PLANNING_ACCEPTANCE.md)，后续 [隔离实机验收](TRANSFER_PLANNING_REAL_ACCEPTANCE.md) 为部分通过：单入口与断源恢复通过，多源流重叠已确认，但慢链路完整副本和指定节点对公网直连尚未通过。
 
 ## 架构
 

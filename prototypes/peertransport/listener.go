@@ -446,6 +446,7 @@ func wrapStream(s network.Stream, policy DialPolicy, fallbackUsed bool) *countin
 		Effective:       effective,
 		RemotePeer:      conn.RemotePeer().String(),
 		RemoteMultiaddr: conn.RemoteMultiaddr().String(),
+		LocalMultiaddr:  conn.LocalMultiaddr().String(),
 		Limited:         conn.Stat().Limited,
 		Secure:          true,
 		FallbackUsed:    fallbackUsed,

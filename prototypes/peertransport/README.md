@@ -73,21 +73,48 @@ wanrunner relay   -state DIR -listen-port 44001 -announce /ip4/<A-pub>/tcp/44001
 wanrunner control -state DIR -listen-port 44000 -announce /ip4/<B-pub>/tcp/44000                   [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>]
 # each storage host: register + periodic transfer probes (64 KiB + 32 MiB,
 #                    direct-first, relay fallback, checksum-verified)
-wanrunner peer    -state DIR -listen-port 44010 [-announce /ip4/<pub>/tcp/44010]                   -control /ip4/<B-pub>/tcp/44000/p2p/<controlID>                   [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>]                   -allow-peer <otherPeerID>... -probe-every 30s                   [-no-mesh-direct]
+wanrunner peer    -state DIR -listen-port 44010 [-announce /ip4/<pub>/tcp/44010]                   -control /ip4/<B-pub>/tcp/44000/p2p/<controlID>                   [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>]                   -allow-peer <otherPeerID>... -probe-every 30s                   [-no-mesh-direct] [-public-only]
 # one-shot measurement against ONE target on ONE explicitly requested policy;
 # prints four JSON lines (connect / request / up / down) and exits
-wanrunner perf    -state DIR -target <peerID> -direct-addr /ip4/<pub>/tcp/44010                    [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>] -policy direct|forced-relay|direct-then-relay                   [-rounds 20] [-bw-bytes N] [-direct-timeout 3s]
+wanrunner perf    -state DIR -target <peerID> -direct-addr /ip4/<pub>/tcp/44010                    [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>] -policy direct|forced-relay|direct-then-relay                   [-rounds 20] [-bw-bytes N] [-direct-timeout 3s] [-public-only]
 ```
 
 `-no-mesh-direct` drops overlay-routable endpoints (RFC1918/loopback plus
 100.64.0.0/10 CGNAT) from the probe's direct dial set, so a LAN mesh or a
 Tailscale overlay cannot satisfy the "direct" half of the probe and hide the
-public relay path under test.
+public relay path under test. It filters only the probe's initial address
+list — endpoints re-learned later (identify, DCUtR) are stopped by the
+connection gate below, not by this flag.
 
-Each role prints one JSON identity line on stdout at startup; every probe
+`-public-only` (peer/perf only; default off) enables the peertransport
+public-endpoint connection gate for route-interface proofs: ONLY real public
+transport endpoints may be dialed or accepted, in both directions. Refused
+classes: loopback (127/8, ::1), RFC1918, CGNAT 100.64.0.0/10, IPv4/IPv6
+link-local, IPv6 ULA (fc00::/7), multicast, unspecified, and DNS names (the
+prototype dials explicitly configured addresses only; judging a name would
+need an implicit external resolution). CircuitRelay v2 paths are judged by
+their FIRST transport component — the public relay hop — so a public relay
+(including the `/p2p-circuit` dial address) keeps working and the circuit
+virtual form is never misread as local-private; the local side of a
+port-forwarded host (a NAT'd LAN address) stays acceptable because only
+loopback locals are refused. Endpoints re-learned by identify or dialed
+speculatively by DCUtR hit the same gate (every swarm dial passes
+`InterceptAddrDial` in libp2p v0.50), so there are no private dial side
+effects. `-public-only` proves the route stayed on public endpoints — it does
+NOT by itself prove a direct (non-circuit) connection succeeded; whether a
+non-circuit connection exists, and over which OS route, is only what the
+recorded connection endpoints of an actual run show. It is accepted by the
+peer/perf roles only; relay/control reject the flag loudly.
+
+Each role prints one JSON identity line on stdout at startup (with
+`"public_only":true` added only when `-public-only` is on); every probe
 prints one JSON result line per operation with
 `time,op,remote,policy,path,fallback,fallback_upgraded,bytes,wire_bytes,sha256,
-match,latency_ms,err`. `bytes` counts acknowledged bytes only (0 on failure)
+match,latency_ms,err` plus the ACTUAL endpoints of the connection that
+carried the operation, `remote_multiaddr` and `local_multiaddr` (additive,
+omitted when unset — for a circuit connection the remote is the
+`/ip4/<relay>/.../p2p-circuit` form whose first IP is the relay hop).
+`bytes` counts acknowledged bytes only (0 on failure)
 and a failed operation is emitted with its `err` field rather than dropped.
 WAN mode enables AutoNAT (reachability learning) in addition to the always-on
 hole punch service; `-announce` overrides the announced address set (the listen
@@ -96,7 +123,9 @@ port and the announced port may differ under NAT port-forwarding).
 The `perf` role is a one-shot measurement against one target on one explicitly
 requested policy: four phases (`connect`, `request`, `up`, `down`), one JSON
 line each with `phase,policy,path,fallback_attempted,fallback_upgraded,endpoint,
-n,bytes,wire_bytes,min_ms,med_ms,p95_ms,max_ms,mbps,sha256,err`. Payload
+n,bytes,wire_bytes,min_ms,med_ms,p95_ms,max_ms,mbps,sha256,err` plus additive
+`local_multiaddr` (the historical `endpoint` key keeps its meaning: the
+connection's remote multiaddr). Payload
 generation and the warm-up request are outside every timer; `n` counts
 successful operations only; an upload counts only after the server manifest
 confirms the same sha256 and size, a download only after the length and sha256
@@ -165,6 +194,23 @@ combined test output. No test writes to a fixed log file.
   403 at the HTTP layer for unauthorized registrations. Infrastructure peers
   (e.g., an extra relay) can be authorized at the gater level only via
   `StoragePeer.AllowInfraPeer` — they never enter a service allowlist.
+- **Public-endpoint gate (opt-in)** — `ConnGater.PublicOnly` (flowing
+  `PeerConfig.PublicOnly` → `HostOptions.PublicOnly` → the host's `*ConnGater`;
+  `newHost` refuses to start when PublicOnly is requested without a
+  `*ConnGater`) adds an address-class gate on top of the PeerID allowlist:
+  dials to and accepts from non-public transport endpoints are refused
+  (loopback, RFC1918, CGNAT 100.64/10, IPv4/IPv6 link-local, IPv6 ULA,
+  multicast, unspecified, DNS names). All five intercept hooks enforce it:
+  `InterceptAddrDial` is the choke point for every swarm dial — including
+  endpoints re-learned by identify or dialed by DCUtR — `InterceptAccept`
+  judges the transport endpoints pre-handshake, and
+  `InterceptSecured`/`InterceptUpgraded` re-judge the connection's ACTUAL
+  local/remote multiaddrs plus the verified PeerID. CircuitRelay v2 addresses
+  are judged by their first transport component (the relay hop), so a public
+  relay stays dialable and the `/p2p-circuit` virtual form is never mistaken
+  for a private endpoint; the NAT'd local side of a port-forwarded host is
+  legitimate and only loopback locals are refused. Default off: the
+  historical loopback behavior is byte-for-byte unchanged.
 - **Data plane security** — libp2p Noise is the only registered security
   protocol on TCP (QUIC uses libp2p's embedded identity-locked TLS). The
   handshake is bound to the Ed25519 PeerID, giving end-to-end encrypted and
@@ -214,6 +260,15 @@ combined test output. No test writes to a fixed log file.
 | `TestWrapStreamLabelsActualPathNotRequestedPath` | a connection is labelled from itself, not from the request: a direct stream opened by a relay attempt reports `direct` + `FallbackUsed=true`, and a circuit stream opened by a direct request reports `circuit` (never the reverse) |
 | `TestPerfPhasesEnforceRequestedPolicy` (`cmd/wanrunner`) | the perf phases measure the policy that was requested: no `/p2p-circuit` leaks into a direct run, and a live direct endpoint never rides the relay in a forced-relay run |
 | `TestProbeTransferReportsFailureWithoutCounting` (`cmd/wanrunner`) | a 413 upload emits the failure with its error, reports 0 bytes, skips the GET, and leaves the store empty |
+| `TestPublicOnlyDialClassification` | the public-only gate classifies every dial target correctly: public v4/v6 and circuit-over-public-relay pass; loopback, RFC1918, CGNAT 100.64/10, link-local, ULA, multicast, unspecified, DNS names and endpoint-less/circuit-over-private forms are refused |
+| `TestPublicOnlyLocalClassification` | the local side of a port-forwarded host (NAT'd LAN address) and the circuit virtual form are accepted; only loopback/unspecified/unknown shapes are refused |
+| `TestConnGaterPublicOnlyIntercepts` | all five intercept hooks enforce allowlist-first + endpoint class; outbound/inbound circuit over a PUBLIC relay stays connectable, loopback never does |
+| `TestConnGaterDefaultModeLoopbackUnchanged` | with PublicOnly=false (the default) loopback dials/accepts/secured conns pass exactly as before |
+| `TestNewHostPublicOnlyRequiresConnGater` | `HostOptions.PublicOnly` flows into the host's `*ConnGater`; a non-`*ConnGater` is a startup error, never a silently ungated run |
+| `TestPublicOnlyRefusesLoopbackEndpoints` | real-host negative: a public-only host refuses loopback dials at the gate (`gater disallows`), refuses the loopback relay fallback leg, refuses loopback REMOTES as the listener, leaves zero connections and a clean store — and the default mode still transfers on the same code path with the actual endpoints recorded |
+| `TestPublicOnlyFlagRoleScope` (`cmd/wanrunner`) | `-public-only` is accepted by peer/perf only; relay/control/identity reject it |
+| `TestPerfPublicOnlyRefusesLoopbackDirect` (`cmd/wanrunner`) | a `-public-only` perf run against a loopback direct endpoint fails as a measurement (n=0, no path) instead of measuring an overlay connection |
+| `TestEmitProbeIsJSONStable` / `TestEmitPerfResultIsJSONStable` (`cmd/wanrunner`) | probe/perf JSON keys are stable and additive: historical lines without `remote_multiaddr`/`local_multiaddr` still decode; `endpoint` keeps its remote-multiaddr meaning |
 
 ## Dependencies (pinned)
 
@@ -269,3 +324,14 @@ the heavy trees: go-libp2p ≈ 7.6 MB, quic-go ≈ 5.1 MB, multiformats ≈ 1.4 
 - QUIC relay hopping works in the demo (the circuit addr may use the relay's
   QUIC endpoint), but path selection between the relay's TCP/QUIC addresses is
   whatever `host.Addrs()` lists first — not yet policy-driven.
+- **`-public-only` proves endpoint classes, not reachability.** It constrains
+  every connection to public transport endpoints, so a recorded `direct` path
+  under the flag can no longer be a LAN-mesh/Tailscale/loopback link — but it
+  does NOT make a direct connection happen: behind double NAT without port
+  forwarding the probes will correctly stay on the relay (or fail), and DCUtR
+  hole punching is limited to public candidates because its private candidate
+  dials are refused by the same gate. Whether a non-circuit connection exists,
+  and over which OS route, is only what the `remote_multiaddr`/`local_multiaddr`
+  recorded by an actual run show. Loopback cannot positively exercise the
+  gate (everything is loopback there); the positive cases are the classifier
+  unit tests, the negative loopback rejections run against real hosts.

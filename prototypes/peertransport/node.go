@@ -40,6 +40,13 @@ type PeerConfig struct {
 	ListenIP     string        // listen IP, e.g. "0.0.0.0" for cross-machine runs
 	AnnounceAddrs []ma.Multiaddr // force-announced public endpoint(s) behind NAT
 	ListenPort   int
+	// PublicOnly enables the public-endpoint connection gate (see
+	// ConnGater.PublicOnly): dials and accepts are restricted to real public
+	// IP endpoints — loopback, RFC1918, CGNAT 100.64/10, link-local, IPv6
+	// ULA/link-local and DNS names are refused in every direction; relay
+	// paths are judged by the public relay hop. Zero value (default) keeps
+	// the historical loopback behavior.
+	PublicOnly bool
 }
 
 // StoragePeer is one storage node of the prototype: a persistent Ed25519
@@ -93,6 +100,9 @@ func NewStoragePeer(ctx context.Context, cfg PeerConfig) (*StoragePeer, error) {
 		gaterAllow.Add(relayID)
 	}
 	gater := NewConnGater(gaterAllow)
+	// Rejections (allowlist and public-only endpoint class) become
+	// operator-visible on the peer's logger.
+	gater.log = cfg.Logger
 	p.gater = gater
 
 	h, err := newHost(ctx, HostOptions{
@@ -105,6 +115,7 @@ func NewStoragePeer(ctx context.Context, cfg PeerConfig) (*StoragePeer, error) {
 		ListenIP:      cfg.ListenIP,
 		ListenPort:    cfg.ListenPort,
 		AnnounceAddrs: cfg.AnnounceAddrs,
+		PublicOnly:    cfg.PublicOnly,
 	})
 	if err != nil {
 		return nil, err

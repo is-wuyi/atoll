@@ -41,6 +41,12 @@ type HostOptions struct {
 	ListenIP     string
 	ListenPort   int
 	AnnounceAddrs []ma.Multiaddr
+	// PublicOnly turns the public-endpoint connection gate on for this host
+	// (see ConnGater.PublicOnly). It flows into the provided gater, so a
+	// *ConnGater is REQUIRED: without one the policy could not be enforced
+	// and newHost refuses to start instead of silently running ungated.
+	// Zero value (default) keeps the historical behavior.
+	PublicOnly bool
 }
 
 // newHost builds a libp2p host with:
@@ -77,6 +83,16 @@ func newHost(ctx context.Context, o HostOptions) (host.Host, error) {
 	rm, err := rcmgr.NewResourceManager(limiter)
 	if err != nil {
 		return nil, fmt.Errorf("peertransport: resource manager: %w", err)
+	}
+
+	// PublicOnly must be enforced by a *ConnGater; anything else is a
+	// configuration error, never a silent unenforced run.
+	if o.PublicOnly {
+		cg, ok := o.Gater.(*ConnGater)
+		if !ok {
+			return nil, fmt.Errorf("peertransport: PublicOnly requires a *ConnGater connection gater, got %T", o.Gater)
+		}
+		cg.PublicOnly = true
 	}
 
 	opts := []libp2p.Option{

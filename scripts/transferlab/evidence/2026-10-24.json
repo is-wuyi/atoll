@@ -1,0 +1,147 @@
+{
+  "date": "2026-10-24",
+  "run_id": "transfer-346fbb3b43fe",
+  "baseline": "f9b7a73",
+  "overall": "partial",
+  "storage_hosts": {
+    "master": "26666.et.net",
+    "A": "27472.et.net",
+    "B": "29038.et.net",
+    "C": "28425.et.net"
+  },
+  "single_ingress": {
+    "exit_code": 0,
+    "status": "passed",
+    "sample_bytes": 83886080,
+    "started_at": "2026-10-24T13:56:27.011544Z",
+    "finished_at": "2026-10-24T13:59:18.157382Z",
+    "sha256": "b389dd32763fb50683cb298879d86c47977a211efad7354158cefaa40b7bdc2a",
+    "chunks": [
+      {"object_id": 1099511627776, "size": 67108864, "replicas": [2, 3], "done": [2, 3]},
+      {"object_id": 1099511627777, "size": 16777216, "replicas": [2, 3], "done": [2, 3]}
+    ],
+    "events": [
+      {"label": "A", "method": "PUT", "path": "/objects/1099511627777", "body_bytes": 16777216, "start_utc": "2026-10-24T13:56:52.073366124Z", "end_utc": "2026-10-24T13:57:01.057304967Z", "duration_ms": 8983},
+      {"label": "A", "method": "PUT", "path": "/objects/1099511627776", "body_bytes": 67108864, "start_utc": "2026-10-24T13:56:51.667064997Z", "end_utc": "2026-10-24T13:57:25.582283496Z", "duration_ms": 33915},
+      {"label": "B", "method": "PUT", "path": "/replicate/1099511627777", "body_bytes": 16777216, "start_utc": "2026-10-24T13:57:02.094561135Z", "end_utc": "2026-10-24T13:57:19.074985666Z", "duration_ms": 16980},
+      {"label": "B", "method": "PUT", "path": "/replicate/1099511627776", "body_bytes": 67108864, "start_utc": "2026-10-24T13:57:25.798827368Z", "end_utc": "2026-10-24T13:58:51.328272649Z", "duration_ms": 85529}
+    ]
+  },
+  "multi_source_complete_replica": {
+    "exit_code": 4,
+    "status": "failed",
+    "started_at": "2026-10-24T14:03:11.807937Z",
+    "finished_at": "2026-10-24T14:15:38.116707Z",
+    "reason": "The 64 MiB object did not complete within the 180-second lease across repeated attempts. The 16 MiB object completed; the file replica did not.",
+    "large_object_plan": {
+      "id": "lab-cf09f639-o1099511627776",
+      "object_id": 1099511627776,
+      "source_id": 2,
+      "target_id": 4,
+      "last_observed_attempts": 5,
+      "final_state": "cancelled after failed acceptance",
+      "partial_transfers": [
+        {"start_utc": "2026-10-24T14:03:16.987713738Z", "end_utc": "2026-10-24T14:06:13.190332832Z", "duration_ms": 176202, "body_bytes": 12131728},
+        {"start_utc": "2026-10-24T14:06:14.686682373Z", "end_utc": "2026-10-24T14:09:14.579999086Z", "duration_ms": 179893, "body_bytes": 12358420},
+        {"start_utc": "2026-10-24T14:09:20.260022985Z", "end_utc": "2026-10-24T14:12:20.071937823Z", "duration_ms": 179811, "body_bytes": 14024704},
+        {"start_utc": "2026-10-24T14:12:28.792761461Z", "end_utc": "2026-10-24T14:15:27.588897714Z", "duration_ms": 178796, "body_bytes": 19085056}
+      ]
+    },
+    "small_object_plan": {
+      "id": "lab-fb5874a2-o1099511627777",
+      "object_id": 1099511627777,
+      "source_id": 3,
+      "target_id": 4,
+      "attempts": 1,
+      "final_state": "completed",
+      "body_bytes": 16777216,
+      "start_utc": "2026-10-24T14:03:19.935483311Z",
+      "end_utc": "2026-10-24T14:05:42.751153819Z",
+      "duration_ms": 142815
+    }
+  },
+  "multi_source_overlap": {
+    "observed_overlap_seconds": 142.816,
+    "simultaneous_source_status_samples": 6,
+    "representative_status_sample": {
+      "client_wall_unix": 1792850600.499402,
+      "A": {"active_gets": 1, "node_id": 2, "now_utc": "2026-10-24T14:03:20.2368831Z"},
+      "B": {"active_gets": 1, "node_id": 3, "now_utc": "2026-10-24T14:03:20.237659264Z"}
+    },
+    "qualification": "Source UTC intervals are corroborated by concurrent status samples. Do not subtract monotonic clocks from different hosts. Overlap does not establish speedup or successful complete-replica acceptance."
+  },
+  "fault_recovery": {
+    "status": "passed",
+    "exit_code": 0,
+    "sample_bytes": 262144,
+    "sha256": "1b02ae1f702293009b17f5078905c76a29a7d1da3618972791509e03c5a0ad9c",
+    "plan_id": "lab-fa5cd9cd-o1099511628032",
+    "object_id": 1099511628032,
+    "target_id": 4,
+    "first_source_id": 2,
+    "rebound_source_id": 3,
+    "attempts": 2,
+    "elapsed_seconds": 195.776,
+    "snapshots": [
+      {"time_utc": "2026-10-24T14:30:13.064286742Z", "state": "pending", "source_id": 2, "attempts": 1, "target_done": false, "next_attempt": "2026-10-24T14:33:12.076980848Z"},
+      {"time_utc": "2026-10-24T14:30:16.286337448Z", "state": "pending", "source_id": 2, "attempts": 1, "target_done": false, "next_attempt": "2026-10-24T14:33:12.076980848Z"},
+      {"time_utc": "2026-10-24T14:33:14.363340094Z", "state": "pending", "source_id": 3, "attempts": 2, "target_done": false, "next_attempt": "2026-10-24T14:36:13.803201369Z"},
+      {"time_utc": "2026-10-24T14:33:24.269447584Z", "state": "completed", "source_id": 3, "attempts": 2, "target_done": true, "replicas": [2, 3, 4], "done": [3, 2, 4]}
+    ]
+  },
+  "original_pair_p2p": {
+    "pair": ["27119.et.net", "28425.et.net"],
+    "operation_records": 480,
+    "verified_operations": 95,
+    "verified_put_get_pairs": 47,
+    "verified_put_only": 1,
+    "verified_sizes": [65536],
+    "verified_direct_operations": 0,
+    "verified_circuit_operations": 95,
+    "representative_remote_multiaddr": "/ip4/193.134.209.37/tcp/44421/p2p/12D3KooWMH9T1TFfvn7TTduK29JF5Afdq92RvhAmxCs8L2PN9sEv/p2p-circuit",
+    "representative_local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+    "qualified_result": "Only small circuit operations passed before 27119 became unavailable. No verified public direct path or bidirectional throughput benchmark."
+  },
+  "cleanup": {
+    "stopped_owned_roles": ["26666.et.net", "27472.et.net", "29038.et.net", "28425.et.net"],
+    "removed_owned_directories": ["26666.et.net", "27472.et.net", "29038.et.net", "28425.et.net", "29663.et.net"],
+    "temporary_rule_removed": true,
+    "runtime_public_test_ports_closed": [44420, 44421],
+    "permanent_public_test_ports_closed": [44420, 44421],
+    "existing_service_health_after": {"master_26666": 200, "node_27472": 200, "node_29038": 200, "node_28425": 200},
+    "unverified_residue": {
+      "host": "27119.et.net",
+      "path": "/volume1/@fake_home_link/jimo/.atoll-transfer-346fbb3b43fe-zowqlse0",
+      "possible_process": "isolated WAN peer-a",
+      "reason": "Not in the center's admitted peer list and no test-network DNS entry; final process and directory verification unavailable."
+    }
+  },
+  "source_evidence_sha256": {
+    "round2-ingress-report.json": "cb57dfdf78e0cc454d35e9a64ee8fe1cdfca4b01acadc0dd1f05ed672f41f2c6",
+    "round2-ingress-report.json.events.ndjson": "2aa0ce241e8e7a039775968add371c652ab603a8b7aae957518dd39d02ad6c01",
+    "round2-protection-report.json": "27561c69c4a2bf967c752a6b20acdeea78bf2bd02721054e952df738ba85f589",
+    "round2-protection-report.json.events.ndjson": "c319883ae494972dc932b6bdadb4a4151d99005d1c96410f6d217474dbf1714a",
+    "round2-protection-activity.ndjson": "9fa3a07ccc9fca130b6b216f71c5fe87f849173e2045357493d90839de225bd7",
+    "fault-recovery-result.json": "6f7d4899c7b0241a7ac6f21ab1afe08c090b11fa4d24e3f8cf244c4d6f9fa7d9",
+    "fault-first-dispatched.json": "7f675e424056a9bd7edfcbbaddbd466e06813776fae97fe7fd9a5c387abe771b",
+    "fault-after-source-loss.json": "4ed9124d4d444c117311410db4e9558e81a4162a84ccfcb5d9c1620d0c43dc57",
+    "fault-rebound.json": "b76a909602e99c5b1a43d61123ca56eacc6d8920db5f56254cdde9280686aa20",
+    "fault-completed.json": "f916b2d996fec4d423073e980a908b63dbf655c1c22b68469dc87ee3ed6c7f58",
+    "cleanup-stop-results.json": "b1ea4fc2e0081c0d61879815b0bac187e83277157f216e5050b6f7a13589227e",
+    "cleanup-firewall-results.json": "9406ad556c0c7bc63d79765a05322940b574760e8055b71b7499379d69c63ba2",
+    "cleanup-directory-results.json": "74098b5a563008cf965e7a9e0ef0c9a5adfde9a22d22cecfd8a7a61769c77d3d",
+    "cleanup-29038-final.json": "125e0747b2c5cb953c24842c520a070c413e2db2c5b84169c01a2cd9fb9969cc",
+    "cleanup-29663-final.json": "2dc1affffb15bdc0e973d8f0b162958525ae375fdd0a67fde42a483439da8584",
+    "existing-services-after-test.json": "fd2a01e2c866da59f1a14ae5acd1036aedbe8ce699f0474179be427a1a75c607",
+    "28425.et.net-peer-b.log": "372ee7cb91a5f3eac857dbe846a399089273bc000f441349886d6266ae51a95e",
+    "26666.et.net-relay.log": "bd51b58f288a0f8d73d02a44239430e6f7db2e4f139cba5b69e95b5519f5a313",
+    "26666.et.net-control.log": "b6144338908759e3a47874976131f18a051c9c5ede2f51e2313f449b407325e2"
+  },
+  "qualifications": [
+    "No credentials or private configuration files are included.",
+    "Overlap is not a speedup benchmark; configured BPS is not observed goodput.",
+    "The 64 MiB target replica failed; source-loss recovery passed on an independent 256 KiB sample.",
+    "Master data-route absence was checked, but network-byte capture was not performed.",
+    "Final local EDNS and reserved-address fixes were not rerun on remote hosts."
+  ]
+}

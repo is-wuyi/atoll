@@ -8,19 +8,34 @@
 //	wanrunner control -state DIR -announce /ip4/<public>/tcp/4000 [-relay /ip4/.../p2p/<relayID>]
 //	wanrunner peer    -state DIR [-announce ...] -control <multiaddr-with-p2p>
 //	                    [-relay <multiaddr-with-p2p>] [-allow-peer ID]... [-probe-every 30s]
+//	                    [-no-mesh-direct] [-public-only]
 //	wanrunner perf    -state DIR -target <peerID> [-direct-addr <multiaddr>]
 //	                    [-relay <multiaddr-with-p2p>] [-policy direct|forced-relay|direct-then-relay]
-//	                    [-rounds 20] [-bw-bytes N] [-direct-timeout 3s]
+//	                    [-rounds 20] [-bw-bytes N] [-direct-timeout 3s] [-public-only]
 //
 // Every role prints one JSON line on stdout at startup:
 //
-//	{"role":"peer","peer_id":"12D3...","addresses":["/ip4/.../tcp/..."]}
+//	{"role":"peer","peer_id":"12D3...","addresses":["/ip4/.../tcp/..."],"public_only":true}
+//
+// (public_only is present only when -public-only is enabled.)
 //
 // The peer role registers with control, fetches the authorized peer list, then
 // every -probe-every interval runs a transfer probe against each peer it can
 // reach: PUT then GET of a small + a large probe object, direct-first with
 // relay fallback, recording one JSON result line per probe (policy, path,
-// fallback attempt, bytes, checksum match). Never prints keys or tokens.
+// fallback attempt, bytes, checksum match, and the ACTUAL remote/local
+// multiaddr of the connection that carried the operation). Never prints keys
+// or tokens.
+//
+// -public-only (peer/perf) enables the peertransport public-endpoint
+// connection gate: dials and accepts are limited to real public IP endpoints
+// (loopback, RFC1918, CGNAT 100.64/10, link-local, IPv6 ULA/link-local and DNS
+// names are refused in every direction; a circuit path is judged by its first
+// public relay endpoint). Endpoints re-learned by identify or dialed by DCUtR
+// hit the same gate, so no private dial side effects exist. It proves the
+// route stayed on public endpoints — it does NOT by itself prove a direct
+// (non-circuit) connection succeeded; the actual non-circuit path and OS route
+// are only what the recorded connection endpoints of a run show.
 //
 // The perf role measures ONE target on ONE explicitly requested policy and
 // exits. Four phases, one JSON line each: connect (first-touch path cost, cold
@@ -80,10 +95,14 @@ type roleInfo struct {
 	Role      string   `json:"role"`
 	PeerID    string   `json:"peer_id"`
 	Addresses []string `json:"addresses"`
+	// PublicOnly is true when the role started with the public-endpoint
+	// connection gate enabled (-public-only). Omitted when false so the
+	// historical identity line is byte-for-byte unchanged.
+	PublicOnly bool `json:"public_only,omitempty"`
 }
 
-func announceJSON(role string, id peer.ID, addrs []ma.Multiaddr) {
-	out := roleInfo{Role: role, PeerID: id.String(), Addresses: make([]string, 0, len(addrs))}
+func announceJSON(role string, id peer.ID, addrs []ma.Multiaddr, publicOnly bool) {
+	out := roleInfo{Role: role, PeerID: id.String(), Addresses: make([]string, 0, len(addrs)), PublicOnly: publicOnly}
 	for _, a := range addrs {
 		out.Addresses = append(out.Addresses, a.String())
 	}
@@ -141,6 +160,7 @@ func main() {
 	allowed := peerIDSliceFlag(fs, "allow-peer", "authorized PeerID (repeatable)")
 	probeEvery := fs.Duration("probe-every", 30*time.Second, "probe interval; 0 = register and idle")
 	noMesh := fs.Bool("no-mesh-direct", false, "drop overlay-routable endpoints from probe direct dials (force the relay path on an overlaid mesh)")
+	publicOnly := fs.Bool("public-only", false, "仅允许公网端点建连（peer/perf 专用）：拒绝 loopback/RFC1918/CGNAT 100.64/10/链路本地/IPv6 ULA/DNS 的拨号与入站，circuit 按 relay 首个公网端点判定；默认 false 保持历史行为")
 	perfTarget := fs.String("target", "", "perf: target PeerID")
 	perfDirect := fs.String("direct-addr", "", "perf: target direct multiaddr")
 	perfPolicy := fs.String("policy", "direct-then-relay", "perf: direct|forced-relay|direct-then-relay (enforced, never downgraded)")
@@ -154,6 +174,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "wanrunner: -state is required")
 		os.Exit(2)
 	}
+	// -public-only 是端到端验证用的门，不是各角色通用开关：relay/control 的
+	// 连接策略不同（relay 必须接受保留请求），误用直接拒绝，绝不静默忽略。
+	if *publicOnly && !publicOnlyRoleOK(role) {
+		fmt.Fprintf(os.Stderr, "wanrunner %s: -public-only 仅支持 peer/perf 角色\n", role)
+		os.Exit(2)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -163,7 +189,7 @@ func main() {
 		// requested policy, four phases with acknowledged-byte accounting.
 		// Emits one JSON line per phase and exits non-zero on any failure.
 		runPerf(ctx, *state, *listenIP, *listenPort, announce, *perfTarget, *perfDirect,
-			relayAIString(relayAddr), *perfPolicy, *perfRounds, *perfBW, *perfDirectTimeout)
+			relayAIString(relayAddr), *perfPolicy, *perfRounds, *perfBW, *perfDirectTimeout, *publicOnly)
 		return
 	}
 
@@ -179,7 +205,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("identity: %v", err)
 		}
-		announceJSON("identity", id.ID, nil)
+		announceJSON("identity", id.ID, nil, false)
 		return
 	}
 
@@ -189,12 +215,16 @@ func main() {
 	case "control":
 		runControl(ctx, *state, *listenIP, *listenPort, announce, *quic, relayAddr, *allowed)
 	case "peer":
-		runPeer(ctx, *state, *listenIP, *listenPort, announce, *quic, controlAddr, relayAddr, *allowed, *probeEvery, *noMesh)
+		runPeer(ctx, *state, *listenIP, *listenPort, announce, *quic, controlAddr, relayAddr, *allowed, *probeEvery, *noMesh, *publicOnly)
 	default:
 		fmt.Fprintf(os.Stderr, "wanrunner: unknown role %q\n", role)
 		os.Exit(2)
 	}
 }
+
+// publicOnlyRoleOK pins which roles accept -public-only (peer/perf); every
+// other role must reject the flag loudly instead of silently ignoring it.
+func publicOnlyRoleOK(role string) bool { return role == "peer" || role == "perf" }
 
 type multiaddrSlice struct{ list *[]ma.Multiaddr }
 
@@ -286,8 +316,12 @@ type perfResult struct {
 	// ended up direct; then path is "direct" and fallback_attempted is true.
 	FallbackUpgraded bool `json:"fallback_upgraded"`
 	// Endpoint is the used connection's remote multiaddr (a public endpoint,
-	// not a secret).
+	// not a secret). Kept as-is for JSON compatibility with existing perf
+	// records; the local side was added as local_multiaddr below.
 	Endpoint string `json:"endpoint,omitempty"`
+	// LocalMultiaddr is the used connection's actual local endpoint (route
+	// evidence alongside endpoint). Additive: omitted when unset.
+	LocalMultiaddr string `json:"local_multiaddr,omitempty"`
 	// N counts ONLY successful operations; failures are excluded from N and
 	// from the latency distribution.
 	N int `json:"n"`
@@ -374,7 +408,10 @@ func validatePerfFlags(targetID, directAddr, relayAddr, policy string, rounds in
 // runPerf validates the flags, then runs the four phases in order. It is the
 // only function that exits: usage and validation errors exit 2, measurement
 // failures exit 1 via log.Fatalf.
-func runPerf(ctx context.Context, state, listenIP string, listenPort int, announce []ma.Multiaddr, targetID, directAddr, relayAddr, policy string, rounds int, bwBytes int64, directTimeout time.Duration) {
+func runPerf(ctx context.Context, state, listenIP string, listenPort int, announce []ma.Multiaddr, targetID, directAddr, relayAddr, policy string, rounds int, bwBytes int64, directTimeout time.Duration, publicOnly bool) {
+	if publicOnly {
+		log.Printf("public-only 已启用：仅公网端点可建连；非公网直连端点（loopback/私网/CGNAT/DNS）会在连接门处被拒绝并计为失败，绝不产生私网拨号")
+	}
 	spec, err := validatePerfFlags(targetID, directAddr, relayAddr, policy, rounds, bwBytes, directTimeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "wanrunner perf: %v\n", err)
@@ -390,6 +427,7 @@ func runPerf(ctx context.Context, state, listenIP string, listenPort int, announ
 		ListenPort:    listenPort,
 		AnnounceAddrs: announce,
 		DirectTimeout: spec.directTimeout,
+		PublicOnly:    publicOnly,
 		Logger:        log.Default(),
 	})
 	if err != nil {
@@ -646,6 +684,7 @@ func refreshPath(res *perfResult, st pt.TransferStats) {
 	res.FallbackAttempted = st.FallbackUsed
 	res.FallbackUpgraded = st.FallbackUsed && st.Effective == pt.PathDirect
 	res.Endpoint = st.RemoteMultiaddr
+	res.LocalMultiaddr = st.LocalMultiaddr
 }
 
 func objectURL(key string) string { return "http://peer/objects/" + key }
@@ -754,7 +793,7 @@ func runRelay(ctx context.Context, state, listenIP string, listenPort int, annou
 	if err != nil {
 		log.Fatalf("relay: %v", err)
 	}
-	announceJSON("relay", r.ID, r.Host.Addrs())
+	announceJSON("relay", r.ID, r.Host.Addrs(), false)
 	log.Printf("relay running addrs=%v", r.Host.Addrs())
 	<-ctx.Done()
 	_ = r.Close()
@@ -776,7 +815,7 @@ func runControl(ctx context.Context, state, listenIP string, listenPort int, ann
 	if err != nil {
 		log.Fatalf("control: %v", err)
 	}
-	announceJSON("control", c.Host.ID(), c.Host.Addrs())
+	announceJSON("control", c.Host.ID(), c.Host.Addrs(), false)
 	addrs := c.Host.Addrs()
 	if len(announce) > 0 {
 		addrs = announce
@@ -795,10 +834,13 @@ func relayPtr(ai *peer.AddrInfo) *peer.AddrInfo {
 
 // ============================ peer role ============================
 
-func runPeer(ctx context.Context, state, listenIP string, listenPort int, announce []ma.Multiaddr, quic bool, control, relay *peer.AddrInfo, allowed []peer.ID, probeEvery time.Duration, noMesh bool) {
+func runPeer(ctx context.Context, state, listenIP string, listenPort int, announce []ma.Multiaddr, quic bool, control, relay *peer.AddrInfo, allowed []peer.ID, probeEvery time.Duration, noMesh bool, publicOnly bool) {
 	if control == nil || control.ID == "" {
 		fmt.Fprintln(os.Stderr, "wanrunner peer: -control is required")
 		os.Exit(2)
+	}
+	if publicOnly {
+		log.Printf("public-only 已启用：仅公网端点可建连；identify/DCUtR 再学习到的私网端点会被连接门拦截，不会产生私网拨号副作用")
 	}
 	allow := pt.NewAllowlist(allowed...)
 	p, err := pt.NewStoragePeer(ctx, pt.PeerConfig{
@@ -810,13 +852,14 @@ func runPeer(ctx context.Context, state, listenIP string, listenPort int, announ
 		ListenIP:      listenIP,
 		ListenPort:    listenPort,
 		AnnounceAddrs: announce,
+		PublicOnly:    publicOnly,
 		Logger:        log.Default(),
 	})
 	if err != nil {
 		log.Fatalf("peer: %v", err)
 	}
 	defer p.Close()
-	announceJSON("peer", p.ID, p.Host.Addrs())
+	announceJSON("peer", p.ID, p.Host.Addrs(), publicOnly)
 	log.Printf("peer running addrs=%v control=%s relay=%s", p.Host.Addrs(), control.ID, relay.ID)
 
 	if err := p.RegisterWithControl(ctx, *control); err != nil {
@@ -859,7 +902,13 @@ type probeResult struct {
 	Sha256    string  `json:"sha256"`
 	Match     *bool   `json:"match,omitempty"`
 	LatencyMS float64 `json:"latency_ms"`
-	Err       string  `json:"err,omitempty"`
+	// 实际端点（route 证明用）：本操作真正使用的连接端点，取自连接本身而
+	// 非策略。remote_multiaddr 对 circuit 连接是 /ip4/<relay>/.../p2p-circuit
+	// 形态（首个 IP 为 relay 跳），local_multiaddr 是本侧真实传输地址。历史
+	// 行没有这两个键；omitempty 保证旧字段顺序与默认输出不破坏。
+	RemoteMultiaddr string `json:"remote_multiaddr,omitempty"`
+	LocalMultiaddr  string `json:"local_multiaddr,omitempty"`
+	Err             string `json:"err,omitempty"`
 }
 
 func runProbeRound(ctx context.Context, p *pt.StoragePeer, control *peer.AddrInfo, targets []peer.ID, noMesh bool) {
@@ -1038,6 +1087,10 @@ func refreshProbePath(r *probeResult, st pt.TransferStats) {
 	r.Path = st.Effective
 	r.Fallback = st.FallbackUsed
 	r.FallbackUpgraded = st.FallbackUsed && st.Effective == pt.PathDirect
+	// The endpoints come from the connection that actually carried the
+	// operation — they are the route evidence, never the requested policy.
+	r.RemoteMultiaddr = st.RemoteMultiaddr
+	r.LocalMultiaddr = st.LocalMultiaddr
 }
 
 func emitProbe(r probeResult) {
