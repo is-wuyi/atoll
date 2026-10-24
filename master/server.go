@@ -30,6 +30,7 @@ type Server struct {
 	backup            *MetaBackup   // 元数据备份状态查询/手动触发（可为 nil：未启用备份）
 	autonomy          *Autonomy
 	writePlanner      *writePlanner
+	transferLinks     transferLinkStore
 	security          *serverSecurity
 	token             auth.Token  // 集群认证；空 = 兼容模式
 	adminToken        auth.Token  // 破坏性操作（/admin/gc）专用；空 = 回退用 token
@@ -131,6 +132,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /meta", s.handleLookup) // ?path=/a/b
 	mux.HandleFunc("POST /writes", s.handleBeginWrite)
 	mux.HandleFunc("POST /writes/chunks", s.handlePlanWriteChunk)
+	mux.HandleFunc("GET /writes/transfer-nodes", s.handleWriteTransferNodes)
+	mux.HandleFunc("GET /writes/status", s.handleWriteStatus)
+	mux.HandleFunc("POST /nodes/transfer-observation", s.handleNodeTransferObservation)
+	mux.HandleFunc("GET /nodes/transfer-peers", s.handleNodeTransferPeers)
 	mux.HandleFunc("POST /writes/commit", s.handleCommitWrite)
 	mux.HandleFunc("POST /writes/abort", s.handleAbortWrite)
 	mux.HandleFunc("GET /protection", s.handleProtection)

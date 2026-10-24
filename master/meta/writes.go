@@ -491,11 +491,21 @@ func (s *Store) ReserveWriteChunk(actor WriteActor, req types.PlanWriteChunkRequ
 							return ErrWritePlanConflict
 						}
 						out, chunk = plan, c
+						if plan.Transfer != nil && !now.Before(plan.Transfer.ExpiresAt) {
+							return ErrWriteExpired
+						}
 						return nil
 					}
 				}
 				return ErrWritePlanConflict
 			}
+		}
+		transferEnabled, err := transferPlanningEnabledTx(w.tx)
+		if err != nil || transferEnabled != (choice.Transfer != nil) {
+			return ErrWritePlanConflict
+		}
+		if choice.Transfer != nil && (!now.Before(choice.Transfer.ExpiresAt) || choice.Transfer.ExpiresAt.After(now.Add(time.Hour))) {
+			return ErrWriteExpired
 		}
 		if profileRevision != profileRevisionTx(w.tx) {
 			return ErrWritePlanConflict
@@ -505,6 +515,9 @@ func (s *Store) ReserveWriteChunk(actor WriteActor, req types.PlanWriteChunkRequ
 			if offset >= rec.Upload.Size || req.LogicalSize != min(types.ChunkSize, rec.Upload.Size-offset) {
 				return ErrChunkBadSize
 			}
+		}
+		if err := validateWriteTransferBudgetTx(w.tx, choice, now); err != nil {
+			return err
 		}
 		caps, err := capacitiesTx(w.tx)
 		if err != nil {

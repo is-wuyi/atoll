@@ -158,7 +158,7 @@ func validateUserTicketTx(tx *bolt.Tx, t accessTicketRecord, now time.Time) (typ
 		}
 		if hasPlannedWriteTx(tx, in.ID) {
 			u, err := plannedWriteTx(tx, in.ID)
-			if err != nil || u.Actor != (WriteActor{UserID: user.ID, SpaceID: t.SpaceID}) || u.Upload.State != types.WritePending || !now.Before(u.Upload.ExpiresAt) {
+			if err != nil || u.Actor != (WriteActor{UserID: user.ID, SpaceID: t.SpaceID}) || u.Upload.State != types.WritePending || !now.Before(u.Upload.ExpiresAt) || !writeTransferAllowsTx(tx, id, 0, t.AudienceNodeID, now) {
 				return types.ObjectIntegrity{}, ErrAccessTicket
 			}
 		} else {
@@ -191,8 +191,11 @@ func validateDeviceTicketTx(tx *bolt.Tx, t accessTicketRecord, now time.Time) (t
 		if !planTargetAllowedTx(tx, t.Request.PlanID, d, sender.NodeID, now) || !types.ContainsUint64(d.Done, t.AudienceNodeID) || types.ContainsUint64(d.Suspect, t.AudienceNodeID) {
 			return types.ObjectIntegrity{}, ErrAccessTicket
 		}
+		if allowed, err := protectionSourceMatchesTx(tx, t.Request.PlanID, sender.NodeID, t.AudienceNodeID, now); err != nil || !allowed {
+			return types.ObjectIntegrity{}, ErrAccessTicket
+		}
 	case t.Request.Method == http.MethodPut && strings.HasPrefix(t.Request.Path, "/replicate/"):
-		if t.Request.PlanID != "" || !types.ContainsUint64(d.Done, sender.NodeID) || types.ContainsUint64(d.Suspect, sender.NodeID) || !types.ContainsUint64(d.Replicas, t.AudienceNodeID) {
+		if t.Request.PlanID != "" || !types.ContainsUint64(d.Done, sender.NodeID) || types.ContainsUint64(d.Suspect, sender.NodeID) || !types.ContainsUint64(d.Replicas, t.AudienceNodeID) || !writeTransferAllowsTx(tx, id, sender.NodeID, t.AudienceNodeID, now) {
 			return types.ObjectIntegrity{}, ErrAccessTicket
 		}
 	default:

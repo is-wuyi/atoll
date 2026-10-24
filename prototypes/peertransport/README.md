@@ -73,17 +73,39 @@ wanrunner relay   -state DIR -listen-port 44001 -announce /ip4/<A-pub>/tcp/44001
 wanrunner control -state DIR -listen-port 44000 -announce /ip4/<B-pub>/tcp/44000                   [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>]
 # each storage host: register + periodic transfer probes (64 KiB + 32 MiB,
 #                    direct-first, relay fallback, checksum-verified)
-wanrunner peer    -state DIR -listen-port 44010 [-announce /ip4/<pub>/tcp/44010]                   -control /ip4/<B-pub>/tcp/44000/p2p/<controlID>                   [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>]                   -allow-peer <otherPeerID>... -probe-every 30s
+wanrunner peer    -state DIR -listen-port 44010 [-announce /ip4/<pub>/tcp/44010]                   -control /ip4/<B-pub>/tcp/44000/p2p/<controlID>                   [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>]                   -allow-peer <otherPeerID>... -probe-every 30s                   [-no-mesh-direct]
+# one-shot measurement against ONE target on ONE explicitly requested policy;
+# prints four JSON lines (connect / request / up / down) and exits
+wanrunner perf    -state DIR -target <peerID> -direct-addr /ip4/<pub>/tcp/44010                    [-relay /ip4/<A-pub>/tcp/44001/p2p/<relayID>] -policy direct|forced-relay|direct-then-relay                   [-rounds 20] [-bw-bytes N] [-direct-timeout 3s]
 ```
 
+`-no-mesh-direct` drops overlay-routable endpoints (RFC1918/loopback plus
+100.64.0.0/10 CGNAT) from the probe's direct dial set, so a LAN mesh or a
+Tailscale overlay cannot satisfy the "direct" half of the probe and hide the
+public relay path under test.
+
 Each role prints one JSON identity line on stdout at startup; every probe
-prints one JSON result line (op/path/fallback/bytes/sha256/match). WAN mode
-enables AutoNAT (reachability learning) in addition to the always-on hole
-punch service; `-announce` overrides the announced address set (the listen
-port and the announced port may differ under NAT port-forwarding). Smoke
-state: two peer processes on one machine exchange 64 KiB + 32 MiB probes
-direct-path with matching checksums. **Real WAN / NAT traversal runs are the
-next verification step and are NOT yet claimed as verified.**
+prints one JSON result line per operation with
+`time,op,remote,policy,path,fallback,fallback_upgraded,bytes,wire_bytes,sha256,
+match,latency_ms,err`. `bytes` counts acknowledged bytes only (0 on failure)
+and a failed operation is emitted with its `err` field rather than dropped.
+WAN mode enables AutoNAT (reachability learning) in addition to the always-on
+hole punch service; `-announce` overrides the announced address set (the listen
+port and the announced port may differ under NAT port-forwarding).
+
+The `perf` role is a one-shot measurement against one target on one explicitly
+requested policy: four phases (`connect`, `request`, `up`, `down`), one JSON
+line each with `phase,policy,path,fallback_attempted,fallback_upgraded,endpoint,
+n,bytes,wire_bytes,min_ms,med_ms,p95_ms,max_ms,mbps,sha256,err`. Payload
+generation and the warm-up request are outside every timer; `n` counts
+successful operations only; an upload counts only after the server manifest
+confirms the same sha256 and size, a download only after the length and sha256
+match. Any phase failure is reported with phase/op/round/path and the process
+exits non-zero, so a failed run cannot be read as a successful one.
+
+**No WAN, NAT traversal, or cross-machine result is claimed by any of this.**
+The loopback regression in the test table below exercises the same dial and
+measurement code paths; the real cross-machine run is the unverified step.
 
 By default the demo creates its own private temp directory under the system
 temp dir (`os.MkdirTemp`, e.g. `/tmp/atoll-peer-demo.a1b2c3`, or
@@ -115,11 +137,23 @@ combined test output. No test writes to a fixed log file.
   Production code is untouched.
 - **Explicit transport policy** — `PolicyDirect`, `PolicyForcedRelay`,
   `PolicyDirectThenRelay`. The dialer pins the peerstore address set per
-  policy, tears down mismatched connections, and verifies the resulting
-  connection: forced-relay must be a Limited connection whose
+  policy (`peerstore.ClearAddrs`, so endpoints learned by identify cannot leak
+  into the next dial), tears down mismatched connections, and verifies the
+  resulting connection: forced-relay must be a Limited connection whose
   `RemoteMultiaddr` contains `/p2p-circuit`; a direct request must NOT be on a
-  circuit. Any fallback is recorded in `TransferStats.FallbackUsed` — there is
-  no silent path switch.
+  circuit. Three facts are reported separately and must never be collapsed:
+  `TransferStats.Path` is the REQUESTED policy, `FallbackUsed` records that a
+  relay attempt was made, and `Effective` (one of the exported
+  `PathDirect`/`PathCircuit`) is the path of the connection actually carrying
+  bytes — derived from the connection itself, never from the policy. A relay
+  attempt whose connection upgrades to a direct one is therefore reported as
+  `Effective="direct"` with `FallbackUsed=true`, never as "circuit".
+  `DialConfig.DirectTimeout` bounds only the direct attempt (default 3 s); the
+  relay keeps the longer connect timeout.
+- **"direct" is a transport fact, not a topology fact.** It proves only
+  non-circuit. A direct connection may still ride an overlay network (LAN
+  mesh, VPN, Tailscale), so nothing here infers physical topology from the
+  path label. There is no static-key or non-overlay guarantee.
 - **Payload/circuit accounting** — every connection is wrapped in a counting
   `net.Conn`; `TransferStats` reports path, effective transport, remote
   multiaddr, `Limited` flag, and payload bytes read/written (for relayed
@@ -176,6 +210,10 @@ combined test output. No test writes to a fixed log file.
 | `TestWrongExpectedPeerRejected` | dial with mismatched expected PeerID fails (identity-locked handshake) |
 | `TestNoSilentUnencryptedFallback` | every connection shows a verified remote identity; secure flag recorded |
 | `TestQUICOptionalDirect` | QUIC-only endpoint works for direct transport |
+| `TestPolicyEnforcementLabelsAttemptAndPath` | each policy establishes what it was told and reports the three facts separately: requested policy, whether a relay attempt was made, and the effective path; direct is preferred when reachable and the fallback attempt is recorded when the direct endpoint is dead |
+| `TestWrapStreamLabelsActualPathNotRequestedPath` | a connection is labelled from itself, not from the request: a direct stream opened by a relay attempt reports `direct` + `FallbackUsed=true`, and a circuit stream opened by a direct request reports `circuit` (never the reverse) |
+| `TestPerfPhasesEnforceRequestedPolicy` (`cmd/wanrunner`) | the perf phases measure the policy that was requested: no `/p2p-circuit` leaks into a direct run, and a live direct endpoint never rides the relay in a forced-relay run |
+| `TestProbeTransferReportsFailureWithoutCounting` (`cmd/wanrunner`) | a 413 upload emits the failure with its error, reports 0 bytes, skips the GET, and leaves the store empty |
 
 ## Dependencies (pinned)
 
@@ -204,12 +242,22 @@ the heavy trees: go-libp2p ≈ 7.6 MB, quic-go ≈ 5.1 MB, multiformats ≈ 1.4 
 - **This is a prototype, not the production network migration.** It shares no
   code with the production `atoll` module (by design, to keep the boundary
   clean); migrating these mechanisms into production transport is future work.
+  A separate local-only harness (`../peertransport-production`, `go test
+  -tags=integration`) imports both this module and production
+  `master`/`node`/`client` through path replaces and runs the real secure
+  path — invited device, user session, planned write, commit, read — over a
+  libp2p stream with ordinary TLS in front. It proves the bridge and the
+  credential boundary, not peer discovery or identity binding: its resolver
+  maps a fixture address to an explicitly expected PeerID, and the node's
+  edge identity is an independent credential from its libp2p identity, with
+  nothing binding them. Production peer discovery and binding are not
+  implemented.
 - The relay holds reservations with a TTL; the prototype does not implement
   background reservation refresh for long-lived sessions (tests and demo are
-  short-lived). Direct/circuit dialing currently uses the shared connect timeout
-  (default 15 s); the `DirectTimeout` field is not yet applied. Concurrent dials
-  with conflicting path policies to the same peer are not validated: path
-  enforcement currently rewrites that peer's address set and closes other paths.
+  short-lived). Concurrent dials with conflicting path policies to the same
+  peer are not validated: path enforcement rewrites that peer's address set
+  and closes the connections that do not match the requested path, so a
+  concurrent dialer toward the same peer can be disrupted.
 - E2E here means transport-level encrypted/authenticated channels between
   verified peers. It does not cover at-rest encryption, nor authorization
   beyond PeerID allowlists.

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"atoll/pkg/auth"
+	"atoll/pkg/transferbudget"
 	"atoll/pkg/types"
 )
 
@@ -35,10 +36,16 @@ type Client struct {
 	sec *secureSession
 	// secTransport 是 secure 模式的出站 transport，与 c.HTTP 的 Transport 是同一实例
 	// （FUSE 读句柄经 ObjectTransport() 共用，连接池/票据逻辑一处）。
-	secTransport *secureTransport
-	writeMu      sync.Mutex
-	writeEnabled bool
-	writeChecked time.Time
+	secTransport        *secureTransport
+	writeMu             sync.Mutex
+	writeEnabled        bool
+	writeChecked        time.Time
+	transferEnabled     bool
+	transferBudget      *types.TransferBudget
+	transferUpload      *transferbudget.Limiter
+	transferMu          sync.Mutex
+	transferObservation *types.WriteTransferObservation
+	transferObservedAt  time.Time
 	// keyCache 是读取侧按对象缓存的内容 DEK（secure 会话下经 /auth/content-key
 	// 获取）。仅 aead 块使用；plain 块不触碰。
 	keyCacheMu sync.Mutex

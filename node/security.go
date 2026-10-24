@@ -45,6 +45,7 @@ import (
 	"atoll/pkg/auth"
 	"atoll/pkg/edgeidentity"
 	"atoll/pkg/metacrypto"
+	"atoll/pkg/peerhttp"
 	"atoll/pkg/types"
 )
 
@@ -595,7 +596,7 @@ func (t *deviceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if tok == "" {
 		return nil, errors.New("node security: no device session")
 	}
-	c := req.Clone(req.Context())
+	c := req.Clone(peerhttp.ControlContext(req.Context()))
 	c.Header.Del("Authorization")
 	c.Header.Set("Authorization", "Bearer "+tok)
 	dispatched = true

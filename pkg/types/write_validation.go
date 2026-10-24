@@ -42,5 +42,25 @@ func ValidateWriteChunkPlan(req PlanWriteChunkRequest, plan WriteChunkPlan) erro
 	if !seen[plan.Layout.Nodes[0]] {
 		return errors.New("primary target must be a required confirmation")
 	}
+	if plan.Transfer != nil {
+		p := plan.Transfer
+		if len(p.UploadTargets) < 1 || len(p.UploadTargets) > 4 || len(p.Legs) != len(targets) || p.ExpiresAt.IsZero() {
+			return errors.New("invalid write transfer geometry")
+		}
+		roots := map[uint64]bool{}
+		for _, id := range p.UploadTargets {
+			if !seen[id] || roots[id] {
+				return errors.New("upload ingress must be a distinct required replica")
+			}
+			roots[id] = true
+		}
+		completed := map[uint64]bool{}
+		for _, leg := range p.Legs {
+			if !targets[leg.ToNodeID] || completed[leg.ToNodeID] || leg.FromNodeID == leg.ToNodeID || leg.BPS == 0 || leg.BPS > 1<<40 || (leg.Path != "http" && leg.Path != "https" && leg.Path != "direct" && leg.Path != "circuit") || roots[leg.ToNodeID] != (leg.FromNodeID == 0) || leg.FromNodeID != 0 && !roots[leg.FromNodeID] {
+				return errors.New("invalid write transfer leg")
+			}
+			completed[leg.ToNodeID] = true
+		}
+	}
 	return nil
 }

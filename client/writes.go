@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"atoll/pkg/peerhttp"
+	"atoll/pkg/transferbudget"
 	"atoll/pkg/types"
 )
 
@@ -50,7 +52,7 @@ func (c *Client) WritePlanning(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, plannedError(err)
 	}
-	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature)
+	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature+","+types.WriteTransferFeature)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return false, plannedError(err)
@@ -84,6 +86,11 @@ func (c *Client) WritePlanning(ctx context.Context) (bool, error) {
 			return false, plannedError(errors.New("master enabled an unsupported write protocol"))
 		}
 		c.writeEnabled = true
+		for _, feature := range caps.Features {
+			if feature == types.WriteTransferFeature {
+				c.transferEnabled = true
+			}
+		}
 	}
 	c.writeChecked = time.Now()
 	return *caps.WritePlanning, nil
@@ -118,7 +125,7 @@ func (c *Client) writeJSON(ctx context.Context, method, path string, body, out a
 	if err != nil {
 		return err
 	}
-	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature)
+	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature+","+types.WriteTransferFeature)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -256,6 +263,13 @@ func (c *Client) uploadPlannedChunkAEAD(ctx context.Context, u types.WriteUpload
 		}
 	}
 	request := types.PlanWriteChunkRequest{WriteBinding: plannedBinding(u), Index: index, LogicalSize: int64(len(data)), StoredSize: int64(len(upload)), Encoding: encoding, Checksum: types.CRC32C(upload)}
+	if c.transferEnabled {
+		network, err := c.observeWriteTransfer(ctx, u)
+		if err != nil {
+			return err
+		}
+		request.Network = network
+	}
 	var out types.PlanWriteChunkResponse
 	if err := c.writeJSONRetry(ctx, "/writes/chunks", request, &out); err != nil {
 		return err
@@ -263,9 +277,22 @@ func (c *Client) uploadPlannedChunkAEAD(ctx context.Context, u types.WriteUpload
 	if err := validatePlannedChunk(request, out); err != nil {
 		return err
 	}
+	if c.transferEnabled && out.Plan.Transfer == nil {
+		return errors.New("master omitted required write transfer plan")
+	}
 	addresses := map[uint64]string{}
 	for _, n := range out.Nodes {
 		addresses[n.ID] = n.Addr
+	}
+	uploadTargets := out.Plan.Confirmations
+	if out.Plan.Transfer != nil {
+		if !time.Now().Before(out.Plan.Transfer.ExpiresAt) {
+			return errors.New("write transfer plan expired")
+		}
+		uploadTargets = out.Plan.Transfer.UploadTargets
+		var deadlineCancel context.CancelFunc
+		ctx, deadlineCancel = context.WithDeadline(ctx, out.Plan.Transfer.ExpiresAt)
+		defer deadlineCancel()
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -273,7 +300,7 @@ func (c *Client) uploadPlannedChunkAEAD(ctx context.Context, u types.WriteUpload
 	var mu sync.Mutex
 	var firstErr error
 	slots := make(chan struct{}, 2)
-	for _, id := range out.Plan.Confirmations {
+	for _, id := range uploadTargets {
 		select {
 		case slots <- struct{}{}:
 		case <-ctx.Done():
@@ -286,7 +313,17 @@ func (c *Client) uploadPlannedChunkAEAD(ctx context.Context, u types.WriteUpload
 		go func(id uint64) {
 			defer wg.Done()
 			defer func() { <-slots }()
-			err := c.putPlannedObject(ctx, addresses[id], out.Plan.Object.ID, request.Checksum, upload)
+			putCtx := ctx
+			var rate uint64
+			if out.Plan.Transfer != nil {
+				for _, leg := range out.Plan.Transfer.Legs {
+					if leg.FromNodeID == 0 && leg.ToNodeID == id {
+						putCtx = peerhttp.WithPath(putCtx, peerhttp.Path(leg.Path))
+						rate = leg.BPS
+					}
+				}
+			}
+			err := c.putPlannedObjectWithRate(putCtx, addresses[id], out.Plan.Object.ID, request.Checksum, upload, rate)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -301,15 +338,55 @@ func (c *Client) uploadPlannedChunkAEAD(ctx context.Context, u types.WriteUpload
 	if firstErr != nil {
 		return firstErr
 	}
+	if out.Plan.Transfer != nil {
+		if err := c.waitPlannedChunk(ctx, u, index); err != nil {
+			return err
+		}
+	}
 	return ctx.Err()
 }
 
 func (c *Client) putPlannedObject(ctx context.Context, addr string, id uint64, checksum uint32, data []byte) error {
+	return c.putPlannedObjectWithRate(ctx, addr, id, checksum, data, 0)
+}
+
+func (c *Client) putPlannedObjectWithRate(ctx context.Context, addr string, id uint64, checksum uint32, data []byte, rate uint64) error {
+	if path, required := peerhttp.RequiredPath(ctx); required && (path == peerhttp.PathDirect || path == peerhttp.PathRelay) {
+		if c.secTransport == nil {
+			return errors.New("P2P write plan requires a configured secure peer transport")
+		}
+		if _, ok := c.secTransport.base.(*peerhttp.Transport); !ok {
+			return errors.New("P2P write plan requires a configured peer resolver")
+		}
+	}
+	var limiter *transferbudget.Limiter
+	c.transferMu.Lock()
+	limiter = c.transferUpload
+	c.transferMu.Unlock()
+	if limiter == nil && rate != 0 {
+		var err error
+		limiter, err = transferbudget.New(rate, 1)
+		if err != nil {
+			return err
+		}
+	}
+	if limiter != nil {
+		release, err := limiter.Acquire(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
 	var last error
 	for attempt := 0; attempt < 3; attempt++ {
 		putCtx, cancel := context.WithTimeout(ctx, c.ioTimeout(int64(len(data))))
-		req, err := http.NewRequestWithContext(putCtx, http.MethodPut, fmt.Sprintf("%s://%s/objects/%d", c.scheme(), addr, id), bytes.NewReader(data))
+		var reader io.Reader = bytes.NewReader(data)
+		if limiter != nil {
+			reader = limiter.Reader(putCtx, reader, rate)
+		}
+		req, err := http.NewRequestWithContext(putCtx, http.MethodPut, fmt.Sprintf("%s://%s/objects/%d", c.scheme(), addr, id), reader)
 		if err == nil {
+			req.ContentLength = int64(len(data))
 			req.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", checksum))
 			var resp *http.Response
 			resp, err = c.HTTP.Do(req)

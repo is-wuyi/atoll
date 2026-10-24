@@ -22,6 +22,7 @@ import (
 	"atoll/internal/scheduler"
 	"atoll/master/meta"
 	"atoll/pkg/auth"
+	"atoll/pkg/transferbudget"
 	"atoll/pkg/types"
 )
 
@@ -40,7 +41,14 @@ type AutonomyConfig struct {
 	MaxPlans           int           `json:"max_plans"`
 	MaxDispatchPerTick int           `json:"max_dispatch_per_tick"`
 	MaxBytesPerRound   int64         `json:"max_bytes_per_round"`
-	MaxReplicas        int           `json:"max_replicas"`
+	// 每源/每目标的并发租约上限（0 = 取 MaxDispatchPerTick）。
+	MaxSourceConcurrent int `json:"max_source_concurrent"`
+	MaxTargetConcurrent int `json:"max_target_concurrent"`
+	// 每流速率分配的天花板（0 = 不设天花板）。上限只用于拒绝分配，绝不下调已声明的
+	// profile 速率，也不会因为某源声明速率高于天花板而永久淘汰它。
+	MaxSourceUploadBPS   uint64 `json:"max_source_upload_bps"`
+	MaxTargetDownloadBPS uint64 `json:"max_target_download_bps"`
+	MaxReplicas          int    `json:"max_replicas"`
 }
 
 type AutonomyDecision struct {
@@ -101,6 +109,12 @@ func NewAutonomy(store *meta.Store, nodeMaxAge time.Duration, cfg AutonomyConfig
 	if cfg.MaxDispatchPerTick == 0 {
 		cfg.MaxDispatchPerTick = 2
 	}
+	if cfg.MaxSourceConcurrent == 0 {
+		cfg.MaxSourceConcurrent = cfg.MaxDispatchPerTick
+	}
+	if cfg.MaxTargetConcurrent == 0 {
+		cfg.MaxTargetConcurrent = cfg.MaxDispatchPerTick
+	}
 	if cfg.MaxBytesPerRound == 0 {
 		cfg.MaxBytesPerRound = 256 << 20
 	}
@@ -109,7 +123,9 @@ func NewAutonomy(store *meta.Store, nodeMaxAge time.Duration, cfg AutonomyConfig
 	}
 	if cfg.Interval <= 0 || cfg.ProbeTimeout <= 0 || cfg.RequestTimeout <= 0 || cfg.RetryInterval <= 0 ||
 		cfg.MaxPlans < 1 || cfg.MaxPlans > 1024 || cfg.MaxDispatchPerTick < 1 || cfg.MaxDispatchPerTick > 16 ||
-		cfg.MaxBytesPerRound <= 0 || cfg.MaxReplicas < 2 || cfg.MaxReplicas > 32 {
+		cfg.MaxBytesPerRound <= 0 || cfg.MaxReplicas < 2 || cfg.MaxReplicas > 32 ||
+		cfg.MaxSourceConcurrent < 1 || cfg.MaxSourceConcurrent > 32 || cfg.MaxTargetConcurrent < 1 || cfg.MaxTargetConcurrent > 32 ||
+		cfg.MaxSourceUploadBPS > transferbudget.MaxRate || cfg.MaxTargetDownloadBPS > transferbudget.MaxRate {
 		return nil, errors.New("invalid autonomy resource bounds")
 	}
 	return &Autonomy{store: store, nodeMaxAge: nodeMaxAge, config: cfg, http: &http.Client{Transport: auth.HTTPTransport("", nil, nil)}, scheme: "http"}, nil
@@ -466,7 +482,10 @@ func (a *Autonomy) executePendingBudget(ctx context.Context, plans []meta.Protec
 			return dispatched, err
 		}
 		plan, target, err := a.store.ClaimProtectionTarget(p.ID, now, a.config.RetryInterval,
-			meta.ProtectionExecutionBudget{MaxConcurrent: a.config.MaxDispatchPerTick, MaxBytes: *remaining})
+			meta.ProtectionExecutionBudget{MaxConcurrent: a.config.MaxDispatchPerTick, MaxBytes: *remaining,
+				MaxSourceConcurrent: a.config.MaxSourceConcurrent, MaxTargetConcurrent: a.config.MaxTargetConcurrent,
+				MaxSourceUploadBPS: a.config.MaxSourceUploadBPS, MaxTargetDownloadBPS: a.config.MaxTargetDownloadBPS,
+				NodeMaxAge: a.nodeMaxAge})
 		if err != nil {
 			return dispatched, err
 		}
@@ -524,23 +543,22 @@ func (a *Autonomy) executeTarget(ctx context.Context, plan meta.ProtectionPlan, 
 	if err != nil {
 		return err
 	}
-	var sources []types.NodeInfo
-	for _, id := range d.Done {
-		if id == target.NodeID || types.ContainsUint64(d.Suspect, id) {
-			continue
-		}
-		n, e := a.store.GetNode(id)
-		if e == nil && time.Since(n.LastHeartbeat) <= a.nodeMaxAge {
-			sources = append(sources, n)
-		}
+	// 源绑定是唯一权威：claim 事务把绑定与租约一起持久化，这里只做存活复核
+	// （地址变更 / 内容丢失 / 心跳过期 / suspect 都算失效），失败一律拒绝派工，
+	// 绝不静默改派到另一个源。RecordProtectionError 只记录 LastError：失败租约的
+	// 在飞速率预留保留到租约窗口自然过期，重绑发生在窗口过期后的下一次有效 claim。
+	if target.SourceID == 0 {
+		return errors.New("protection lease has no persisted source binding")
 	}
-	if len(sources) == 0 {
-		return errors.New("no verified live source for protection plan")
+	n, e := a.store.GetNode(target.SourceID)
+	if e != nil {
+		return e
 	}
-	// A live node can still have lost this object. Persisted attempts rotate
-	// sources so one such node cannot strand every retry of the same plan.
-	source := sources[int(target.Attempts-1)%len(sources)]
-	payload, _ := json.Marshal(map[string]any{"inode_id": d.ObjectID, "source_addr": source.Addr, "checksum": d.Checksum, "plan_id": plan.ID})
+	if n.Addr != target.SourceAddr || !types.ContainsUint64(d.Done, n.ID) ||
+		types.ContainsUint64(d.Suspect, n.ID) || time.Since(n.LastHeartbeat) > a.nodeMaxAge {
+		return errors.New("persisted protection source binding is invalid")
+	}
+	payload, _ := json.Marshal(map[string]any{"inode_id": d.ObjectID, "source_id": n.ID, "source_addr": n.Addr, "checksum": d.Checksum, "plan_id": plan.ID})
 	status, err = a.request(ctx, http.MethodPost, fmt.Sprintf("%s://%s/pull", a.scheme, target.Addr), payload)
 	if err != nil {
 		return err

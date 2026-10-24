@@ -17,6 +17,7 @@ type WriteDecision struct {
 	Reasons               []string          `json:"reasons"`
 	Validation            *ValidationReport `json:"validation,omitempty"`
 	EvaluatedCandidates   int               `json:"evaluated_candidates"`
+	Transfer              *WriteTransfer    `json:"transfer,omitempty"`
 }
 
 type writeCandidate struct {
@@ -37,6 +38,11 @@ func writeInput(snap *Snapshot, obj ObjectRequirement, now time.Time) (*Snapshot
 		return nil, fmt.Errorf("scheduler: unknown protection preference")
 	}
 	copy := *snap
+	if copy.Network != nil {
+		if err := validateTransferNetwork(copy.Network, now); err != nil {
+			return nil, fmt.Errorf("scheduler: %w", err)
+		}
+	}
 	copy.Objects = []ObjectRequirement{obj}
 	if rep := ValidateSnapshot(&copy); !rep.Passed {
 		return nil, fmt.Errorf("scheduler: invalid write snapshot: %s", summarizeViolations(rep))
@@ -47,6 +53,9 @@ func writeInput(snap *Snapshot, obj ObjectRequirement, now time.Time) (*Snapshot
 		return nil, fmt.Errorf("scheduler: write search exceeds supported bounds")
 	}
 	work.Policy.CodecLimits = CodecLimits{MaxK: -1}
+	if work.Network != nil {
+		indexTransferNetwork(work.Network, now)
+	}
 	return work, nil
 }
 
@@ -90,6 +99,9 @@ func PlanWriteAt(snap *Snapshot, obj ObjectRequirement, now time.Time) (WriteDec
 		stability := 1 - float64(c.bytes)/float64(maxBytes)
 		score := ScoreBreakdown{Durability: c.durability, Readability: c.readability, Cost: cost, Performance: performance, Stability: stability,
 			Units: "relative ranking only; protection blends confirmed state (65%) and target state (35%); durability averages readability after one modeled domain loss; performance uses slowest required-node RTT and confirmation fan-out; cost is physical bytes times node cost; stability favors fewer newly stored bytes"}
+		if work.Network != nil {
+			score.Units = "relative ranking only; protection blends confirmed and target state; performance uses budgeted endpoint transfer completion and confirmation fan-out; unknown link goodput uses configured ceilings, not measured throughput"
+		}
 		score.Total = weights.Durability*score.Durability + weights.Readability*score.Readability + weights.Cost*score.Cost + weights.Performance*score.Performance + weights.Stability*score.Stability
 		c.decision.Score = score
 	}
@@ -319,6 +331,17 @@ func ValidateWriteDecisionAt(snap *Snapshot, obj ObjectRequirement, d WriteDecis
 	}
 	confirmationRep := validateWriteLayout(work, obj, writeLayout(obj, d.ConfirmationNodes), now)
 	rep.Violations = append(rep.Violations, confirmationRep.Violations...)
+	if work.Network != nil {
+		var targetIDs []string
+		for _, target := range p.TargetLayout.Replicas {
+			targetIDs = append(targetIDs, target.NodeID)
+		}
+		if err := validateWriteTransfer(work.Network, d.Transfer, targetIDs, d.ConfirmationNodes, obj.SizeBytes, now); err != nil {
+			violate(rep, VBudgetExceeded, err.Error())
+		}
+	} else if d.Transfer != nil {
+		violate(rep, VBudgetExceeded, "transfer plan has no directional network snapshot")
+	}
 	rep.Passed = len(rep.Violations) == 0
 	return rep
 }

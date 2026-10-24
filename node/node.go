@@ -25,6 +25,7 @@ import (
 
 	"atoll/pkg/access"
 	"atoll/pkg/auth"
+	"atoll/pkg/transferbudget"
 	"atoll/pkg/types"
 )
 
@@ -42,6 +43,11 @@ type Node struct {
 	pulling           sync.Map      // map[uint64]struct{}: 正在拉取的 inode，去重用
 	token             auth.Token    // 集群认证；空 = 兼容模式
 	sec               *nodeSecurity // 独立身份+在线票据模式；nil = legacy 行为
+	uploadBudget      *transferbudget.Limiter
+	downloadBudget    *transferbudget.Limiter
+	observationMu     sync.Mutex
+	observedPeers     map[uint64]time.Time
+	observationBusy   atomic.Bool
 
 	capMu              sync.Mutex // 容量闸：保护 inflight 与「used 结算 + 预留归还」的原子性
 	usageOnce          sync.Once
@@ -182,18 +188,41 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	expectedSize := int64(-1)
+	var flowBPS uint64
+	ctx := r.Context()
 	if n.nodeID.Load() > 0 && id >= types.StagingInodeBase<<8 {
 		plan, err := n.replicationPlan(r.Context(), id)
 		if err != nil {
 			httpError(w, http.StatusConflict, err.Error())
 			return
 		}
+		if plan.WriteTransfer != nil {
+			leg, err := n.writeTransferLeg(plan.WriteTransfer, 0, uint64(n.nodeID.Load()))
+			if err != nil {
+				httpError(w, http.StatusConflict, err.Error())
+				return
+			}
+			flowBPS = leg.BPS
+			var cancel context.CancelFunc
+			ctx, cancel, err = receiveDeadline(w, r, plan.WriteTransfer.ExpiresAt)
+			if err != nil {
+				httpError(w, http.StatusServiceUnavailable, "transfer read deadline unavailable")
+				return
+			}
+			defer cancel()
+		}
 		expectedSize = plan.Object.Size
 		if plan.Object.ChecksumKnown {
 			checksum = &plan.Object.Checksum
 		}
 	}
-	size, _, err := n.storeVerifiedObject(id, r.Body, checksum, expectedSize)
+	body, release, err := n.receiveWithBudget(ctx, r.Body, flowBPS)
+	if err != nil {
+		httpError(w, http.StatusServiceUnavailable, "transfer download budget unavailable")
+		return
+	}
+	defer release()
+	size, _, err := n.storeVerifiedObject(id, body, checksum, expectedSize)
 	if err != nil {
 		log.Printf("put object %d: %v", id, err)
 		// 容量硬闸拒绝 ≠ 内部错误：507 让调用方能区分「节点满」与「节点坏」。
@@ -264,11 +293,34 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusConflict, err.Error())
 		return
 	}
+	var flowBPS uint64
+	ctx := r.Context()
+	if plan.WriteTransfer != nil {
+		leg, err := n.incomingWriteLeg(plan.WriteTransfer, uint64(n.nodeID.Load()))
+		if err != nil {
+			httpError(w, http.StatusConflict, err.Error())
+			return
+		}
+		flowBPS = leg.BPS
+		var cancel context.CancelFunc
+		ctx, cancel, err = receiveDeadline(w, r, plan.WriteTransfer.ExpiresAt)
+		if err != nil {
+			httpError(w, http.StatusServiceUnavailable, "transfer read deadline unavailable")
+			return
+		}
+		defer cancel()
+	}
+	body, release, err := n.receiveWithBudget(ctx, r.Body, flowBPS)
+	if err != nil {
+		httpError(w, http.StatusServiceUnavailable, "transfer download budget unavailable")
+		return
+	}
+	defer release()
 	var crc *uint32
 	if plan.Object.ChecksumKnown {
 		crc = &plan.Object.Checksum
 	}
-	size, _, err := n.storeVerifiedObject(id, r.Body, crc, plan.Object.Size)
+	size, _, err := n.storeVerifiedObject(id, body, crc, plan.Object.Size)
 	if err != nil {
 		log.Printf("replicate object %d: %v", id, err)
 		if errors.Is(err, errObjectRetired) {
@@ -278,7 +330,7 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusUnprocessableEntity, "object does not match metadata or could not be stored")
 		return
 	}
-	if err := n.reportStored(r.Context(), plan.Object); err != nil {
+	if err := n.reportStored(ctx, plan.Object); err != nil {
 		httpError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -364,9 +416,22 @@ func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, 
 			sourceID = src.ID
 		}
 	}
-	if sourceID == 0 || (expectCRC != 0 && (!plan.Object.ChecksumKnown || expectCRC != plan.Object.Checksum)) {
+	if sourceID == 0 || (plan.Transfer != nil && plan.Transfer.SourceID != sourceID) || (expectCRC != 0 && (!plan.Object.ChecksumKnown || expectCRC != plan.Object.Checksum)) {
 		log.Printf("pull %d: stale or unassigned source", objectID)
 		return
+	}
+	if plan.Transfer != nil && n.downloadBudget == nil && (plan.Transfer.DownloadBPS != 0 || plan.Transfer.UploadBPS != 0) {
+		log.Printf("pull %d: configured local download budget required", objectID)
+		return
+	}
+	var downloadRelease func()
+	if n.downloadBudget != nil {
+		downloadRelease, err = n.downloadBudget.Acquire(ctx)
+		if err != nil {
+			log.Printf("pull %d: download slot: %v", objectID, err)
+			return
+		}
+		defer downloadRelease()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf("%s://%s/objects/%d", n.scheme(), sourceAddr, objectID), nil)
@@ -393,7 +458,23 @@ func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, 
 	if plan.Object.ChecksumKnown {
 		crc = &plan.Object.Checksum
 	}
-	if _, _, err := n.storeVerifiedObject(objectID, resp.Body, crc, plan.Object.Size); err != nil {
+	var flowBPS uint64
+	if plan.Transfer != nil {
+		t := plan.Transfer
+		if t.TargetID != uint64(n.nodeID.Load()) || t.SourceID != sourceID || !time.Now().Before(t.ExpiresAt) {
+			log.Printf("pull %d: transfer source or lease mismatch", objectID)
+			return
+		}
+		flowBPS = t.DownloadBPS
+		if t.UploadBPS != 0 && (flowBPS == 0 || t.UploadBPS < flowBPS) {
+			flowBPS = t.UploadBPS
+		}
+	}
+	var body io.Reader = resp.Body
+	if n.downloadBudget != nil {
+		body = n.downloadBudget.Reader(ctx, body, flowBPS)
+	}
+	if _, _, err := n.storeVerifiedObject(objectID, body, crc, plan.Object.Size); err != nil {
 		log.Printf("pull %d: %v", objectID, err)
 		if errors.Is(err, errIntegrityMismatch) {
 			_ = n.reportIntegrityFor(ctx, "/files/objects/suspect", plan.Object, sourceID)
@@ -708,6 +789,12 @@ func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	reader, release, budgetErr := n.sendWithBudget(r.Context(), f, 0)
+	if budgetErr != nil {
+		httpError(w, http.StatusServiceUnavailable, "transfer upload budget unavailable")
+		return
+	}
+	defer release()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Accept-Ranges", "bytes")
 
@@ -721,7 +808,7 @@ func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, st.Size()))
 		w.WriteHeader(http.StatusPartialContent)
 		if _, err := f.Seek(start, io.SeekStart); err == nil {
-			if _, err := io.CopyN(w, f, end-start+1); err != nil {
+			if _, err := io.CopyN(w, reader, end-start+1); err != nil {
 				log.Printf("serve object %d range: %v", id, err)
 			}
 		}
@@ -729,7 +816,7 @@ func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	// 整对象读：显式给出 Content-Length，客户端才能预知长度、检测截断。
 	w.Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
-	if _, err := io.Copy(w, f); err != nil {
+	if _, err := io.Copy(w, reader); err != nil {
 		log.Printf("serve object %d: %v", id, err)
 	}
 }
@@ -933,6 +1020,7 @@ func (n *Node) heartbeatOnce() error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("heartbeat: status %d", resp.StatusCode)
 	}
+	n.scheduleTransferObservation()
 	return nil
 }
 

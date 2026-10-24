@@ -2,7 +2,9 @@
 
 Atoll（环礁）面向零配置、自治调度的跨地域边缘主存储。当前系统提供多副本存储、FUSE 本地挂载和故障修复；新增默认关闭的观测／旁路／仅增保护控制循环，已接入持久计划与预算，但尚未部署真集群。本批新增默认关闭的安全模式（受邀账号、个人/团队空间、节点独立身份与在线访问票据，见 [安全说明](SECURITY.md)）：**`-secure` 代码路径下节点已改用 `pkg/edgeidentity` 持久 Ed25519 独立身份入网**（尚未部署真集群）。内置 P2P（libp2p）与内容加密基础仍是独立库、未接入生产链路；现有部署的 EasyTier 地址通道仍在使用，本批不做网络迁移、不拆除 EasyTier。
 
-运行方法与边界见 [计划写入说明](WRITE_PLANNING.md)、[对象退隐与容量释放](RETIREMENT.md) 和 [自治多副本说明](AUTONOMY.md)；前一批协议、升级限制与原型记录见 [完整性基础说明](EDGE_FOUNDATION.md)。`-write-planning` 为默认关闭的新写入口：Master 调度器冻结复制布局与具体确认集合，满足后原子发布；保护档位只影响优化权重，不是固定副本数。
+运行方法与边界见 [计划写入说明](WRITE_PLANNING.md)、[拓扑与带宽感知传输](TRANSFER_PLANNING.md)、[对象退隐与容量释放](RETIREMENT.md) 和 [自治多副本说明](AUTONOMY.md)；前一批协议、升级限制与原型记录见 [完整性基础说明](EDGE_FOUNDATION.md)。`-write-planning` 为默认关闭的新写入口：Master 调度器冻结复制布局与具体确认集合，满足后原子发布；保护档位只影响优化权重，不是固定副本数。
+
+`-write-transfer-planning` 在计划写入上增加方向性连接观测、多个上传入口与节点复制路线；后台补副本可为不同不可变块绑定多个来源，共享上下行预算。`pkg/peerhttp` 保留 HTTPS 与在线票据，经真实 TLS-over-peer-stream 接生产组件；libp2p 的实际装配由独立模块隔离验证，CLI 自动发现/身份绑定与公网打洞验收仍未完成。当前不替换现网 EasyTier。验收记录见 [传输批次验收](TRANSFER_PLANNING_ACCEPTANCE.md)。
 
 ## 架构
 

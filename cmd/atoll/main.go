@@ -159,6 +159,7 @@ func runMaster(args []string, stderr io.Writer) int {
 	autonomyReplicas := fs.Int("autonomy-max-replicas", 8, "自治副本候选上限，不是固定副本数")
 	writePlanning := fs.Bool("write-planning", false, "由调度器规划新写入（启用状态持久化，重启须保留此开关）")
 	writeReplicas := fs.Int("write-max-replicas", 8, "新写入复制布局搜索上限，不是固定副本数")
+	writeTransfer := fs.Bool("write-transfer-planning", false, "规划上传入口和节点复制路径（需 write-planning；启用状态持久化）")
 	contentKeyFile := fs.String("content-key-file", "", "secure 内容主密钥文件（加密对象功能启用时必需；不进入数据库/WAL）")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
 	adminToken := fs.String("admin-token", envDefault("ATOLL_ADMIN_TOKEN", ""), "破坏性操作(/admin/gc)专用 token（空 = 回退用集群 token）")
@@ -173,6 +174,10 @@ func runMaster(args []string, stderr io.Writer) int {
 	backupRetention := fs.Int("meta-backup-retention", 3, "保留最近 N 个元数据快照版本")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if *writeTransfer && !*writePlanning {
+		fmt.Fprintln(stderr, "write transfer planning requires -write-planning")
+		return 1
 	}
 	outTLS, err := clientTLS(*tlsCA, *tlsSkip)
 	if err != nil {
@@ -229,6 +234,11 @@ func runMaster(args []string, stderr io.Writer) int {
 	if initialized, err := store.WritePlanningEnabled(); err != nil || (initialized && !*writePlanning) {
 		store.Close()
 		fmt.Fprintln(stderr, "write planning database requires -write-planning and intact configuration")
+		return 1
+	}
+	if initialized, err := store.TransferPlanningEnabled(); err != nil || (initialized && !*writeTransfer) {
+		store.Close()
+		fmt.Fprintln(stderr, "write transfer database requires -write-transfer-planning and intact configuration")
 		return 1
 	}
 	backup.SetStore(store)
@@ -312,7 +322,7 @@ func runMaster(args []string, stderr io.Writer) int {
 		log.Printf("元数据备份进集群已启用（兼容模式明文）：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
 	}
 	if *writePlanning {
-		if err := srv.EnableWritePlanning(master.WritePlanningConfig{MaxReplicas: *writeReplicas}); err != nil {
+		if err := srv.EnableWritePlanning(master.WritePlanningConfig{MaxReplicas: *writeReplicas, TransferPlanning: *writeTransfer}); err != nil {
 			fmt.Fprintln(stderr, "write planning:", err)
 			return 1
 		}
@@ -376,6 +386,9 @@ func runNode(args []string, stderr io.Writer) int {
 	inviteEnv := fs.String("invite-env", "ATOLL_NODE_INVITE", "节点加入邀请码环境变量")
 	allowInsecureNode := fs.Bool("allow-insecure", false, "仅供隔离测试：允许明文或跳过证书验证")
 	totalBytes := fs.Int64("total-bytes", 100<<30, "声明容量（字节）")
+	uploadBPS := fs.Uint64("upload-bps", 0, "节点对象传输上行预算（bytes/s；0=未配置）")
+	downloadBPS := fs.Uint64("download-bps", 0, "节点对象传输下行预算（bytes/s；0=未配置）")
+	transferConcurrent := fs.Int("transfer-concurrency", 4, "节点每方向对象传输并发上限")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
 	tlsCert := fs.String("tls-cert", "", "TLS 证书文件（配 -tls-key 后 node 走 https）")
 	tlsKey := fs.String("tls-key", "", "TLS 私钥文件")
@@ -402,6 +415,12 @@ func runNode(args []string, stderr io.Writer) int {
 		return 1
 	}
 	n := node.New(*dataDir, *masterURL, adv, *totalBytes)
+	if *uploadBPS != 0 || *downloadBPS != 0 {
+		if err := n.ConfigureTransferBudget(types.TransferBudget{UploadBPS: *uploadBPS, DownloadBPS: *downloadBPS, MaxConcurrent: *transferConcurrent}); err != nil {
+			fmt.Fprintln(stderr, "atoll node transfer budget:", err)
+			return 1
+		}
+	}
 	n.SetToken(auth.Token(*token))
 	n.SetTLS(outTLS)
 	if *secureNode {
@@ -461,6 +480,9 @@ func runMount(args []string, stderr io.Writer) int {
 	allowInsecure := fset.Bool("allow-insecure", false, "仅供隔离测试：允许安全会话明文 HTTP")
 	tlsCA := fset.String("tls-ca", "", "校验服务端证书用的 CA（master 走 https 时）")
 	tlsSkip := fset.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
+	clientUploadBPS := fset.Uint64("upload-bps", 0, "挂载上传预算（bytes/s；传输计划模式需配置）")
+	clientDownloadBPS := fset.Uint64("download-bps", 0, "挂载下载预算（bytes/s；传输计划模式需配置）")
+	clientTransferConcurrency := fset.Int("transfer-concurrency", 2, "挂载上传并发上限")
 	if err := fset.Parse(args); err != nil {
 		return 2
 	}
@@ -483,6 +505,12 @@ func runMount(args []string, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "atoll mount:", err)
 		return 1
+	}
+	if *clientUploadBPS != 0 || *clientDownloadBPS != 0 {
+		if err := c.SetTransferBudget(types.TransferBudget{UploadBPS: *clientUploadBPS, DownloadBPS: *clientDownloadBPS, MaxConcurrent: *clientTransferConcurrency}); err != nil {
+			fmt.Fprintln(stderr, "atoll mount transfer budget:", err)
+			return 1
+		}
 	}
 	m, err := mount.NewWithTLS(c, *cacheDir, *replicas, auth.Token(*token), tlsCfg)
 	if err != nil {
@@ -539,6 +567,9 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	space := fs.Uint64("space", securitySpaceEnv(), "安全用户空间 ID")
 	allowInsecure := fs.Bool("allow-insecure", false, "仅供隔离测试：允许安全会话明文 HTTP")
 	requireEncryption := fs.Bool("require-encryption", false, "加密探测因故障失败时硬停上传，不静默降级明文（仅 put/secure 会话）")
+	clientUploadBPS := fs.Uint64("upload-bps", 0, "客户端上传预算（bytes/s；传输计划模式需配置）")
+	clientDownloadBPS := fs.Uint64("download-bps", 0, "客户端下载预算（bytes/s；传输计划模式需配置）")
+	clientTransferConcurrency := fs.Int("transfer-concurrency", 2, "客户端上传并发上限")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
 	tlsCA := fs.String("tls-ca", "", "校验服务端证书用的 CA（master 走 https 时）")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
@@ -554,6 +585,12 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "atoll client:", err)
 		return 1
+	}
+	if *clientUploadBPS != 0 || *clientDownloadBPS != 0 {
+		if err := c.SetTransferBudget(types.TransferBudget{UploadBPS: *clientUploadBPS, DownloadBPS: *clientDownloadBPS, MaxConcurrent: *clientTransferConcurrency}); err != nil {
+			fmt.Fprintln(stderr, "atoll client transfer budget:", err)
+			return 1
+		}
 	}
 	if *requireEncryption {
 		c.SetRequireEncryption()

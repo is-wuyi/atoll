@@ -29,9 +29,19 @@ type NodeUsage struct {
 	UsedBytes int64  `json:"used_bytes"`
 }
 
+type ReplicaTransfer struct {
+	SourceID    uint64    `json:"source_id"`
+	TargetID    uint64    `json:"target_id"`
+	UploadBPS   uint64    `json:"upload_bps"`
+	DownloadBPS uint64    `json:"download_bps"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
 type ReplicationPlan struct {
-	Protocol string          `json:"protocol"`
-	Object   ObjectIntegrity `json:"object"`
-	Targets  []NodeInfo      `json:"targets"`
-	Sources  []NodeInfo      `json:"sources,omitempty"`
+	Protocol      string             `json:"protocol"`
+	Object        ObjectIntegrity    `json:"object"`
+	Targets       []NodeInfo         `json:"targets"`
+	Sources       []NodeInfo         `json:"sources,omitempty"`
+	WriteTransfer *WriteTransferPlan `json:"write_transfer,omitempty"`
+	Transfer      *ReplicaTransfer   `json:"transfer,omitempty"`
 }

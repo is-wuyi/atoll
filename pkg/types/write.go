@@ -3,11 +3,12 @@ package types
 import "time"
 
 const (
-	WritePlanFeature = "write-plan-v1"
-	PlainEncoding    = "plain-v1"
-	WritePending     = "pending"
-	WriteCommitted   = "committed"
-	WriteAborted     = "aborted"
+	WritePlanFeature     = "write-plan-v1"
+	WriteTransferFeature = "write-transfer-v1"
+	PlainEncoding        = "plain-v1"
+	WritePending         = "pending"
+	WriteCommitted       = "committed"
+	WriteAborted         = "aborted"
 )
 
 type ProtectionTier string
@@ -59,13 +60,27 @@ type ReplicaLayout struct {
 	Nodes    []uint64 `json:"nodes"`
 }
 
+type WriteTransferLeg struct {
+	FromNodeID uint64 `json:"from_node_id"`
+	ToNodeID   uint64 `json:"to_node_id"`
+	Path       string `json:"path"`
+	BPS        uint64 `json:"bps"`
+}
+
+type WriteTransferPlan struct {
+	UploadTargets []uint64           `json:"upload_targets"`
+	Legs          []WriteTransferLeg `json:"legs"`
+	ExpiresAt     time.Time          `json:"expires_at"`
+}
+
 type WriteChunkPlan struct {
-	Index                 int           `json:"index"`
-	Object                ContentObject `json:"object"`
-	Layout                ReplicaLayout `json:"layout"`
-	Confirmations         []uint64      `json:"confirmations"`
-	RequiredConfirmations int           `json:"required_confirmations"`
-	Reasons               []string      `json:"reasons,omitempty"`
+	Index                 int                `json:"index"`
+	Object                ContentObject      `json:"object"`
+	Layout                ReplicaLayout      `json:"layout"`
+	Confirmations         []uint64           `json:"confirmations"`
+	RequiredConfirmations int                `json:"required_confirmations"`
+	Reasons               []string           `json:"reasons,omitempty"`
+	Transfer              *WriteTransferPlan `json:"transfer,omitempty"`
 }
 
 type WriteUpload struct {
@@ -101,11 +116,12 @@ type WriteBinding struct {
 
 type PlanWriteChunkRequest struct {
 	WriteBinding
-	Index       int    `json:"index"`
-	LogicalSize int64  `json:"logical_size"`
-	StoredSize  int64  `json:"stored_size"`
-	Encoding    string `json:"encoding"`
-	Checksum    uint32 `json:"checksum"`
+	Index       int                       `json:"index"`
+	LogicalSize int64                     `json:"logical_size"`
+	StoredSize  int64                     `json:"stored_size"`
+	Encoding    string                    `json:"encoding"`
+	Checksum    uint32                    `json:"checksum"`
+	Network     *WriteTransferObservation `json:"network,omitempty"`
 }
 
 type PlanWriteChunkResponse struct {

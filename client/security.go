@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"atoll/pkg/access"
+	"atoll/pkg/peerhttp"
 )
 
 // errNotSecure：非 NewSecure 创建的客户端没有会话语义（旧构造函数保持兼容模式）。
@@ -284,7 +285,7 @@ func (t *secureTransport) fetchTicket(req *http.Request, token string, spaceID u
 	if err != nil {
 		return access.Ticket{}, err
 	}
-	ctx, cancel := context.WithTimeout(req.Context(), maxTicketWait)
+	ctx, cancel := context.WithTimeout(peerhttp.ControlContext(req.Context()), maxTicketWait)
 	defer cancel()
 	treq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		t.master.Scheme+"://"+t.master.Host+"/security/tickets", bytes.NewReader(b))

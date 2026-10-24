@@ -123,7 +123,7 @@ type DialConfig struct {
 	Policy      DialPolicy
 	// DirectTimeout bounds each direct dial attempt for DirectThenRelay
 	// (default 3s).
-	DirectTimeout time.Duration
+	DirectTimeout  time.Duration
 	ConnectTimeout time.Duration
 	logf           func(format string, args ...any)
 
@@ -136,6 +136,12 @@ type DialConfig struct {
 // LastStats aggregates counters over every connection opened by this config
 // (HTTP keep-alive may open more than one) plus the path metadata of the most
 // recent connection.
+//
+// When no connection was opened Effective is the empty string. That is a real
+// signal and not a measurement: it means this config never dialed, so callers
+// must treat an empty Effective as "nothing was transferred" rather than as a
+// path. (A measurement tool that read stats from an idle config would otherwise
+// report an empty path and a zero-byte transfer as if it had measured one.)
 func (d *DialConfig) LastStats() TransferStats {
 	d.lastMu.Lock()
 	defer d.lastMu.Unlock()
@@ -207,14 +213,30 @@ func (d *DialConfig) DialContext(ctx context.Context, network_, addr string) (ne
 		return nil, fmt.Errorf("peertransport: unsupported network %q", network_)
 	}
 	conn, _, err := d.dial(ctx)
-	return conn, err
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 // Dial establishes one libp2p-backed connection per policy and returns the
-// wrapped conn plus stats.
+// wrapped conn plus the stats of the connection actually opened.
+//
+// On failure the conn is a true nil, not a typed nil: callers may safely test
+// `if conn != nil` before using it.
 func (d *DialConfig) Dial(ctx context.Context) (net.Conn, TransferStats, error) {
 	conn, stats, err := d.dial(ctx)
+	if err != nil {
+		return nil, stats, err
+	}
 	return conn, stats, err
+}
+
+// printf is a nil-safe logger for dials built without a logger attached.
+func (d *DialConfig) printf(format string, args ...any) {
+	if d.logf != nil {
+		d.logf(format, args...)
+	}
 }
 
 func (d *DialConfig) dial(ctx context.Context) (*countingConn, TransferStats, error) {
@@ -230,7 +252,7 @@ func (d *DialConfig) dial(ctx context.Context) (*countingConn, TransferStats, er
 	case PolicyDirectThenRelay:
 		conn, err = d.dialDirect(ctx, d.DirectAddrs)
 		if err != nil {
-			d.logf("direct dial to %s failed (%v); falling back to relay", d.Expected, err)
+			d.printf("direct dial to %s failed (%v); falling back to relay", d.Expected, err)
 			conn, err = d.dialRelay(ctx, true)
 		}
 	default:
@@ -261,7 +283,10 @@ func (d *DialConfig) dialDirect(ctx context.Context, addrs []ma.Multiaddr) (*cou
 	d.resetPeerAddrs(addrs)
 	d.closeConnsExcept(pathDirect)
 	ai := peer.AddrInfo{ID: d.Expected, Addrs: addrs}
-	dctx, cancel := context.WithTimeout(ctx, d.connectTimeout())
+	// The direct attempt gets its own (short) budget; the relay attempt keeps
+	// the longer connectTimeout(). A dead direct endpoint in direct-then-relay
+	// must fail fast and fall back, not burn the whole connection budget.
+	dctx, cancel := context.WithTimeout(ctx, d.directTimeout())
 	defer cancel()
 	if err := d.Host.Connect(dctx, ai); err != nil {
 		return nil, fmt.Errorf("peertransport: direct connect to %s: %w", d.Expected, err)
@@ -270,7 +295,7 @@ func (d *DialConfig) dialDirect(ctx context.Context, addrs []ma.Multiaddr) (*cou
 	if err != nil {
 		return nil, err
 	}
-	return wrapStream(stream, pathDirect, false), nil
+	return wrapStream(stream, d.Policy, false), nil
 }
 
 // dialRelay connects via the CircuitRelay v2 circuit address. When fallback is
@@ -299,7 +324,7 @@ func (d *DialConfig) dialRelay(ctx context.Context, fallback bool) (*countingCon
 	if err != nil {
 		return nil, err
 	}
-	return wrapStream(stream, pathCircuit, fallback), nil
+	return wrapStream(stream, d.Policy, fallback), nil
 }
 
 // closeConnsExcept tears down connections to the expected peer that do NOT
@@ -316,18 +341,16 @@ func (d *DialConfig) closeConnsExcept(path string) {
 }
 
 // resetPeerAddrs replaces ALL known addresses of Expected with exactly the
-// given set (stored with PermanentAddrTTL). It purges the standard TTL
-// buckets so neither direct nor circuit endpoints learned earlier can leak
-// into the next policy-scoped dial.
+// given set (stored with PermanentAddrTTL). ClearAddrs is used rather than
+// sweeping specific TTL buckets: the identify service re-announces the peer's
+// real endpoints under other TTLs (ObservedAddrTTL and friends) while a
+// connection is live, and a bucket sweep misses those. Without the full clear
+// a previous relay traversal would leak the peer's real direct endpoint into
+// the next direct dial, so an explicitly dead direct endpoint would still
+// "succeed" and the policy scope would no longer be strict.
 func (d *DialConfig) resetPeerAddrs(addrs []ma.Multiaddr) {
 	ps := d.Host.Peerstore()
-	for _, ttl := range []time.Duration{
-		peerstore.PermanentAddrTTL,
-		peerstore.ConnectedAddrTTL,
-		peerstore.TempAddrTTL,
-	} {
-		ps.UpdateAddrs(d.Expected, ttl, 0)
-	}
+	ps.ClearAddrs(d.Expected)
 	if len(addrs) > 0 {
 		ps.AddAddrs(d.Expected, addrs, peerstore.PermanentAddrTTL)
 	}
@@ -371,17 +394,18 @@ func (d *DialConfig) openVerifiedStream(ctx context.Context, path string, fallba
 	}
 	isCircuit := hasCircuitComponent(conn.RemoteMultiaddr())
 	if path == pathCircuit && (!isCircuit || !conn.Stat().Limited) {
-		// CircuitRelay v2 connection upgrade: after relay traversal the swarm
-		// may migrate the connection to a direct one (observed on a real WAN
-		// run: the relay hop upgraded the circuit to a QUIC direct
-		// connection). For DirectThenRelay fallback this upgrade is a success
-		// — the bytes DID traverse the relay first; only forced-relay keeps
-		// the strict limited-circuit requirement.
+		// A fallback attempt may select an already-upgraded direct connection.
+		// Forced relay must still verify a limited circuit; attempt and payload path differ.
 		if !fallback {
 			stream.Reset()
 			return nil, fmt.Errorf("peertransport: expected limited circuit connection, got %s (limited=%v)",
 				conn.RemoteMultiaddr(), conn.Stat().Limited)
 		}
+		// The connection carrying the bytes is direct now, so wrapStream labels
+		// it Effective="direct" while FallbackUsed stays true. The attempt and
+		// the path are distinct facts and are both reported.
+		d.printf("relay fallback to %s upgraded to a direct connection %s (limited=%v)",
+			d.Expected, conn.RemoteMultiaddr(), conn.Stat().Limited)
 	}
 	if path == pathDirect && isCircuit {
 		stream.Reset()
@@ -390,20 +414,51 @@ func (d *DialConfig) openVerifiedStream(ctx context.Context, path string, fallba
 	return stream, nil
 }
 
-func wrapStream(s network.Stream, effective string, fallbackUsed bool) *countingConn {
-	isCircuit := hasCircuitComponent(s.Conn().RemoteMultiaddr())
-	cc := &countingConn{Stream: s, peerID: s.Conn().RemotePeer(), circuit: isCircuit}
+// wrapStream wraps a libp2p stream as a counting net.Conn and records what
+// ACTUALLY happened, not what was requested. Three things must never be
+// collapsed into one label:
+//
+//   - Path is the REQUESTED policy (direct | forced-relay | direct-then-relay)
+//   - FallbackUsed means a relay (circuit) ATTEMPT was made: the direct dial
+//     failed first and the dialer went through the relay hop
+//   - Effective is the path of the connection really carrying bytes, derived
+//     from the connection itself, never from the policy
+//
+// FallbackUsed and Effective can disagree on purpose: after relay traversal
+// the swarm may upgrade the connection to a direct one (observed on a real WAN
+// run: the circuit hop became a QUIC direct connection). Such a connection is
+// reported as Effective="direct" with FallbackUsed=true — never as "circuit".
+//
+// "direct" only means non-circuit. It is NOT proof of a non-overlay path: a
+// direct connection may itself ride an overlay network (LAN mesh, VPN,
+// Tailscale), which is why the dialer never infers physical topology from the
+// path label.
+func wrapStream(s network.Stream, policy DialPolicy, fallbackUsed bool) *countingConn {
+	conn := s.Conn()
+	isCircuit := hasCircuitComponent(conn.RemoteMultiaddr())
+	effective := PathDirect
+	if isCircuit {
+		effective = PathCircuit
+	}
+	cc := &countingConn{Stream: s, peerID: conn.RemotePeer(), circuit: isCircuit}
 	cc.stats = &TransferStats{
-		Path:            effective,
+		Path:            string(policy),
 		Effective:       effective,
-		RemotePeer:      s.Conn().RemotePeer().String(),
-		RemoteMultiaddr: s.Conn().RemoteMultiaddr().String(),
-		Limited:         s.Conn().Stat().Limited,
+		RemotePeer:      conn.RemotePeer().String(),
+		RemoteMultiaddr: conn.RemoteMultiaddr().String(),
+		Limited:         conn.Stat().Limited,
 		Secure:          true,
 		FallbackUsed:    fallbackUsed,
 	}
 	return cc
 }
+
+// PathDirect and PathCircuit are the TransferStats.Effective values (exported
+// so measurement tooling can compare paths without magic strings).
+const (
+	PathDirect  = pathDirect
+	PathCircuit = pathCircuit
+)
 
 // CircuitAddrInfo builds the CircuitRelay v2 dial address
 // <relayAddr>/p2p/<relayID>/p2p-circuit/p2p/<targetID>.

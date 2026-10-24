@@ -105,6 +105,14 @@ func buildWriteCandidate(e *engine, obj ObjectRequirement, targets, confirms []s
 	for _, id := range confirms {
 		candidate.latency = math.Max(candidate.latency, math.Max(1, e.nodes[id].RTTMs))
 	}
+	if e.snap.Network != nil {
+		transfer, err := planWriteTransfer(e.snap.Network, ordered, confirms, obj.SizeBytes, now)
+		if err != nil {
+			return writeCandidate{}, false
+		}
+		candidate.decision.Transfer = transfer
+		candidate.latency = math.Max(1, transfer.EstimatedSeconds*1000)
+	}
 	return candidate, finiteNonNeg(candidate.cost)
 }
 

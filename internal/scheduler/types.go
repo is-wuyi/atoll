@@ -42,6 +42,7 @@ type Snapshot struct {
 	Nodes         []Node              `json:"nodes"`
 	Objects       []ObjectRequirement `json:"objects"`
 	Policy        Policy              `json:"policy"`
+	Network       *TransferNetwork    `json:"network,omitempty"`
 }
 
 // Node is one storage node with its hard resource budget and the best

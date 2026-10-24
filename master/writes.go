@@ -21,8 +21,10 @@ import (
 )
 
 type WritePlanningConfig struct {
-	MaxReplicas  int
-	ProbeTimeout time.Duration
+	MaxReplicas            int
+	ProbeTimeout           time.Duration
+	TransferPlanning       bool
+	TransferObservationTTL time.Duration
 }
 
 type writePlanner struct {
@@ -40,11 +42,22 @@ func (s *Server) EnableWritePlanning(cfg WritePlanningConfig) error {
 	if cfg.ProbeTimeout == 0 {
 		cfg.ProbeTimeout = 3 * time.Second
 	}
+	if cfg.TransferObservationTTL == 0 {
+		cfg.TransferObservationTTL = 30 * time.Second
+	}
+	if cfg.TransferObservationTTL < time.Second || cfg.TransferObservationTTL > 5*time.Minute {
+		return errors.New("invalid transfer observation TTL")
+	}
 	if cfg.MaxReplicas < 1 || cfg.MaxReplicas > 32 || cfg.ProbeTimeout <= 0 || s.nodeMaxAge <= 0 {
 		return errors.New("invalid write planning resource limits")
 	}
 	if err := s.store.EnableWritePlanning(); err != nil {
 		return err
+	}
+	if cfg.TransferPlanning {
+		if err := s.store.EnableTransferPlanning(); err != nil {
+			return err
+		}
 	}
 	s.writePlanner = &writePlanner{config: cfg}
 	return nil
@@ -74,7 +87,7 @@ func isLegacyWrite(r *http.Request) bool {
 
 func isWritePlanningRoute(p string) bool {
 	switch p {
-	case "/writes", "/writes/chunks", "/writes/commit", "/writes/abort", "/protection":
+	case "/writes", "/writes/chunks", "/writes/status", "/writes/transfer-nodes", "/writes/commit", "/writes/abort", "/protection":
 		return true
 	}
 	return false
@@ -87,7 +100,9 @@ func (s *Server) writePlanningGuard(next http.Handler) http.Handler {
 			return
 		}
 		enabled, err := s.store.WritePlanningEnabled()
-		if err != nil || enabled != (s.writePlanner != nil) {
+		transferEnabled, transferErr := s.store.TransferPlanningEnabled()
+		configuredTransfer := s.writePlanner != nil && s.writePlanner.config.TransferPlanning
+		if err != nil || transferErr != nil || enabled != (s.writePlanner != nil) || transferEnabled != configuredTransfer {
 			writePlanningError(w, http.StatusServiceUnavailable, types.WritePlanRequired, "write planning state is unavailable or does not match server configuration")
 			return
 		}
@@ -96,7 +111,11 @@ func (s *Server) writePlanningGuard(next http.Handler) http.Handler {
 				httpError(w, http.StatusUpgradeRequired, "TLS required for security mode")
 				return
 			}
-			writeJSON(w, http.StatusOK, types.Capabilities{Features: []string{types.ObjectIDFeature, types.WritePlanFeature}, WritePlanning: enabled})
+			features := []string{types.ObjectIDFeature, types.WritePlanFeature}
+			if transferEnabled {
+				features = append(features, types.WriteTransferFeature)
+			}
+			writeJSON(w, http.StatusOK, types.Capabilities{Features: features, WritePlanning: enabled})
 			return
 		}
 		if enabled && isLegacyWrite(r) {
@@ -110,6 +129,10 @@ func (s *Server) writePlanningGuard(next http.Handler) http.Handler {
 			}
 			if !supportsWritePlans(r) {
 				writePlanningError(w, http.StatusUpgradeRequired, types.WritePlanRequired, "write-plan-v1 client feature required")
+				return
+			}
+			if transferEnabled && !supportsWriteTransfers(r) {
+				writePlanningError(w, http.StatusUpgradeRequired, types.WritePlanRequired, "write-transfer-v1 client feature required")
 				return
 			}
 		}
@@ -316,6 +339,9 @@ func (s *Server) handlePlanWriteChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	world, err := s.newWriteSnapshot(r.Context(), snapshot, now)
+	if err == nil && s.writePlanner.config.TransferPlanning {
+		world.Network, err = s.writeTransferNetwork(req.Network, snapshot, now)
+	}
 	if err != nil {
 		writePlanningMetaError(w, err)
 		return
@@ -374,6 +400,31 @@ func writeChunkChoice(req types.PlanWriteChunkRequest, objectID uint64, decision
 	}
 	if len(out.Confirmations) == 0 || out.RequiredConfirmations != len(out.Confirmations) || len(out.Layout.Nodes) == 0 || !types.ContainsUint64(out.Confirmations, out.Layout.Nodes[0]) {
 		return out, errors.New("invalid confirmation set")
+	}
+	if decision.Transfer != nil {
+		t := &types.WriteTransferPlan{ExpiresAt: decision.Transfer.ExpiresAt}
+		for _, target := range decision.Transfer.UploadTargets {
+			id, err := strconv.ParseUint(target, 10, 64)
+			if err != nil || id == 0 {
+				return out, errors.New("invalid upload ingress")
+			}
+			t.UploadTargets = append(t.UploadTargets, id)
+		}
+		for _, leg := range decision.Transfer.Legs {
+			to, err := strconv.ParseUint(leg.To, 10, 64)
+			if err != nil || to == 0 {
+				return out, errors.New("invalid replica transfer target")
+			}
+			var from uint64
+			if leg.From != "client" {
+				from, err = strconv.ParseUint(leg.From, 10, 64)
+				if err != nil || from == 0 {
+					return out, errors.New("invalid replica transfer source")
+				}
+			}
+			t.Legs = append(t.Legs, types.WriteTransferLeg{FromNodeID: from, ToNodeID: to, Path: leg.Path, BPS: leg.BPS})
+		}
+		out.Transfer = t
 	}
 	return out, nil
 }
@@ -512,6 +563,10 @@ func (s *Server) newWriteSnapshot(ctx context.Context, snapshot meta.AutonomySna
 			if _, err := s.store.DeviceByNode(node.ID); err != nil {
 				continue
 			}
+		}
+		if s.writePlanner.config.TransferPlanning {
+			world.Nodes[i].Online = true
+			continue
 		}
 		wg.Add(1)
 		go func(i int, node types.NodeInfo) {

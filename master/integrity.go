@@ -48,6 +48,19 @@ func (s *Server) handleReplicationPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := types.ReplicationPlan{Protocol: types.IntegrityProtocol, Object: d}
+	if r.URL.Query().Get("plan_id") == "" {
+		out.WriteTransfer, err = s.store.WriteTransferForObject(id)
+		if err != nil {
+			httpErrorFromMeta(w, err)
+			return
+		}
+	} else {
+		out.Transfer, err = s.store.ProtectionTransfer(r.URL.Query().Get("plan_id"), id, nodeID)
+		if err != nil {
+			httpErrorFromMeta(w, err)
+			return
+		}
+	}
 	for _, targetID := range d.Replicas {
 		target, err := s.store.GetNode(targetID)
 		if err != nil || time.Since(target.LastHeartbeat) > s.nodeMaxAge {
@@ -57,7 +70,17 @@ func (s *Server) handleReplicationPlan(w http.ResponseWriter, r *http.Request) {
 			out.Sources = append(out.Sources, target)
 		}
 		if targetID != nodeID && !types.ContainsUint64(d.Done, targetID) {
-			out.Targets = append(out.Targets, target)
+			allowed := out.WriteTransfer == nil
+			if out.WriteTransfer != nil && time.Now().Before(out.WriteTransfer.ExpiresAt) {
+				for _, leg := range out.WriteTransfer.Legs {
+					if leg.FromNodeID == nodeID && leg.ToNodeID == targetID {
+						allowed = true
+					}
+				}
+			}
+			if allowed {
+				out.Targets = append(out.Targets, target)
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, out)

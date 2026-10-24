@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"atoll/pkg/access"
+	"atoll/pkg/peerhttp"
 	"atoll/pkg/types"
 )
 
@@ -105,6 +106,12 @@ func (n *Node) replicationPlan(ctx context.Context, objectID uint64, planID ...s
 		!types.ContainsUint64(d.Replicas, uint64(n.nodeID.Load())) ||
 		(d.Chunked && (d.Size <= 0 || d.Size > aeadChunkObjectLimit() || d.ChunkIndex < 0)) {
 		return plan, fmt.Errorf("invalid or unsupported replication metadata")
+	}
+	if plan.Transfer != nil {
+		t := plan.Transfer
+		if wantPlan == "" || t.SourceID == 0 || t.TargetID != uint64(n.nodeID.Load()) || t.ExpiresAt != d.PlanLeaseUntil || !types.ContainsUint64(d.Done, t.SourceID) || types.ContainsUint64(d.Suspect, t.SourceID) || t.UploadBPS > 1<<40 || t.DownloadBPS > 1<<40 {
+			return plan, fmt.Errorf("invalid source-bound replica transfer")
+		}
 	}
 	for _, nd := range append(append([]types.NodeInfo(nil), plan.Targets...), plan.Sources...) {
 		if nd.ID == 0 || nd.Addr == "" || !types.ContainsUint64(d.Replicas, nd.ID) {
@@ -225,8 +232,39 @@ func (n *Node) pushWithPlan(ctx context.Context, peerAddr string, plan types.Rep
 		return err
 	}
 	defer f.Close()
+	var flowBPS uint64
+	if plan.WriteTransfer != nil {
+		var targetID uint64
+		for _, target := range plan.Targets {
+			if target.Addr == peerAddr {
+				targetID = target.ID
+			}
+		}
+		leg, err := n.writeTransferLeg(plan.WriteTransfer, uint64(n.nodeID.Load()), targetID)
+		if err != nil {
+			return err
+		}
+		flowBPS = leg.BPS
+		ctx = peerhttp.WithPath(ctx, peerhttp.Path(leg.Path))
+		if leg.Path == string(peerhttp.PathDirect) || leg.Path == string(peerhttp.PathRelay) {
+			if n.sec == nil {
+				return errors.New("P2P replica plan requires secure peer transport")
+			}
+			if _, ok := n.sec.base.(*peerhttp.Transport); !ok {
+				return errors.New("P2P replica plan requires a configured peer resolver")
+			}
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, plan.WriteTransfer.ExpiresAt)
+		defer cancel()
+	}
+	reader, release, err := n.sendWithBudget(ctx, f, flowBPS)
+	if err != nil {
+		return err
+	}
+	defer release()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
-		fmt.Sprintf("%s://%s/replicate/%d", n.scheme(), peerAddr, plan.Object.ObjectID), io.NopCloser(f))
+		fmt.Sprintf("%s://%s/replicate/%d", n.scheme(), peerAddr, plan.Object.ObjectID), io.NopCloser(reader))
 	if err != nil {
 		return err
 	}
