@@ -78,6 +78,16 @@ go build -o atoll ./cmd/atoll
 
 同一个计划有多个目标时，一个目标发布会推进完整性代际，其他较早取得描述的回执可能被拒。后续重试重新取得描述，并优先验证已经落盘的数据，而不是放松版本条件。
 
+### 进度反馈与有界租约续期
+
+- 每次 claim 生成独立 `AttemptToken` 并随租约持久化；目标节点的进度反馈、访问票据与最终回执都绑定 (计划, 尝试序号, token)。新 claim 递增 `Attempts` 并重生成 token，被取代尝试的所有反馈与票据立即失效，不依赖时间戳比较。
+- 目标节点通过 `POST /files/protection/progress`（设备会话授权，`node_id` 必须等于上报设备）上报实际读入字节、测量 goodput 与失败类别（`failed`/`corrupt`）。进度报告**不写 Done、不发布副本、不释放容量预留**。
+- 慢而持续前进的传输可获**有界续租**：仅当测量 goodput 显示剩余租约不足以完成剩余字节时延长，受单尝试续租次数（默认 8）与总租约时长（默认 30 分钟）双重上限；节点侧另有 5 分钟硬上界不因此放宽授权，但 feedback 计划（descriptor 带 `PlanAttempt>0`）的 /pull 不再被首 descriptor 的租约截止切断。goodput 未知时不续租（不把配置预算当测量值）。legacy 计划（token 空）维持原"租约截止即网络截止"语义与 `PlanLeaseUntil` 严格相等 fence。
+- `failed`/`corrupt` 反馈把当前尝试的租约收敛到当下（数据流已结束），下一次合法 claim 可立即重新选源；corrupt 仍走既有 suspect 上报路径。执行器**绝不静默换绑**——换源只发生在新有效 claim 的源选择事务里。
+- descriptor 与传输绑定现在在同一个只读事务内返回（`ProtectionPlanSnapshot`），续租不会再落在两次读之间造成节点误拒。
+- `/pull` 去重身份是 (对象, 计划, 尝试)：相同身份幂等 202，不同计划/尝试返回 409，master 不会把未启动的新传输误当已派工。
+- `AutonomyReport` 新增 attempted/succeeded/failed/corrupt/bytes_done 聚合（反馈统计，非派工数）。
+
 ### 取消与不确定字节
 
 - 未开始的目标可随取消/失效释放预留。

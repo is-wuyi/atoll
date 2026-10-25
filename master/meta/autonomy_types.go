@@ -51,17 +51,34 @@ type NodePlacementProfile struct {
 // target download budgets captured at bind time. SourceID == 0 means the
 // target was claimed before source binding existed and is executed by the
 // legacy rotation path.
+//
+// Feedback fields (AttemptToken and below, before Done) exist only on plans
+// whose claim ran with protection-feedback enabled; zero values mean the
+// legacy fence still applies. AttemptToken is regenerated on every claim so a
+// superseded attempt's progress, receipts and tickets all become invalid at
+// once, without relying on timestamp inequality. ProgressBytes/LastProgressAt
+// are monotonic node-reported bytes; GoodputBPS is measured payload bytes per
+// second (never the configured budget); Renewals counts bounded in-flight
+// lease extensions of the current attempt; FailureKind is ""|"failed"|
+// "corrupt". Progress never marks Done and never releases reservations.
 type ProtectionTarget struct {
-	NodeID      uint64    `json:"node_id"`
-	Addr        string    `json:"addr"`
-	SourceID    uint64    `json:"source_id,omitempty"`
-	SourceAddr  string    `json:"source_addr,omitempty"`
-	UploadBPS   uint64    `json:"upload_bps,omitempty"`
-	DownloadBPS uint64    `json:"download_bps,omitempty"`
-	Done        bool      `json:"done"`
-	Attempts    uint32    `json:"attempts"`
-	NextAttempt time.Time `json:"next_attempt,omitempty"`
-	LastError   string    `json:"last_error,omitempty"`
+	NodeID         uint64    `json:"node_id"`
+	Addr           string    `json:"addr"`
+	SourceID       uint64    `json:"source_id,omitempty"`
+	SourceAddr     string    `json:"source_addr,omitempty"`
+	UploadBPS      uint64    `json:"upload_bps,omitempty"`
+	DownloadBPS    uint64    `json:"download_bps,omitempty"`
+	AttemptToken   string    `json:"attempt_token,omitempty"`
+	LeaseStart     time.Time `json:"lease_start,omitempty"`
+	ProgressBytes  int64     `json:"progress_bytes,omitempty"`
+	LastProgressAt time.Time `json:"last_progress_at,omitempty"`
+	GoodputBPS     uint64    `json:"goodput_bps,omitempty"`
+	Renewals       uint32    `json:"renewals,omitempty"`
+	FailureKind    string    `json:"failure_kind,omitempty"`
+	Done           bool      `json:"done"`
+	Attempts       uint32    `json:"attempts"`
+	NextAttempt    time.Time `json:"next_attempt,omitempty"`
+	LastError      string    `json:"last_error,omitempty"`
 }
 
 type ProtectionPlan struct {

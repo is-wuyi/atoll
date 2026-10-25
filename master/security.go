@@ -822,7 +822,7 @@ func (s *Server) allowDeviceMetadata(w http.ResponseWriter, r *http.Request, dev
 	if key == "POST /nodes/transfer-observation" || key == "GET /nodes/transfer-peers" {
 		return true
 	}
-	if key != "POST /nodes/heartbeat" && key != "POST /files/replicated/verified" && key != "POST /files/replicated/present" && key != "POST /files/objects/suspect" {
+	if key != "POST /nodes/heartbeat" && key != "POST /files/replicated/verified" && key != "POST /files/replicated/present" && key != "POST /files/objects/suspect" && key != "POST /files/protection/progress" {
 		httpError(w, 403, "device operation denied")
 		return false
 	}

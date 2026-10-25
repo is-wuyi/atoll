@@ -41,6 +41,7 @@ type Node struct {
 	httpClient        *http.Client  // 与 master 交互（小请求，60s 全程超时）
 	bulkClient        *http.Client  // 对等节点大对象传输（push/pull，不设全程超时）
 	pulling           sync.Map      // map[uint64]struct{}: 正在拉取的 inode，去重用
+	pullingKey        sync.Map      // map[uint64]pullKey: 去重命中时的在飞计划/尝试身份
 	token             auth.Token    // 集群认证；空 = 兼容模式
 	sec               *nodeSecurity // 独立身份+在线票据模式；nil = legacy 行为
 	uploadBudget      *transferbudget.Limiter
@@ -343,16 +344,28 @@ func (n *Node) handlePull(w http.ResponseWriter, r *http.Request) {
 		SourceAddr string `json:"source_addr"`
 		Checksum   uint32 `json:"checksum"`
 		PlanID     string `json:"plan_id"`
+		Attempt    uint32 `json:"attempt"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.InodeID == 0 || req.SourceAddr == "" {
 		httpError(w, http.StatusBadRequest, "inode_id and source_addr are required")
 		return
 	}
 	// 同一物理对象并发去重；plan_id 仅增保护计划授权下从计划源拉取。
+	// 去重身份是 (对象, 计划, 尝试)：完全相同 = 幂等重复派工，返回 202；
+	// 计划/尝试不同（旧租约的飞行、另一计划的拉取）必须显式 409，master 的
+	// executeTarget 会把它当派工失败记录，而不是误以为新传输已启动。
+	key := pullKey{PlanID: req.PlanID, Attempt: req.Attempt}
 	if _, loaded := n.pulling.LoadOrStore(req.InodeID, struct{}{}); !loaded {
-		go n.pullObject(req.InodeID, req.SourceAddr, req.Checksum, req.PlanID)
+		n.pullingKey.Store(req.InodeID, key)
+		go n.pullObject(req.InodeID, req.SourceAddr, req.Checksum, req.PlanID, req.Attempt)
+		w.WriteHeader(http.StatusAccepted)
+		return
 	}
-	w.WriteHeader(http.StatusAccepted)
+	if current, ok := n.pullingKey.Load(req.InodeID); ok && current == key {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	httpError(w, http.StatusConflict, "object transfer already in flight for a different plan or attempt")
 }
 
 // planPullTimeout 计划拉取的整体上界：master 控制器对 plan claim 持久化 retryAt
@@ -379,34 +392,48 @@ func planDeadline(base time.Duration, lease time.Time) (time.Time, error) {
 	return d, nil
 }
 
-func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, planID ...string) {
+// pullKey 是 /pull 去重命中时在飞传输的计划/尝试身份。
+type pullKey struct {
+	PlanID  string
+	Attempt uint32
+}
+
+func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, planID string, attempt uint32) {
+	wantPlan, wantAttempt := planID, attempt
 	defer n.pulling.Delete(objectID)
-	wantPlan := ""
-	if len(planID) > 0 {
-		wantPlan = planID[0]
-	}
+	defer n.pullingKey.Delete(objectID)
 	ctx := context.Background()
 	var cancel context.CancelFunc
 	if wantPlan != "" {
-		// 计划拉取：租约内完成整条链路（取 descriptor + 传输 + 落盘 + 回执）。
-		// PlanLeaseUntil 过期 = claim 已被 master 回收，本侧拒绝开新网络流。
+		// 计划拉取的硬总上界：feedback 计划（PlanAttempt>0）的租约由 master 依据
+		// 进度反馈续租，节点侧不再把首 descriptor 的租约截止当作唯一网络 deadline；
+		// 授权仍 fail-closed——descriptor 获取与最终回执都在 master 侧校验租约。
 		ctx, cancel = context.WithTimeout(ctx, planPullTimeout)
 	}
 	if cancel != nil {
 		defer cancel()
 	}
+	report := func(bytes int64, kind, message string) {
+		n.reportPullFeedback(wantPlan, wantAttempt, objectID, bytes, kind, message)
+	}
 	plan, err := n.replicationPlan(ctx, objectID, wantPlan)
 	if err != nil {
 		log.Printf("pull %d metadata: %v", objectID, err)
+		report(0, "failed", err.Error())
 		return
 	}
-	if wantPlan != "" {
+	if plan.Object.PlanAttempt > 0 {
+		wantAttempt = plan.Object.PlanAttempt
+		n.pullingKey.Store(objectID, pullKey{PlanID: wantPlan, Attempt: wantAttempt})
+	}
+	if wantPlan != "" && plan.Object.PlanAttempt == 0 {
+		// legacy 计划（无 PlanAttempt）保持原租约收窄语义。
 		deadline, lerr := planDeadline(planPullTimeout, plan.Object.PlanLeaseUntil)
 		if lerr != nil {
 			log.Printf("pull %d: %v", objectID, lerr)
+			report(0, "failed", lerr.Error())
 			return
 		}
-		// 用租约收窄剩余上界（只收窄不放宽）。
 		ctx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 	}
@@ -418,10 +445,12 @@ func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, 
 	}
 	if sourceID == 0 || (plan.Transfer != nil && plan.Transfer.SourceID != sourceID) || (expectCRC != 0 && (!plan.Object.ChecksumKnown || expectCRC != plan.Object.Checksum)) {
 		log.Printf("pull %d: stale or unassigned source", objectID)
+		report(0, "failed", "stale or unassigned source")
 		return
 	}
 	if plan.Transfer != nil && n.downloadBudget == nil && (plan.Transfer.DownloadBPS != 0 || plan.Transfer.UploadBPS != 0) {
 		log.Printf("pull %d: configured local download budget required", objectID)
+		report(0, "failed", "configured local download budget required")
 		return
 	}
 	var downloadRelease func()
@@ -429,6 +458,7 @@ func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, 
 		downloadRelease, err = n.downloadBudget.Acquire(ctx)
 		if err != nil {
 			log.Printf("pull %d: download slot: %v", objectID, err)
+			report(0, "failed", err.Error())
 			return
 		}
 		defer downloadRelease()
@@ -437,21 +467,27 @@ func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, 
 		fmt.Sprintf("%s://%s/objects/%d", n.scheme(), sourceAddr, objectID), nil)
 	if err != nil {
 		log.Printf("pull %d: %v", objectID, err)
+		report(0, "failed", err.Error())
 		return
 	}
 	// 计划拉取把 plan 绑到出站票据上（security 模式换票时一并核验；
 	// legacy 模式该头无消费者，原样携带）。
 	if wantPlan != "" {
 		req.Header.Set(access.PlanHeader, wantPlan)
+		if plan.Object.PlanAttempt > 0 {
+			req.Header.Set(access.PlanAttemptHeader, strconv.FormatUint(uint64(plan.Object.PlanAttempt), 10))
+		}
 	}
 	resp, err := n.bulkClient.Do(req)
 	if err != nil {
 		log.Printf("pull %d: %v", objectID, err)
+		report(0, "failed", err.Error())
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("pull %d: source status %d", objectID, resp.StatusCode)
+		report(0, "failed", fmt.Sprintf("source status %d", resp.StatusCode))
 		return
 	}
 	var crc *uint32
@@ -463,6 +499,7 @@ func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, 
 		t := plan.Transfer
 		if t.TargetID != uint64(n.nodeID.Load()) || t.SourceID != sourceID || !time.Now().Before(t.ExpiresAt) {
 			log.Printf("pull %d: transfer source or lease mismatch", objectID)
+			report(0, "failed", "transfer source or lease mismatch")
 			return
 		}
 		flowBPS = t.DownloadBPS
@@ -470,20 +507,117 @@ func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, 
 			flowBPS = t.UploadBPS
 		}
 	}
-	var body io.Reader = resp.Body
+	// 字节计数只统计实际读到的对象 payload；HTTP 头/框架不计入。周期进度报告
+	// 携带测量 goodput（累计字节/累计耗时），master 用它决定是否续租。
+	counter := &progressCounter{}
+	var body io.Reader = io.TeeReader(resp.Body, counter)
 	if n.downloadBudget != nil {
 		body = n.downloadBudget.Reader(ctx, body, flowBPS)
 	}
-	if _, _, err := n.storeVerifiedObject(objectID, body, crc, plan.Object.Size); err != nil {
-		log.Printf("pull %d: %v", objectID, err)
-		if errors.Is(err, errIntegrityMismatch) {
+	stopProgress := make(chan struct{})
+	progressDone := make(chan struct{})
+	if plan.Object.PlanAttempt > 0 {
+		go func() {
+			defer close(progressDone)
+			n.progressLoop(ctx, stopProgress, plan.Object.PlanID, plan.Object.PlanAttempt, objectID, counter)
+		}()
+	} else {
+		close(progressDone)
+	}
+	_, _, serr := n.storeVerifiedObject(objectID, body, crc, plan.Object.Size)
+	close(stopProgress)
+	<-progressDone
+	if serr != nil {
+		log.Printf("pull %d: %v", objectID, serr)
+		kind := "failed"
+		if errors.Is(serr, errIntegrityMismatch) {
+			kind = "corrupt"
 			_ = n.reportIntegrityFor(ctx, "/files/objects/suspect", plan.Object, sourceID)
 		}
+		report(counter.n.Load(), kind, serr.Error())
 		return
 	}
 	if err := n.reportStored(ctx, plan.Object); err != nil {
 		log.Printf("pull %d receipt: %v", objectID, err)
 	}
+}
+
+// progressCounter 统计流过的对象字节（原子，供进度 goroutine 无锁读取）。
+type progressCounter struct {
+	n atomic.Int64
+}
+
+func (p *progressCounter) Write(b []byte) (int, error) {
+	p.n.Add(int64(len(b)))
+	return len(b), nil
+}
+
+// progressReportInterval 是计划拉取的进度心跳周期：足够密以支撑续租判断，
+// 足够疏以免进度请求本身成为 master 负载。测试可注入缩短。
+var progressReportInterval = 15 * time.Second
+
+// progressLoop 周期上报进度；上报失败只记日志（进度是尽力而为的续租心跳，
+// 真正的授权闸在 descriptor 与回执两处）。stop 关闭或 ctx 结束即退出。
+func (n *Node) progressLoop(ctx context.Context, stop <-chan struct{}, planID string, attempt uint32, objectID uint64, counter *progressCounter) {
+	started := time.Now()
+	ticker := time.NewTicker(progressReportInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			bytes := counter.n.Load()
+			elapsed := time.Since(started).Seconds()
+			var goodput uint64
+			if bytes > 0 && elapsed > 0 {
+				goodput = uint64(float64(bytes) / elapsed)
+			}
+			n.reportPullProgress(ctx, planID, attempt, objectID, bytes, goodput, "", "")
+		}
+	}
+}
+
+// reportPullFeedback 在一次计划拉取结束时上报失败类别与读到的字节数。仅
+// feedback 计划上报（attempt>0 且计划 ID 已知）；legacy 计划保持日志-only。
+// 用独立短 ctx——传输 ctx 可能已取消。best-effort：失败仅日志。
+func (n *Node) reportPullFeedback(planID string, attempt uint32, objectID uint64, bytes int64, kind, message string) {
+	if planID == "" || attempt == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	n.reportPullProgress(ctx, planID, attempt, objectID, bytes, 0, kind, message)
+}
+
+// reportPullProgress 发一条进度/失败反馈到 master。节点上报走自身控制通道
+// （legacy 集群 token / secure 设备会话由 n.httpClient 的 transport 注入）。
+func (n *Node) reportPullProgress(ctx context.Context, planID string, attempt uint32, objectID uint64, bytesDone int64, goodput uint64, kind, message string) {
+	if planID == "" || attempt == 0 {
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"plan_id": planID, "object_id": objectID, "node_id": n.nodeID.Load(),
+		"attempt": attempt, "bytes_done": bytesDone, "goodput_bps": goodput,
+		"failure_kind": kind, "message": message,
+	})
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.masterURL+"/files/protection/progress", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := n.httpClient.Do(req)
+	if err != nil {
+		log.Printf("pull %d progress report: %v", objectID, err)
+		return
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
 }
 
 func (n *Node) storeObject(id uint64, r io.Reader, expectCRC uint32) (int64, uint32, error) {

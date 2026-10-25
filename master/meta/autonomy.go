@@ -454,6 +454,7 @@ func (s *Store) ProtectionDescriptor(planID string, objectID, nodeID uint64) (ty
 				}
 				allowed = node.Addr == t.Addr && (t.Done || time.Now().Before(t.NextAttempt))
 				result.PlanLeaseUntil = t.NextAttempt
+				result.PlanAttempt = t.Attempts
 			}
 		}
 		if !allowed {
@@ -467,9 +468,11 @@ func (s *Store) ProtectionDescriptor(planID string, objectID, nodeID uint64) (ty
 			return ErrProtectionConflict
 		}
 		leaseUntil := result.PlanLeaseUntil
+		attempt := result.PlanAttempt
 		result = current
 		result.PlanID = planID
 		result.PlanLeaseUntil = leaseUntil
+		result.PlanAttempt = attempt
 		result.Replicas = appendUnique(append([]uint64(nil), current.Replicas...), nodeID)
 		return nil
 	})
@@ -525,8 +528,19 @@ func (s *Store) markProtectionDone(expected types.ObjectIntegrity, nodeID uint64
 			}
 			return nil
 		}
-		if !exactProtectionIdentity(current, plan.Expected) || !exactProtectionIdentity(current, expected) ||
-			!expected.PlanLeaseUntil.Equal(plan.Targets[idx].NextAttempt) || !time.Now().Before(plan.Targets[idx].NextAttempt) {
+		// Fence 分支：feedback 计划（有 AttemptToken）以 token+attempt+有效租约判定，
+		// 续租只延长 NextAttempt 不换 token，回执在延长的窗口内仍有效；legacy 计划
+		// （token 空，含 gate 开启前已存在的计划）保持 PlanLeaseUntil 严格相等。
+		t := &plan.Targets[idx]
+		if t.AttemptToken != "" {
+			if expected.PlanAttempt != t.Attempts || expected.PlanAttempt == 0 || !time.Now().Before(t.NextAttempt) {
+				return nil
+			}
+		} else if !expected.PlanLeaseUntil.Equal(t.NextAttempt) || !time.Now().Before(t.NextAttempt) {
+			return nil
+		}
+		// identity 校验对两个分支共同生效。
+		if !exactProtectionIdentity(current, plan.Expected) || !exactProtectionIdentity(current, expected) {
 			return nil
 		}
 		in, err := getInodeTx(w.tx, current.InodeID)
@@ -932,8 +946,11 @@ func budgetCeiling(b *ProtectionExecutionBudget) uint64 {
 // writeTransfer 的腿表校验，不受本票据约束）。带 plan_id 时只放行两种：升级前遗留的
 // 未绑定目标（SourceID==0，执行侧按 Attempts 轮转——现在 claim 总会写绑定，未绑定
 // 只可能来自旧数据），或者目标持有有效租约且 audience 正是绑定源。其余一律返回假。
+// ticketAttempt 是票据携带的 claim 尝试序号：目标存在 AttemptToken（feedback 计划）
+// 时必须等于当前 Attempts，否则是已被新 claim 取代的旧尝试，拒绝；0（legacy 票据）
+// 对 legacy 目标放行，对 feedback 目标拒绝——旧版本节点不认识新 fence，宁可拒绝。
 // 只读 tx，供票据校验在已有写事务内调用。
-func protectionSourceMatchesTx(tx *bolt.Tx, planID string, senderNodeID, audienceNodeID uint64, now time.Time) (bool, error) {
+func protectionSourceMatchesTx(tx *bolt.Tx, planID string, senderNodeID, audienceNodeID uint64, ticketAttempt uint32, now time.Time) (bool, error) {
 	if planID == "" || audienceNodeID == 0 {
 		return true, nil
 	}
@@ -954,6 +971,9 @@ func protectionSourceMatchesTx(tx *bolt.Tx, planID string, senderNodeID, audienc
 		// 遗留未绑定目标（SourceID==0）保持原有的执行轮转；新计划必须精确匹配绑定源。
 		if t.SourceID == 0 {
 			return true, nil
+		}
+		if t.AttemptToken != "" && ticketAttempt != t.Attempts {
+			return false, nil
 		}
 		return t.SourceID == audienceNodeID, nil
 	}
@@ -1017,13 +1037,97 @@ func (s *Store) ProtectionTransfer(planID string, objectID, nodeID uint64) (*typ
 					return ErrProtectionConflict
 				}
 			}
-			out = &types.ReplicaTransfer{SourceID: t.SourceID, TargetID: t.NodeID,
+			out = &types.ReplicaTransfer{SourceID: t.SourceID, TargetID: t.NodeID, PlanAttempt: t.Attempts,
 				UploadBPS: t.UploadBPS, DownloadBPS: t.DownloadBPS, ExpiresAt: t.NextAttempt}
 			return nil
 		}
 		return ErrProtectionConflict
 	})
 	return out, err
+}
+
+// ProtectionPlanSnapshot 在同一个只读事务里返回 descriptor 与传输绑定，
+// 供复制描述符一次性下发：续租事务不会再落在两次独立读之间造成
+// Transfer.ExpiresAt 与 descriptor.PlanLeaseUntil 不一致而被节点误拒。
+func (s *Store) ProtectionPlanSnapshot(planID string, objectID, nodeID uint64) (types.ObjectIntegrity, *types.ReplicaTransfer, error) {
+	var result types.ObjectIntegrity
+	var transfer *types.ReplicaTransfer
+	err := s.db.View(func(tx *bolt.Tx) error {
+		plan, err := planTx(tx, planID)
+		if err != nil {
+			return err
+		}
+		if plan.State != ProtectionPending && plan.State != ProtectionCompleted {
+			return ErrProtectionConflict
+		}
+		if plan.Expected.ObjectID != objectID || plan.ProfileRevision != profileRevisionTx(tx) {
+			return ErrProtectionConflict
+		}
+		allowed := false
+		for _, t := range plan.Targets {
+			if t.NodeID == nodeID && (t.Done || t.Attempts > 0) {
+				var node types.NodeInfo
+				if err := json.Unmarshal(tx.Bucket(bucketNodes).Get(u64be(nodeID)), &node); err != nil {
+					return err
+				}
+				allowed = node.Addr == t.Addr && (t.Done || time.Now().Before(t.NextAttempt))
+				result.PlanLeaseUntil = t.NextAttempt
+				result.PlanAttempt = t.Attempts
+			}
+		}
+		if !allowed {
+			return ErrProtectionConflict
+		}
+		current, err := integrityTx(tx, objectID)
+		if err != nil {
+			return err
+		}
+		if !exactProtectionIdentity(current, plan.Expected) {
+			return ErrProtectionConflict
+		}
+		leaseUntil, attempt := result.PlanLeaseUntil, result.PlanAttempt
+		result = current
+		result.PlanID = planID
+		result.PlanLeaseUntil = leaseUntil
+		result.PlanAttempt = attempt
+		result.Replicas = appendUnique(append([]uint64(nil), current.Replicas...), nodeID)
+		if plan.State != ProtectionPending {
+			return nil
+		}
+		for _, t := range plan.Targets {
+			if t.NodeID != nodeID {
+				continue
+			}
+			if t.SourceID == 0 {
+				return nil
+			}
+			if t.SourceAddr == "" || t.Attempts == 0 {
+				return ErrProtectionConflict
+			}
+			var targetNode types.NodeInfo
+			if err := json.Unmarshal(tx.Bucket(bucketNodes).Get(u64be(nodeID)), &targetNode); err != nil {
+				return err
+			}
+			if t.Addr != "" && t.Addr != targetNode.Addr {
+				return ErrProtectionConflict
+			}
+			sourceNode, err := nodeAtTx(tx, t.SourceID)
+			if err != nil || sourceNode.Addr == "" || sourceNode.Addr != t.SourceAddr {
+				return ErrProtectionConflict
+			}
+			if !time.Now().Before(t.NextAttempt) {
+				return ErrProtectionConflict
+			}
+			if !types.ContainsUint64(plan.Expected.Done, t.SourceID) || types.ContainsUint64(plan.Expected.Suspect, t.SourceID) {
+				return ErrProtectionConflict
+			}
+			transfer = &types.ReplicaTransfer{SourceID: t.SourceID, TargetID: t.NodeID, PlanAttempt: t.Attempts,
+				UploadBPS: t.UploadBPS, DownloadBPS: t.DownloadBPS, ExpiresAt: t.NextAttempt}
+			return nil
+		}
+		return ErrProtectionConflict
+	})
+	return result, transfer, err
 }
 
 func (s *Store) ClaimProtectionTarget(planID string, now time.Time, retryAfter time.Duration, budgets ...ProtectionExecutionBudget) (ProtectionPlan, *ProtectionTarget, error) {
@@ -1093,8 +1197,21 @@ func (s *Store) ClaimProtectionTarget(planID string, now time.Time, retryAfter t
 				}
 				return err
 			}
+			// 每次 claim 重生成 attempt token：旧尝试的进度、回执与票据同时失效，
+			// 不依赖时间戳不相等论证。上一尝试的反馈字段一并重置——重试从零开始。
+			token, err := secOpaque("pa1_")
+			if err != nil {
+				return err
+			}
 			view.Leases++
 			t.Attempts++
+			t.AttemptToken = token
+			t.LeaseStart = now
+			t.ProgressBytes = 0
+			t.LastProgressAt = time.Time{}
+			t.GoodputBPS = 0
+			t.Renewals = 0
+			t.FailureKind = ""
 			t.NextAttempt = now.Add(retryAfter)
 			plan.UpdatedAt = now
 			copy := *t
@@ -1130,6 +1247,133 @@ func (s *Store) RecordProtectionError(planID string, nodeID uint64, message stri
 		plan.UpdatedAt = time.Now()
 		return putAutonomy(w, "plan", plan.ID, plan)
 	})
+}
+
+// ProtectionProgressReport 是目标节点对一次保护传输尝试的反馈。BytesDone 只统计
+// 实际读到的对象字节；GoodputBPS 是测量值（成功 payload 字节/秒），不是配置预算。
+// FailureKind 为空表示进度报告；"failed" 表示本次尝试的传输已终止（网络/源/落盘
+// 失败），"corrupt" 表示内容校验失败（suspect 仍走既有独立上报，这里只记录类别）。
+type ProtectionProgressReport struct {
+	PlanID      string
+	ObjectID    uint64
+	NodeID      uint64
+	Attempt     uint32
+	BytesDone   int64
+	GoodputBPS  uint64
+	FailureKind string
+	Message     string
+	Now         time.Time
+}
+
+// ProtectionRenewPolicy 约束同一次尝试的有界续租。Window<=0 表示只记录进度不续租；
+// MaxRenewals 是本次尝试内续租次数上限；MaxTotalLease 是从 claim 起租约总长上限。
+// 续租从不改 Attempts/AttemptToken/SourceID/Done/State，也不触碰容量预留。
+type ProtectionRenewPolicy struct {
+	Window        time.Duration
+	MaxRenewals   uint32
+	MaxTotalLease time.Duration
+}
+
+// ErrProtectionProgress 表示反馈报告本身非法（身份/序号/单调性/类别），与
+// “报告被忽略”（计划已完成等，返回 nil, false）区分。
+var ErrProtectionProgress = errors.New("invalid protection progress report")
+
+// RecordProtectionProgress 记录一次进度或失败反馈，并按策略续租。
+// 返回 renewed 表示本次是否延长了租约。要点：
+//   - 只作用于 feedback 计划（AttemptToken 非空）且 attempt 必须等于当前 Attempts；
+//     旧尝试、legacy 计划的报告一律拒绝，不静默采纳。
+//   - 进度单调：BytesDone 小于已记录值是非法报告；超过对象大小同样非法。
+//   - 失败（failed/corrupt）把 NextAttempt 收敛到 now：数据流已结束，下一次合法
+//     claim 可以立即重选源。预留与在飞带宽照旧保留到窗口结束——不假释放。
+//   - 续租只在剩余租约不足以按测量 goodput 完成剩余字节时延长，且受次数与总长
+//     双重上限；goodput 未知时不续租（保守，不拿配置预算当测量值）。
+func (s *Store) RecordProtectionProgress(report ProtectionProgressReport, renew ProtectionRenewPolicy) (renewed bool, err error) {
+	if report.Now.IsZero() {
+		report.Now = time.Now()
+	}
+	if report.PlanID == "" || report.ObjectID == 0 || report.NodeID == 0 ||
+		(report.FailureKind != "" && report.FailureKind != "failed" && report.FailureKind != "corrupt") ||
+		len(report.Message) > 512 || report.GoodputBPS > 1<<40 {
+		return false, ErrProtectionProgress
+	}
+	err = s.write(func(w *txw) error {
+		plan, perr := planTx(w.tx, report.PlanID)
+		if perr != nil {
+			if errors.Is(perr, ErrNotExist) {
+				return ErrProtectionProgress
+			}
+			return perr
+		}
+		if plan.State != ProtectionPending {
+			// 已完成/已取消的计划不再接受反馈，也不是错误。
+			return nil
+		}
+		if plan.Expected.ObjectID != report.ObjectID {
+			return ErrProtectionProgress
+		}
+		idx := -1
+		for i := range plan.Targets {
+			if plan.Targets[i].NodeID == report.NodeID {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			return ErrProtectionProgress
+		}
+		t := &plan.Targets[idx]
+		if t.Done || t.AttemptToken == "" || t.Attempts == 0 || report.Attempt != t.Attempts {
+			return ErrProtectionProgress
+		}
+		if report.FailureKind != "" {
+			if !report.Now.Before(t.NextAttempt) {
+				// 租约已过期的失败报告无需收敛（下个 claim 本就可领）。
+				return nil
+			}
+			t.FailureKind = report.FailureKind
+			if report.Message != "" {
+				t.LastError = report.Message
+			}
+			t.NextAttempt = report.Now
+			plan.UpdatedAt = report.Now
+			return putAutonomy(w, "plan", plan.ID, plan)
+		}
+		if report.BytesDone < 0 || report.BytesDone > plan.Expected.Size ||
+			report.BytesDone < t.ProgressBytes {
+			return ErrProtectionProgress
+		}
+		t.ProgressBytes = report.BytesDone
+		t.LastProgressAt = report.Now
+		if report.GoodputBPS > 0 {
+			t.GoodputBPS = report.GoodputBPS
+		}
+		if report.Message != "" {
+			t.LastError = report.Message
+		}
+		if renew.Window > 0 && renew.MaxRenewals > 0 && t.Renewals < renew.MaxRenewals &&
+			report.GoodputBPS > 0 && report.BytesDone < plan.Expected.Size &&
+			report.Now.Before(t.NextAttempt) {
+			remaining := plan.Expected.Size - report.BytesDone
+			needSeconds := float64(remaining) / float64(report.GoodputBPS)
+			if needSeconds > time.Until(t.NextAttempt).Seconds() {
+				candidate := report.Now.Add(renew.Window)
+				if renew.MaxTotalLease > 0 && !t.LeaseStart.IsZero() &&
+					candidate.Sub(t.LeaseStart) > renew.MaxTotalLease {
+					candidate = t.LeaseStart.Add(renew.MaxTotalLease)
+				}
+				if candidate.After(t.NextAttempt) {
+					t.NextAttempt = candidate
+					t.Renewals++
+					renewed = true
+				}
+			}
+		}
+		plan.UpdatedAt = report.Now
+		return putAutonomy(w, "plan", plan.ID, plan)
+	})
+	if err == nil {
+		err = s.EnsureDurable()
+	}
+	return renewed, err
 }
 
 func (s *Store) CancelProtection(planID string) error {

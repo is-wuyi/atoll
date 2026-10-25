@@ -395,40 +395,45 @@ func TestProtectionSourceMatchesTx(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	check := func(planID string, sender, audience uint64, at time.Time) (bool, error) {
+	check := func(planID string, sender, audience uint64, attempt uint32, at time.Time) (bool, error) {
 		var ok bool
 		var err error
 		err = s.db.View(func(tx *bolt.Tx) error {
-			ok, err = protectionSourceMatchesTx(tx, planID, sender, audience, at)
+			ok, err = protectionSourceMatchesTx(tx, planID, sender, audience, attempt, at)
 			return err
 		})
 		return ok, err
 	}
+	// feedback 计划（claim 生成 AttemptToken）的当前 attempt 放行、旧 attempt 拒绝、
+	// legacy 0 票据也拒绝；unbound 注入记录无 token，任何 attempt 值照旧放行。
 	for _, tc := range []struct {
 		planID   string
 		sender   uint64
 		audience uint64
+		attempt  uint32
 		at       time.Time
 		want     bool
 		wantErr  bool
 	}{
-		{planID: bound.ID, sender: ids[2], audience: ids[0], at: now.Add(time.Second), want: true},
-		{planID: bound.ID, sender: ids[2], audience: ids[1], at: now.Add(time.Second), want: false},
-		{planID: bound.ID, sender: ids[3], audience: ids[0], at: now.Add(time.Second), want: false},
-		{planID: bound.ID, sender: ids[2], audience: ids[0], at: now.Add(31 * time.Second), want: false},
-		{planID: "trf-match-unknown", sender: ids[2], audience: ids[0], at: now.Add(time.Second), want: false},
-		{planID: "", sender: ids[2], audience: ids[0], at: now.Add(time.Second), want: true},
-		{planID: legacy.ID, sender: ids[2], audience: legacyTarget.SourceID, at: now.Add(time.Second), want: true},
-		{planID: legacy.ID, sender: ids[2], audience: ids[0], at: now.Add(time.Second),
+		{planID: bound.ID, sender: ids[2], audience: ids[0], attempt: 1, at: now.Add(time.Second), want: true},
+		{planID: bound.ID, sender: ids[2], audience: ids[0], attempt: 0, at: now.Add(time.Second), want: false},
+		{planID: bound.ID, sender: ids[2], audience: ids[0], attempt: 2, at: now.Add(time.Second), want: false},
+		{planID: bound.ID, sender: ids[2], audience: ids[1], attempt: 1, at: now.Add(time.Second), want: false},
+		{planID: bound.ID, sender: ids[3], audience: ids[0], attempt: 1, at: now.Add(time.Second), want: false},
+		{planID: bound.ID, sender: ids[2], audience: ids[0], attempt: 1, at: now.Add(31 * time.Second), want: false},
+		{planID: "trf-match-unknown", sender: ids[2], audience: ids[0], attempt: 1, at: now.Add(time.Second), want: false},
+		{planID: "", sender: ids[2], audience: ids[0], attempt: 1, at: now.Add(time.Second), want: true},
+		{planID: legacy.ID, sender: ids[2], audience: legacyTarget.SourceID, attempt: 1, at: now.Add(time.Second), want: true},
+		{planID: legacy.ID, sender: ids[2], audience: ids[0], attempt: 1, at: now.Add(time.Second),
 			want: legacyTarget.SourceID == ids[0]},
-		{planID: unbound.ID, sender: ids[2], audience: ids[0], at: now.Add(time.Second), want: true},
-		{planID: unbound.ID, sender: ids[2], audience: ids[3], at: now.Add(time.Second), want: true},
-		{planID: empty.ID, sender: ids[2], audience: ids[0], at: now.Add(time.Second), want: false},
+		{planID: unbound.ID, sender: ids[2], audience: ids[0], attempt: 0, at: now.Add(time.Second), want: true},
+		{planID: unbound.ID, sender: ids[2], audience: ids[3], attempt: 1, at: now.Add(time.Second), want: true},
+		{planID: empty.ID, sender: ids[2], audience: ids[0], attempt: 1, at: now.Add(time.Second), want: false},
 	} {
-		ok, err := check(tc.planID, tc.sender, tc.audience, tc.at)
+		ok, err := check(tc.planID, tc.sender, tc.audience, tc.attempt, tc.at)
 		if tc.wantErr != (err != nil) || ok != tc.want {
-			t.Fatalf("match(plan=%q sender=%d audience=%d) = (%v,%v), want (%v,%v)",
-				tc.planID, tc.sender, tc.audience, ok, err, tc.want, tc.wantErr)
+			t.Fatalf("match(plan=%q sender=%d audience=%d attempt=%d) = (%v,%v), want (%v,%v)",
+				tc.planID, tc.sender, tc.audience, tc.attempt, ok, err, tc.want, tc.wantErr)
 		}
 	}
 }

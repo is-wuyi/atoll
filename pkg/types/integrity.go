@@ -6,9 +6,12 @@ const IntegrityProtocol = "integrity-v1"
 
 // ObjectIntegrity binds a physical object to the metadata snapshot used to verify it.
 // ChecksumKnown distinguishes an explicit CRC of zero from legacy unrecorded checksums.
+// PlanAttempt identifies the protection claim attempt this descriptor/receipt
+// belongs to; 0 means a legacy plan fenced only by PlanLeaseUntil equality.
 type ObjectIntegrity struct {
 	PlanID         string    `json:"plan_id,omitempty"`
 	PlanLeaseUntil time.Time `json:"plan_lease_until,omitzero"`
+	PlanAttempt    uint32    `json:"plan_attempt,omitzero"`
 	ObjectID       uint64    `json:"object_id"`
 	InodeID        uint64    `json:"inode_id"`
 	Generation     uint64    `json:"generation"`
@@ -29,9 +32,13 @@ type NodeUsage struct {
 	UsedBytes int64  `json:"used_bytes"`
 }
 
+// ReplicaTransfer is the committed network binding for one plan target.
+// PlanAttempt mirrors the owning claim's attempt counter; a ticket whose
+// attempt differs is a superseded attempt and must be refused.
 type ReplicaTransfer struct {
 	SourceID    uint64    `json:"source_id"`
 	TargetID    uint64    `json:"target_id"`
+	PlanAttempt uint32    `json:"plan_attempt,omitzero"`
 	UploadBPS   uint64    `json:"upload_bps"`
 	DownloadBPS uint64    `json:"download_bps"`
 	ExpiresAt   time.Time `json:"expires_at"`

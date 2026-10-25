@@ -33,9 +33,11 @@ func (s *Server) handleReplicationPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var d types.ObjectIntegrity
+	var transfer *types.ReplicaTransfer
 	var err error
 	if planID := r.URL.Query().Get("plan_id"); planID != "" {
-		d, err = s.store.ProtectionDescriptor(planID, id, nodeID)
+		// descriptor 与传输绑定同事务快照：续租不会落在两次读之间。
+		d, transfer, err = s.store.ProtectionPlanSnapshot(planID, id, nodeID)
 	} else {
 		d, err = s.store.ObjectIntegrity(id)
 	}
@@ -55,11 +57,7 @@ func (s *Server) handleReplicationPlan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		out.Transfer, err = s.store.ProtectionTransfer(r.URL.Query().Get("plan_id"), id, nodeID)
-		if err != nil {
-			httpErrorFromMeta(w, err)
-			return
-		}
+		out.Transfer = transfer
 	}
 	for _, targetID := range d.Replicas {
 		target, err := s.store.GetNode(targetID)

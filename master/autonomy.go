@@ -49,6 +49,11 @@ type AutonomyConfig struct {
 	MaxSourceUploadBPS   uint64 `json:"max_source_upload_bps"`
 	MaxTargetDownloadBPS uint64 `json:"max_target_download_bps"`
 	MaxReplicas          int    `json:"max_replicas"`
+	// 进度反馈续租策略：同一次尝试只在测量 goodput 表明剩余租约不够完成剩余字节时
+	// 延长租约，且受次数与总长双上限。0 值禁用续租（进度仍记录，失败仍收敛租约）。
+	LeaseRenewWindow  time.Duration `json:"lease_renew_window"`
+	MaxLeaseRenewals  uint32        `json:"max_lease_renewals"`
+	MaxLeaseTotalTime time.Duration `json:"max_lease_total_time"`
 }
 
 type AutonomyDecision struct {
@@ -65,7 +70,15 @@ type AutonomyReport struct {
 	ObservedNodes int                `json:"observed_nodes"`
 	Decisions     []AutonomyDecision `json:"decisions"`
 	Dispatched    int                `json:"dispatched"`
-	Error         string             `json:"error,omitempty"`
+	// Attempted/Succeeded/Failed/Corrupt 是本 tick 内完成尝试的计数（进度反馈
+	// 聚合，非派工数）；BytesDone 是本 tick 报告的实际读入字节之和。测量值，
+	// 不是配置预算。
+	Attempted int    `json:"attempted"`
+	Succeeded int    `json:"succeeded"`
+	Failed    int    `json:"failed"`
+	Corrupt   int    `json:"corrupt"`
+	BytesDone int64  `json:"bytes_done"`
+	Error     string `json:"error,omitempty"`
 }
 
 type Autonomy struct {
@@ -103,6 +116,17 @@ func NewAutonomy(store *meta.Store, nodeMaxAge time.Duration, cfg AutonomyConfig
 	if cfg.RetryInterval == 0 {
 		cfg.RetryInterval = 5 * time.Minute
 	}
+	// 续租默认开启且与节点 5min 硬上界对齐：一次 64MiB 尝试在慢链路上可被
+	// 有界延长（最多 8 次、总长 30min），不会无限占用。0 显式关闭。
+	if cfg.LeaseRenewWindow == 0 {
+		cfg.LeaseRenewWindow = 4 * time.Minute
+	}
+	if cfg.MaxLeaseRenewals == 0 {
+		cfg.MaxLeaseRenewals = 8
+	}
+	if cfg.MaxLeaseTotalTime == 0 {
+		cfg.MaxLeaseTotalTime = 30 * time.Minute
+	}
 	if cfg.MaxPlans == 0 {
 		cfg.MaxPlans = 128
 	}
@@ -125,7 +149,8 @@ func NewAutonomy(store *meta.Store, nodeMaxAge time.Duration, cfg AutonomyConfig
 		cfg.MaxPlans < 1 || cfg.MaxPlans > 1024 || cfg.MaxDispatchPerTick < 1 || cfg.MaxDispatchPerTick > 16 ||
 		cfg.MaxBytesPerRound <= 0 || cfg.MaxReplicas < 2 || cfg.MaxReplicas > 32 ||
 		cfg.MaxSourceConcurrent < 1 || cfg.MaxSourceConcurrent > 32 || cfg.MaxTargetConcurrent < 1 || cfg.MaxTargetConcurrent > 32 ||
-		cfg.MaxSourceUploadBPS > transferbudget.MaxRate || cfg.MaxTargetDownloadBPS > transferbudget.MaxRate {
+		cfg.MaxSourceUploadBPS > transferbudget.MaxRate || cfg.MaxTargetDownloadBPS > transferbudget.MaxRate ||
+		cfg.LeaseRenewWindow < 0 || cfg.MaxLeaseRenewals > 64 || cfg.MaxLeaseTotalTime > 0 && cfg.MaxLeaseTotalTime < cfg.RetryInterval {
 		return nil, errors.New("invalid autonomy resource bounds")
 	}
 	return &Autonomy{store: store, nodeMaxAge: nodeMaxAge, config: cfg, http: &http.Client{Transport: auth.HTTPTransport("", nil, nil)}, scheme: "http"}, nil
@@ -220,6 +245,29 @@ func (a *Autonomy) Step(ctx context.Context) (report AutonomyReport, err error) 
 		n, e := a.executePendingBudget(ctx, latest.Plans, time.Now().UTC(), a.config.MaxDispatchPerTick-report.Dispatched, &remainingDispatchBytes)
 		report.Dispatched += n
 		err = e
+	}
+	// 聚合本 tick 快照里各计划的反馈字段：这些是"已报告的完成/失败尝试"，
+	// 不是本 tick 的派工数（Dispatched 单独计）。BytesDone 只累计实际读入字节。
+	for _, p := range snapshot.Plans {
+		for _, t := range p.Targets {
+			if t.Attempts == 0 || t.AttemptToken == "" {
+				continue
+			}
+			if t.Done {
+				report.Attempted++
+				report.Succeeded++
+				continue
+			}
+			switch t.FailureKind {
+			case "failed":
+				report.Attempted++
+				report.Failed++
+			case "corrupt":
+				report.Attempted++
+				report.Corrupt++
+			}
+			report.BytesDone += t.ProgressBytes
+		}
 	}
 	return
 }
@@ -511,8 +559,14 @@ func (a *Autonomy) executeTarget(ctx context.Context, plan meta.ProtectionPlan, 
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithDeadline(ctx, d.PlanLeaseUntil)
-	defer cancel()
+	// feedback 计划租约会按进度续租，master 侧派工不再用首 descriptor 的租约
+	// 截止收窄 ctx（续租后的 /pull 会因此被误杀）；节点侧仍有 5min 硬上界，
+	// 授权闸在票据与回执两处。legacy 计划保持原收窄语义。
+	var cancel context.CancelFunc
+	if d.PlanAttempt == 0 {
+		ctx, cancel = context.WithDeadline(ctx, d.PlanLeaseUntil)
+		defer cancel()
+	}
 	currentTarget, err := a.store.GetNode(target.NodeID)
 	if err != nil {
 		return err
@@ -558,7 +612,7 @@ func (a *Autonomy) executeTarget(ctx context.Context, plan meta.ProtectionPlan, 
 		types.ContainsUint64(d.Suspect, n.ID) || time.Since(n.LastHeartbeat) > a.nodeMaxAge {
 		return errors.New("persisted protection source binding is invalid")
 	}
-	payload, _ := json.Marshal(map[string]any{"inode_id": d.ObjectID, "source_id": n.ID, "source_addr": n.Addr, "checksum": d.Checksum, "plan_id": plan.ID})
+	payload, _ := json.Marshal(map[string]any{"inode_id": d.ObjectID, "source_id": n.ID, "source_addr": n.Addr, "checksum": d.Checksum, "plan_id": plan.ID, "attempt": target.Attempts})
 	status, err = a.request(ctx, http.MethodPost, fmt.Sprintf("%s://%s/pull", a.scheme, target.Addr), payload)
 	if err != nil {
 		return err
@@ -567,6 +621,15 @@ func (a *Autonomy) executeTarget(ctx context.Context, plan meta.ProtectionPlan, 
 		return fmt.Errorf("plan pull returned %d", status)
 	}
 	return nil
+}
+
+// RenewPolicy 把配置的续租策略交给进度反馈入口；未配置时返回零值（只记录、不续租）。
+func (a *Autonomy) RenewPolicy() meta.ProtectionRenewPolicy {
+	return meta.ProtectionRenewPolicy{
+		Window:        a.config.LeaseRenewWindow,
+		MaxRenewals:   a.config.MaxLeaseRenewals,
+		MaxTotalLease: a.config.MaxLeaseTotalTime,
+	}
 }
 
 func (a *Autonomy) request(ctx context.Context, method, url string, body []byte) (int, error) {

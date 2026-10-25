@@ -53,6 +53,11 @@ func normalizeTicketRequest(req access.TicketRequest) (access.TicketRequest, err
 	if !validDeviceEndpoint(req.NodeAddr) || len(req.Path) > 512 || len(req.Query) > 1024 || len(req.PlanID) > 128 {
 		return req, ErrAccessTicket
 	}
+	// PlanAttempt 只在设备计划读取场景有意义：无 PlanID 或非 GET /objects
+	// 一律清零，保证新旧记录解码与比较语义一致（0 = legacy）。
+	if req.PlanID == "" || req.Method != http.MethodGet || !strings.HasPrefix(req.Path, "/objects/") {
+		req.PlanAttempt = 0
+	}
 	if req.Path == "" || req.Path[0] != '/' || strings.ContainsAny(req.Path, "\\\x00") || strings.Contains(req.Path, "//") {
 		return req, ErrAccessTicket
 	}
@@ -191,7 +196,7 @@ func validateDeviceTicketTx(tx *bolt.Tx, t accessTicketRecord, now time.Time) (t
 		if !planTargetAllowedTx(tx, t.Request.PlanID, d, sender.NodeID, now) || !types.ContainsUint64(d.Done, t.AudienceNodeID) || types.ContainsUint64(d.Suspect, t.AudienceNodeID) {
 			return types.ObjectIntegrity{}, ErrAccessTicket
 		}
-		if allowed, err := protectionSourceMatchesTx(tx, t.Request.PlanID, sender.NodeID, t.AudienceNodeID, now); err != nil || !allowed {
+		if allowed, err := protectionSourceMatchesTx(tx, t.Request.PlanID, sender.NodeID, t.AudienceNodeID, t.Request.PlanAttempt, now); err != nil || !allowed {
 			return types.ObjectIntegrity{}, ErrAccessTicket
 		}
 	case t.Request.Method == http.MethodPut && strings.HasPrefix(t.Request.Path, "/replicate/"):
@@ -314,7 +319,7 @@ func (s *Store) CheckAccessTicket(nodeSession string, req access.CheckRequest, n
 		if node.NodeID != ticket.AudienceNodeID || node.Identity != ticket.AudienceIdentity || node.Addr != ticket.Request.NodeAddr {
 			return ErrAccessTicket
 		}
-		normalized, err := normalizeTicketRequest(access.TicketRequest{NodeAddr: node.Addr, Method: req.Method, Path: req.Path, Query: req.Query, PlanID: req.PlanID, BodyHash: req.BodyHash})
+		normalized, err := normalizeTicketRequest(access.TicketRequest{NodeAddr: node.Addr, Method: req.Method, Path: req.Path, Query: req.Query, PlanID: req.PlanID, PlanAttempt: req.PlanAttempt, BodyHash: req.BodyHash})
 		if err != nil || normalized != ticket.Request {
 			return ErrAccessTicket
 		}

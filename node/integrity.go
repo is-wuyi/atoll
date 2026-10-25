@@ -109,7 +109,10 @@ func (n *Node) replicationPlan(ctx context.Context, objectID uint64, planID ...s
 	}
 	if plan.Transfer != nil {
 		t := plan.Transfer
-		if wantPlan == "" || t.SourceID == 0 || t.TargetID != uint64(n.nodeID.Load()) || t.ExpiresAt != d.PlanLeaseUntil || !types.ContainsUint64(d.Done, t.SourceID) || types.ContainsUint64(d.Suspect, t.SourceID) || t.UploadBPS > 1<<40 || t.DownloadBPS > 1<<40 {
+		// feedback 计划：票据/传输绑定的 attempt 必须与 descriptor 一致，旧尝试
+		// 的绑定整体失效。legacy 计划（双方 PlanAttempt 均为 0）不比较。
+		attemptMismatch := d.PlanAttempt > 0 && t.PlanAttempt != d.PlanAttempt
+		if wantPlan == "" || t.SourceID == 0 || t.TargetID != uint64(n.nodeID.Load()) || t.ExpiresAt != d.PlanLeaseUntil || attemptMismatch || !types.ContainsUint64(d.Done, t.SourceID) || types.ContainsUint64(d.Suspect, t.SourceID) || t.UploadBPS > 1<<40 || t.DownloadBPS > 1<<40 {
 			return plan, fmt.Errorf("invalid source-bound replica transfer")
 		}
 	}

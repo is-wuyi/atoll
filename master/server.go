@@ -151,6 +151,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /files/replicated/verified", s.handleVerifiedReplica)
 	mux.HandleFunc("POST /files/replicated/present", s.handlePresentReplica)
 	mux.HandleFunc("POST /files/objects/suspect", s.handlePhysicalSuspect)
+	mux.HandleFunc("POST /files/protection/progress", s.handleProtectionProgress) // 目标节点进度/失败反馈
 	mux.HandleFunc("POST /files/chunks/suspect", s.handleChunkSuspect)
 	mux.HandleFunc("POST /files/suspect", s.handleReportSuspect) // 版本校验后标记整对象副本待修
 	mux.HandleFunc("POST /files/small", s.handleCreateSmall)     // 小文件单请求通道（v2-2a）

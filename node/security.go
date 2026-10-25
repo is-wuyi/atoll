@@ -651,17 +651,30 @@ func (s *nodeSecurity) authorizePeer(req *http.Request) error {
 	if planID == "" {
 		planID = req.URL.Query().Get("plan_id")
 	}
+	// 计划读取携带 attempt 序号：旧尝试的票据在 master 侧被拒（claim 已递增
+	// Attempts）。仅在计划 GET /objects 时携带，其余请求保持空。
+	planAttempt := uint32(0)
+	if planID != "" && req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/objects/") {
+		if raw := req.Header.Get(access.PlanAttemptHeader); raw != "" {
+			if v, err := strconv.ParseUint(raw, 10, 32); err == nil {
+				planAttempt = uint32(v)
+			} else {
+				return fmt.Errorf("node security: invalid plan attempt header %q", raw)
+			}
+		}
+	}
 	bodyHash, err := controlBodyHash(req)
 	if err != nil {
 		return fmt.Errorf("node security: control body hash: %w", err)
 	}
 	ticketReq := access.TicketRequest{
-		NodeAddr: req.URL.Host,
-		Method:   req.Method,
-		Path:     req.URL.Path,
-		Query:    req.URL.RawQuery,
-		PlanID:   planID,
-		BodyHash: bodyHash,
+		NodeAddr:    req.URL.Host,
+		Method:      req.Method,
+		Path:        req.URL.Path,
+		Query:       req.URL.RawQuery,
+		PlanID:      planID,
+		PlanAttempt: planAttempt,
+		BodyHash:    bodyHash,
 	}
 	var tk access.Ticket
 	sent, _ := s.snapshot()
@@ -826,6 +839,14 @@ func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 		if planID == "" {
 			planID = r.URL.Query().Get("plan_id") // query 只允许 plan_id 参与绑定
 		}
+		planAttempt := uint32(0)
+		if planID != "" && r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/objects/") {
+			if raw := r.Header.Get(access.PlanAttemptHeader); raw != "" {
+				if v, perr := strconv.ParseUint(raw, 10, 32); perr == nil {
+					planAttempt = uint32(v)
+				}
+			}
+		}
 		bodyHash := ""
 		_, retirement := types.RetirementPathID(r.URL.Path)
 		if r.Method == http.MethodPost && (r.URL.Path == "/pull" || retirement) {
@@ -850,12 +871,13 @@ func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 		// /verify 无 body（BodyHash 空）；GET/DELETE /objects、/replicate 等
 		// payload 请求 BodyHash 一律空，由票据在 master 侧按成员关系核验。
 		res, err := s.checkTicket(r.Context(), access.CheckRequest{
-			Token:    tok,
-			Method:   r.Method,
-			Path:     r.URL.Path,
-			Query:    r.URL.RawQuery,
-			PlanID:   planID,
-			BodyHash: bodyHash,
+			Token:       tok,
+			Method:      r.Method,
+			Path:        r.URL.Path,
+			Query:       r.URL.RawQuery,
+			PlanID:      planID,
+			PlanAttempt: planAttempt,
+			BodyHash:    bodyHash,
 		})
 		if err != nil {
 			if errors.Is(err, errCheckDenied) {

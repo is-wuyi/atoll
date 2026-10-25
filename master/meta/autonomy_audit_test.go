@@ -266,13 +266,35 @@ func TestAuditCancelKeepsAttemptedReservationAndClaimLeases(t *testing.T) {
 	if again != nil {
 		t.Fatalf("target re-dispatched inside lease window: %+v", again)
 	}
-	// A receipt with a mismatched lease must be rejected.
+	// A receipt with a mismatched attempt must be rejected (feedback plans fence
+	// on the claim attempt; the lease timestamp alone is advisory).
 	desc, err := s.ProtectionDescriptor(plan.ID, d.ObjectID, t1.NodeID)
 	if err != nil {
 		t.Fatalf("descriptor: %v", err)
 	}
-	wrongLease := desc
-	wrongLease.PlanLeaseUntil = desc.PlanLeaseUntil.Add(time.Second)
+	wrongAttempt := desc
+	wrongAttempt.PlanAttempt = desc.PlanAttempt + 1
+	if ok, err := s.MarkVerifiedObjectDone(wrongAttempt, t1.NodeID); ok || err != nil {
+		t.Fatalf("mismatched attempt receipt accepted: %v %v", ok, err)
+	}
+	// A legacy plan (no AttemptToken) keeps the lease-equality fence.
+	legacyDesc, err := s.ProtectionDescriptor(plan.ID, d.ObjectID, t1.NodeID)
+	if err != nil {
+		t.Fatalf("legacy descriptor: %v", err)
+	}
+	if err := s.write(func(w *txw) error {
+		p, err := planTx(w.tx, plan.ID)
+		if err != nil {
+			return err
+		}
+		p.Targets[0].AttemptToken = ""
+		return putAutonomy(w, "plan", p.ID, p)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wrongLease := legacyDesc
+	wrongLease.PlanAttempt = 0
+	wrongLease.PlanLeaseUntil = legacyDesc.PlanLeaseUntil.Add(time.Second)
 	if ok, err := s.MarkVerifiedObjectDone(wrongLease, t1.NodeID); ok || err != nil {
 		t.Fatalf("mismatched lease receipt accepted: %v %v", ok, err)
 	}
@@ -399,6 +421,7 @@ func TestAuditDurabilityOfPlanTransitions(t *testing.T) {
 	desc := d
 	desc.PlanID = req.ID
 	desc.PlanLeaseUntil = target.NextAttempt
+	desc.PlanAttempt = target.Attempts
 	if _, err := s.MarkVerifiedObjectDone(desc, target.NodeID); err == nil {
 		t.Fatal("receipt bypassed durability")
 	}
