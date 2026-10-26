@@ -76,17 +76,22 @@ go build -o atoll ./cmd/atoll
 5. **验证后发布**：临时目标不在公开副本集中。目标完整落盘并提交带对象、计划和租约身份的 verified 回执后，Master 才在一个事务内追加 Replicas/Done、推进代际并更新计划进度。不会把“已派发”当成“已完成”。
 6. **重启与迟到任务**：计划、预留、claim 和进度写入数据库及 WAL。重启继续同一计划；内容/布局/资料变化、租约过期或错误目标回执都不能发布新副本。重试确认仍检查 `EnsureDurable`。
 
-同一个计划有多个目标时，一个目标发布会推进完整性代际，其他较早取得描述的回执可能被拒。后续重试重新取得描述，并优先验证已经落盘的数据，而不是放松版本条件。
+同一计划多个目标并行时，目标完成会推进计划的完整性游标。反馈保留本次 claim 的 epoch 基线，只接受基线至当前计划游标之间的值；当前对象仍须与计划游标完全一致。目标在最终回执前刷新描述符，并复核同一对象、内容代、尝试序号和 token，不能把内容变化混成兄弟目标完成。
 
-### 进度反馈与有界租约续期
+### 进度反馈与自适应传输
 
-- 每次 claim 生成独立 `AttemptToken` 并随租约持久化；目标节点的进度反馈、访问票据与最终回执都绑定 (计划, 尝试序号, token)。新 claim 递增 `Attempts` 并重生成 token，被取代尝试的所有反馈与票据立即失效，不依赖时间戳比较。
-- 目标节点通过 `POST /files/protection/progress`（设备会话授权，`node_id` 必须等于上报设备）上报实际读入字节、测量 goodput 与失败类别（`failed`/`corrupt`）。进度报告**不写 Done、不发布副本、不释放容量预留**。
-- 慢而持续前进的传输可获**有界续租**：仅当测量 goodput 显示剩余租约不足以完成剩余字节时延长，受单尝试续租次数（默认 8）与总租约时长（默认 30 分钟）双重上限；节点侧另有 5 分钟硬上界不因此放宽授权，但 feedback 计划（descriptor 带 `PlanAttempt>0`）的 /pull 不再被首 descriptor 的租约截止切断。goodput 未知时不续租（不把配置预算当测量值）。legacy 计划（token 空）维持原"租约截止即网络截止"语义与 `PlanLeaseUntil` 严格相等 fence。
-- `failed`/`corrupt` 反馈把当前尝试的租约收敛到当下（数据流已结束），下一次合法 claim 可立即重新选源；corrupt 仍走既有 suspect 上报路径。执行器**绝不静默换绑**——换源只发生在新有效 claim 的源选择事务里。
-- descriptor 与传输绑定现在在同一个只读事务内返回（`ProtectionPlanSnapshot`），续租不会再落在两次读之间造成节点误拒。
-- `/pull` 去重身份是 (对象, 计划, 尝试)：相同身份幂等 202，不同计划/尝试返回 409，master 不会把未启动的新传输误当已派工。
-- `AutonomyReport` 新增 attempted/succeeded/failed/corrupt/bytes_done 聚合（反馈统计，非派工数）。
+在隔离数据库显式开启 `atoll master -autonomy add -protection-feedback`。`protection-feedback-v1` 能力标记写入 bbolt/WAL；默认关闭，数据库已开启但重启漏开关或标记损坏时拒绝启动。开启前已预留的 legacy 计划保持旧 fence。`d21599f` 曾生成 token 但没有能力标记的数据库，需要显式带此开关迁移，不静默降级；先升级节点，旧节点缺少新 token 字段会被拒绝。
+
+- 每次 feedback claim 持久化独立 `AttemptToken`、递增 `Attempts`，冻结尝试 epoch 和硬总截止。描述符、GET 数据票据、进度报告和最终回执都绑定尝试身份。token 不授予权限，设备会话仍是授权来源。
+- `POST /files/protection/progress` 只允许设备报告自己的 `node_id`，校验对象/代际/尝试及单调 payload 字节。Master 用累计字节与自己的 claim 时钟计算应用 goodput，不把节点自报速率或配置预算当成已测吞吐。进度**不写 Done、不发布副本、不释放容量预留**。
+- `internal/scheduler.DecideTransferFlight` 是无网络、数据库和隐含时钟的纯决策器；`ValidateTransferDecision` 独立复核身份、源资格、方向性观测、共享上下行预算、并发、期限和估计值。决策为 `keep`、`renew`、`reassign`、`defer`。
+- `renew` 只在租约接近截止、实际字节前进、测得剩余传输能在硬总截止内完成（含余量）时发生。默认每次续期窗口 4 分钟、最多 8 次、尝试总长最高 30 分钟，不按每个心跳提前耗尽额度。`defer` 不立即杀掉仍获授权的数据流，但不会替它续租或虚报可完成。
+- 节点分别约束当前授权租约、body 阶段一分钟无 payload 进展的空闲界和本次尝试的硬总截止；确认续租仅推进租约，永不推进硬截止。feedback 拉取不再被固定 5 分钟总截止截断。legacy 计划仍用 5 分钟上界及原租约截止，回执保持 `PlanLeaseUntil` 严格相等。
+- 已结束的 `failed`/`corrupt` 报告终止当前授权租约并记录末次字节；独立 `RetryAt` 提供 5 秒起、最高 5 分钟的指数退避，容量预留不释放。corrupt 仍走 suspect 路径。换源只发生在新 claim，执行器不在飞行中偷偷换绑。
+- 反馈通过已绑定来源/目标进入方向性短 TTL 观测，不依赖新写规划开关。新 claim 优先按实测 goodput 估计完成成本，没有测量时只作显式未知的预算估算；分配速率仍由预算决定。健康探测的零吞吐记录不能覆盖或延长新鲜的 payload 测量/失败证据。
+- descriptor 与传输绑定通过 `ProtectionPlanSnapshot` 在单读事务内返回。`/pull` 用单个原子去重表按 (对象, 计划, 尝试) 判断；相同身份 202，不同身份 409。
+
+本节不意味着原写入计划中途改路线、单对象断点续传或全局最优已实现。节点空闲检测包括应用消费阶段停顿，不承诺区分网络、限速或磁盘卡顿，也不能中断操作系统卡住的 fsync。高并发时每次持久反馈会增加 WAL 同步负担，当前有界并发下验收，不宣称规模性能。
 
 ### 取消与不确定字节
 

@@ -20,6 +20,9 @@ func progressFixture(t *testing.T) (*Server, *meta.Store, meta.ProtectionPlan, *
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
+	if err := store.EnableProtectionFeedback(); err != nil {
+		t.Fatal(err)
+	}
 	srv := NewServer(store, time.Hour)
 	var ids []uint64
 	for i := 0; i < 3; i++ {
@@ -77,7 +80,7 @@ func TestProtectionProgressEndpointRecordsAndRejects(t *testing.T) {
 		h.ServeHTTP(w, req)
 		return w.Code
 	}
-	good := map[string]any{"plan_id": plan.ID, "object_id": plan.Expected.ObjectID, "node_id": target.NodeID, "attempt": target.Attempts, "bytes_done": 10, "goodput_bps": 5}
+	good := map[string]any{"plan_id": plan.ID, "object_id": plan.Expected.ObjectID, "generation": plan.Expected.Generation, "integrity_epoch": plan.Expected.IntegrityEpoch, "node_id": target.NodeID, "attempt": target.Attempts, "attempt_token": target.AttemptToken, "bytes_done": 10, "goodput_bps": 5}
 	if code := post(good); code != http.StatusOK {
 		t.Fatalf("valid progress = %d", code)
 	}
@@ -101,7 +104,7 @@ func TestProtectionProgressEndpointRecordsAndRejects(t *testing.T) {
 		t.Fatalf("progress not persisted: %+v", got.Targets[0])
 	}
 	// 失败类别收敛租约但不写 Done。
-	fail := map[string]any{"plan_id": plan.ID, "object_id": plan.Expected.ObjectID, "node_id": target.NodeID, "attempt": target.Attempts, "failure_kind": "failed", "message": "stalled"}
+	fail := map[string]any{"plan_id": plan.ID, "object_id": plan.Expected.ObjectID, "generation": plan.Expected.Generation, "integrity_epoch": plan.Expected.IntegrityEpoch, "node_id": target.NodeID, "attempt": target.Attempts, "attempt_token": target.AttemptToken, "bytes_done": 10, "failure_kind": "failed", "message": "stalled"}
 	if code := post(fail); code != http.StatusOK {
 		t.Fatalf("failure report = %d", code)
 	}

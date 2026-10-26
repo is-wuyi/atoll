@@ -36,7 +36,9 @@ CLI 的节点、客户端 put 和 mount 支持 `-upload-bps`、`-download-bps`�
 
 来源、上下行分配和租约在 claim 事务内持久保存。活跃任务按来源上行与目标下行分别核算；首任务不能占满全部目标预算阻止其他来源。来源失效必须先结束旧尝试，再经新有效租约重新分配，不在执行器内偷偷换掉绑定来源。完成文件的副本布局仍按实际块表描述，不虚称一半数据已是一个完整副本。
 
-目标节点会向 Master 反馈实际读入字节与测量 goodput（`POST /files/protection/progress`，见 [AUTONOMY.md](AUTONOMY.md)）；慢而持续前进的复制可在测量依据与双重上限内获得租约续期，避免慢链路传输每到固定租约截止就从零重传。反馈不写 Done、不释放预留，失败（failed/corrupt）会把当前尝试的租约收敛到当下以便尽快重选源。`/pull` 按 (对象, 计划, 尝试) 去重，不同尝试的重复派工显式 409。
+在 `-protection-feedback` 显式启用的计划中，目标节点通过 `POST /files/protection/progress` 反馈实际 payload 字节。Master 按自己的 claim 时钟计算应用 goodput，并调用纯函数 `DecideTransferFlight` 和独立 `ValidateTransferDecision`：持续前进且能在硬总截止内完成的尝试，在租约接近截止时可有界续租；未知测量不伪装成速度。节点分开执行授权租约、body 空闲界和最高 30 分钟硬总截止，不再以旧 5 分钟截止掐断 feedback 慢流。见 [AUTONOMY.md](AUTONOMY.md)。
+
+方向性实测与失败进入短 TTL 观测，新 claim 据此选择健康来源；配置预算仍是速率分配硬边界，不随测量被改写。没有测量时退化为明确未知的保守预算估算。失败终止本尝试授权，并设置有界指数退避；容量预留不释放。健康探测不覆盖新鲜的 payload 速度或失败证据。`/pull` 按 (对象, 计划, 尝试) 原子去重，不同尝试 409，换源只发生在旧尝试结束后的合法 claim。此批不改变布局、确认集合、CRC 或发布条件。
 
 第一版按现有不可变块分工。没有单对象内部的 Range 拼装，没有 EC/COW 编码器，也不是 BitTorrent 公开 swarm。小对象仍可单源，不为并行制造重复流量。
 

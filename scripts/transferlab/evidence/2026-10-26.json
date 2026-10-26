@@ -1,0 +1,225 @@
+{
+  "date": "2026-10-26",
+  "base_commit": "d21599f",
+  "branch": "feat/admin-console",
+  "run_id": "slow-flight-4625852803df",
+  "linux_runner_sha256": "f97f24e2d4db7920a6b5b11645de8ac1d392f4a0c1003f75ee2c803904843387",
+  "path_kind": "EasyTier overlay HTTP; not proof of public-only direct P2P",
+  "confirmation_conditions_changed": false,
+  "local_validation": {
+    "root_race": "passed",
+    "affected_race": "passed",
+    "vet": "passed",
+    "new_regressions": "passed",
+    "peer_integration_race": "passed with integration build tag",
+    "peer_prototype_race": "passed",
+    "fuse_kernel_mount": "not run in this batch"
+  },
+  "seed": {
+    "started_at": "2026-10-25T23:36:54.187309642Z",
+    "finished_at": "2026-10-25T23:39:13.388420015Z",
+    "exit": 0,
+    "scenarios": [
+      {
+        "name": "one-ingress",
+        "status": "passed",
+        "detail": {
+          "chunks": {
+            "1099511627776": {
+              "done": [
+                2,
+                3
+              ],
+              "object_id": 1099511627776,
+              "replicas": [
+                2,
+                3
+              ],
+              "size": 67108864
+            },
+            "1099511627777": {
+              "done": [
+                2,
+                3
+              ],
+              "object_id": 1099511627777,
+              "replicas": [
+                2,
+                3
+              ],
+              "size": 16777216
+            }
+          },
+          "ingress_leg_events": {
+            "chunk-0->B": {
+              "body_bytes": "67108864",
+              "duration_ms": "65070",
+              "end_utc": "2026-10-25T23:38:51.40052515Z",
+              "start_utc": "2026-10-25T23:37:46.330040287Z"
+            },
+            "chunk-1->B": {
+              "body_bytes": "16777216",
+              "duration_ms": "16987",
+              "end_utc": "2026-10-25T23:37:36.774336363Z",
+              "start_utc": "2026-10-25T23:37:19.786743622Z"
+            }
+          },
+          "sha256": "b389dd32763fb50683cb298879d86c47977a211efad7354158cefaa40b7bdc2a"
+        },
+        "started_at": "2026-10-25T23:36:54.194074163Z",
+        "finished_at": "2026-10-25T23:39:13.272929605Z"
+      }
+    ],
+    "notes": [
+      "已归档 6 条节点事件到 /root/.atoll-slow-flight-4625852803df/seed-report.json.events.ndjson"
+    ]
+  },
+  "slow_copy": {
+    "status": "passed",
+    "initial_lease_seconds": 180,
+    "target_download_budget_bps": 262144,
+    "objects": [
+      {
+        "object_id": 1099511627777,
+        "bytes": 16777216,
+        "source_host": "29038.et.net",
+        "target_host": "28425.et.net",
+        "source_id": 3,
+        "target_id": 4,
+        "attempts": 1,
+        "renewals": 2,
+        "state": "completed",
+        "source_get": {
+          "start_utc": "2026-10-25T23:40:10.457879879Z",
+          "end_utc": "2026-10-25T23:46:53.65719428Z",
+          "duration_ms": 403199,
+          "body_bytes": 16777216,
+          "node_id": 3,
+          "label": "B",
+          "method": "GET",
+          "path": "/objects/1099511627777"
+        },
+        "get_window_bytes_per_second": 41610.262,
+        "last_master_goodput_bps": 40868,
+        "last_reported_progress_bytes": 16567356,
+        "progress_samples": 81,
+        "sha256": "f703276d0fddbb223a7afb220b20eb3541cdf82c280c26a9869cd7c3b2114116"
+      },
+      {
+        "object_id": 1099511627776,
+        "bytes": 67108864,
+        "source_host": "29663.et.net",
+        "target_host": "28425.et.net",
+        "source_id": 2,
+        "target_id": 4,
+        "attempts": 1,
+        "renewals": 2,
+        "state": "completed",
+        "source_get": {
+          "start_utc": "2026-10-25T23:40:10.371316904Z",
+          "end_utc": "2026-10-25T23:48:38.360069491Z",
+          "duration_ms": 507988,
+          "body_bytes": 67108864,
+          "node_id": 2,
+          "label": "A",
+          "method": "GET",
+          "path": "/objects/1099511627776"
+        },
+        "get_window_bytes_per_second": 132107.184,
+        "last_master_goodput_bps": 130886,
+        "last_reported_progress_bytes": 66795893,
+        "progress_samples": 81,
+        "sha256": "588ad039cae26007b2680d3ea9938ae71bc3ed271474461d08a0adbde35a7e00"
+      }
+    ],
+    "file_sha256": "b389dd32763fb50683cb298879d86c47977a211efad7354158cefaa40b7bdc2a",
+    "independent_target_readback": {
+      "status": "passed",
+      "objects": [
+        {
+          "object_id": 1099511627776,
+          "bytes": 67108864,
+          "sha256": "588ad039cae26007b2680d3ea9938ae71bc3ed271474461d08a0adbde35a7e00",
+          "readback_seconds": 16.197012741002254,
+          "size_matches": true
+        },
+        {
+          "object_id": 1099511627777,
+          "bytes": 16777216,
+          "sha256": "f703276d0fddbb223a7afb220b20eb3541cdf82c280c26a9869cd7c3b2114116",
+          "readback_seconds": 4.310876850970089,
+          "size_matches": true
+        }
+      ],
+      "file_sha256": "b389dd32763fb50683cb298879d86c47977a211efad7354158cefaa40b7bdc2a",
+      "expected_sha256": "b389dd32763fb50683cb298879d86c47977a211efad7354158cefaa40b7bdc2a"
+    }
+  },
+  "fault_recovery": {
+    "status": "passed",
+    "plan_id": "lab-314adf68-o1099511628544",
+    "first_source": 2,
+    "rebound_source": 3,
+    "first_attempt": 2,
+    "attempts": 3,
+    "bytes": 262144,
+    "sha256": "8b8171d45296fe5f26692c828c38eaeb5c9a6054cc210b6aa111ff034784e056",
+    "elapsed_seconds": 9.303378197015263
+  },
+  "fault_initial_response_timeout": {
+    "attempt": 1,
+    "status": "failed",
+    "cause": "30 second response header timeout after injected 60 second delay; preserved"
+  },
+  "original_confirmations_after_fault": [
+    3,
+    2,
+    4
+  ],
+  "evidence_hashes": {
+    "seed-report.json": {
+      "bytes": 1596,
+      "sha256": "67378c86e6b20b076d4b117c7036012acc73209499765522746821a902a468e4"
+    },
+    "seed-report.json.events.ndjson": {
+      "bytes": 1351,
+      "sha256": "0aad44fa844f3ab3cbd88ce33c6591db8640c630102f3d9ca97e86b7f00ddb84"
+    },
+    "protection-report.json": {
+      "bytes": 1142,
+      "sha256": "dcccea87fb92d15b7a7c0efd7a99e076b238bd3cfec53ff06722572872f62acf"
+    },
+    "protection-report.json.events.ndjson": {
+      "bytes": 3365,
+      "sha256": "1e5e349252be0035531e5d6d8f681a1306c5b4859f19e106b2752fb58e66bad4"
+    },
+    "protection-samples.ndjson": {
+      "bytes": 377574,
+      "sha256": "9a5393295318bbf8383907cc6b2d6745d52eed75ab035ca3e9e8fd42537916f1"
+    }
+  },
+  "cleanup": {
+    "status": "passed",
+    "removed_directories": {
+      "26666.et.net": "/root/.atoll-slow-flight-4625852803df",
+      "29663.et.net": "/volume1/homes/jimo/.atoll-slow-flight-4625852803df",
+      "29038.et.net": "/volume1/.atoll-slow-flight-4625852803df (empty owned root; removed with required parent permission after uid/no-symlink/empty verification)",
+      "28425.et.net": "/volume2/homes/jimo/.atoll-slow-flight-4625852803df"
+    },
+    "temporary_firewall_rule": "removed; permanent 29460 query remains closed",
+    "formal_health_after": {
+      "26666.et.net:9420": 200,
+      "29038.et.net:9421": 200,
+      "28425.et.net:9421": 200,
+      "29663.et.net:9421": "URLError — host has no formal node process or data directory (pre-existing state, unrelated to this batch)"
+    },
+    "easytier_restarted": false,
+    "formal_services_replaced": false
+  },
+  "remaining": {
+    "range_resume": false,
+    "active_attempt_source_switch": false,
+    "public_only_direct_proven": false,
+    "previous_27119_residue_cleaned": false
+  }
+}

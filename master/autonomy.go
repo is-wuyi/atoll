@@ -51,9 +51,10 @@ type AutonomyConfig struct {
 	MaxReplicas          int    `json:"max_replicas"`
 	// 进度反馈续租策略：同一次尝试只在测量 goodput 表明剩余租约不够完成剩余字节时
 	// 延长租约，且受次数与总长双上限。0 值禁用续租（进度仍记录，失败仍收敛租约）。
-	LeaseRenewWindow  time.Duration `json:"lease_renew_window"`
-	MaxLeaseRenewals  uint32        `json:"max_lease_renewals"`
-	MaxLeaseTotalTime time.Duration `json:"max_lease_total_time"`
+	LeaseRenewWindow   time.Duration `json:"lease_renew_window"`
+	MaxLeaseRenewals   uint32        `json:"max_lease_renewals"`
+	MaxLeaseTotalTime  time.Duration `json:"max_lease_total_time"`
+	ProtectionFeedback bool          `json:"protection_feedback"`
 }
 
 type AutonomyDecision struct {
@@ -70,9 +71,7 @@ type AutonomyReport struct {
 	ObservedNodes int                `json:"observed_nodes"`
 	Decisions     []AutonomyDecision `json:"decisions"`
 	Dispatched    int                `json:"dispatched"`
-	// Attempted/Succeeded/Failed/Corrupt 是本 tick 内完成尝试的计数（进度反馈
-	// 聚合，非派工数）；BytesDone 是本 tick 报告的实际读入字节之和。测量值，
-	// 不是配置预算。
+	// These counters summarize the visible plan snapshot, not per-tick deltas.
 	Attempted int    `json:"attempted"`
 	Succeeded int    `json:"succeeded"`
 	Failed    int    `json:"failed"`
@@ -82,16 +81,17 @@ type AutonomyReport struct {
 }
 
 type Autonomy struct {
-	store      *meta.Store
-	nodeMaxAge time.Duration
-	config     AutonomyConfig
-	http       *http.Client
-	scheme     string
-	stepMu     sync.Mutex
-	mu         sync.Mutex
-	last       AutonomyReport
-	wg         sync.WaitGroup
-	startOnce  sync.Once
+	store                *meta.Store
+	nodeMaxAge           time.Duration
+	config               AutonomyConfig
+	http                 *http.Client
+	scheme               string
+	stepMu               sync.Mutex
+	mu                   sync.Mutex
+	last                 AutonomyReport
+	transferObservations func(time.Time) []scheduler.LinkObservation
+	wg                   sync.WaitGroup
+	startOnce            sync.Once
 }
 
 func NewAutonomy(store *meta.Store, nodeMaxAge time.Duration, cfg AutonomyConfig) (*Autonomy, error) {
@@ -116,8 +116,7 @@ func NewAutonomy(store *meta.Store, nodeMaxAge time.Duration, cfg AutonomyConfig
 	if cfg.RetryInterval == 0 {
 		cfg.RetryInterval = 5 * time.Minute
 	}
-	// 续租默认开启且与节点 5min 硬上界对齐：一次 64MiB 尝试在慢链路上可被
-	// 有界延长（最多 8 次、总长 30min），不会无限占用。0 显式关闭。
+	// Feedback renewals are bounded independently from legacy pull timeouts.
 	if cfg.LeaseRenewWindow == 0 {
 		cfg.LeaseRenewWindow = 4 * time.Minute
 	}
@@ -150,8 +149,15 @@ func NewAutonomy(store *meta.Store, nodeMaxAge time.Duration, cfg AutonomyConfig
 		cfg.MaxBytesPerRound <= 0 || cfg.MaxReplicas < 2 || cfg.MaxReplicas > 32 ||
 		cfg.MaxSourceConcurrent < 1 || cfg.MaxSourceConcurrent > 32 || cfg.MaxTargetConcurrent < 1 || cfg.MaxTargetConcurrent > 32 ||
 		cfg.MaxSourceUploadBPS > transferbudget.MaxRate || cfg.MaxTargetDownloadBPS > transferbudget.MaxRate ||
-		cfg.LeaseRenewWindow < 0 || cfg.MaxLeaseRenewals > 64 || cfg.MaxLeaseTotalTime > 0 && cfg.MaxLeaseTotalTime < cfg.RetryInterval {
+		cfg.LeaseRenewWindow < 0 || cfg.LeaseRenewWindow > 30*time.Minute || cfg.MaxLeaseRenewals > 64 || cfg.MaxLeaseTotalTime < 0 || cfg.MaxLeaseTotalTime > 30*time.Minute || cfg.MaxLeaseTotalTime > 0 && cfg.MaxLeaseTotalTime < cfg.RetryInterval {
 		return nil, errors.New("invalid autonomy resource bounds")
+	}
+	if cfg.ProtectionFeedback {
+		if err := store.EnableProtectionFeedback(); err != nil {
+			return nil, err
+		}
+	} else if enabled, err := store.ProtectionFeedbackEnabled(); err != nil || enabled {
+		return nil, errors.New("protection feedback database requires explicit enablement and intact capability")
 	}
 	return &Autonomy{store: store, nodeMaxAge: nodeMaxAge, config: cfg, http: &http.Client{Transport: auth.HTTPTransport("", nil, nil)}, scheme: "http"}, nil
 }
@@ -533,7 +539,7 @@ func (a *Autonomy) executePendingBudget(ctx context.Context, plans []meta.Protec
 			meta.ProtectionExecutionBudget{MaxConcurrent: a.config.MaxDispatchPerTick, MaxBytes: *remaining,
 				MaxSourceConcurrent: a.config.MaxSourceConcurrent, MaxTargetConcurrent: a.config.MaxTargetConcurrent,
 				MaxSourceUploadBPS: a.config.MaxSourceUploadBPS, MaxTargetDownloadBPS: a.config.MaxTargetDownloadBPS,
-				NodeMaxAge: a.nodeMaxAge})
+				NodeMaxAge: a.nodeMaxAge, MaxTotalLease: a.config.MaxLeaseTotalTime, Links: a.transferLinksAt(now), Path: a.scheme})
 		if err != nil {
 			return dispatched, err
 		}
@@ -559,9 +565,8 @@ func (a *Autonomy) executeTarget(ctx context.Context, plan meta.ProtectionPlan, 
 	if err != nil {
 		return err
 	}
-	// feedback 计划租约会按进度续租，master 侧派工不再用首 descriptor 的租约
-	// 截止收窄 ctx（续租后的 /pull 会因此被误杀）；节点侧仍有 5min 硬上界，
-	// 授权闸在票据与回执两处。legacy 计划保持原收窄语义。
+	// A feedback attempt keeps its persisted hard limit independently of renewable leases.
+	// Legacy dispatch remains fenced by the descriptor's original lease.
 	var cancel context.CancelFunc
 	if d.PlanAttempt == 0 {
 		ctx, cancel = context.WithDeadline(ctx, d.PlanLeaseUntil)
@@ -612,7 +617,7 @@ func (a *Autonomy) executeTarget(ctx context.Context, plan meta.ProtectionPlan, 
 		types.ContainsUint64(d.Suspect, n.ID) || time.Since(n.LastHeartbeat) > a.nodeMaxAge {
 		return errors.New("persisted protection source binding is invalid")
 	}
-	payload, _ := json.Marshal(map[string]any{"inode_id": d.ObjectID, "source_id": n.ID, "source_addr": n.Addr, "checksum": d.Checksum, "plan_id": plan.ID, "attempt": target.Attempts})
+	payload, _ := json.Marshal(map[string]any{"inode_id": d.ObjectID, "source_id": n.ID, "source_addr": n.Addr, "checksum": d.Checksum, "plan_id": plan.ID, "attempt": d.PlanAttempt, "object": d})
 	status, err = a.request(ctx, http.MethodPost, fmt.Sprintf("%s://%s/pull", a.scheme, target.Addr), payload)
 	if err != nil {
 		return err

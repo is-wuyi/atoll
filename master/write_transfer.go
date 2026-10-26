@@ -31,6 +31,31 @@ type transferLinkStore struct {
 	links map[string]scheduler.LinkObservation
 }
 
+func (s *Server) transferObservationsAt(now time.Time) []scheduler.LinkObservation {
+	s.transferLinks.mu.Lock()
+	defer s.transferLinks.mu.Unlock()
+	var links []scheduler.LinkObservation
+	for key, link := range s.transferLinks.links {
+		if !now.Before(link.ValidUntil) {
+			delete(s.transferLinks.links, key)
+			continue
+		}
+		links = append(links, link)
+	}
+	sort.Slice(links, func(i, j int) bool {
+		a, b := links[i], links[j]
+		return a.From+"\x00"+a.To+"\x00"+a.Path < b.From+"\x00"+b.To+"\x00"+b.Path
+	})
+	return links
+}
+
+func (a *Autonomy) transferLinksAt(now time.Time) []scheduler.LinkObservation {
+	if a.transferObservations == nil {
+		return nil
+	}
+	return a.transferObservations(now)
+}
+
 func (s *Server) RecordTransferObservation(observation types.TransferObservation, now time.Time) error {
 	if observation.FromNodeID == 0 || observation.ToNodeID == 0 || observation.FromNodeID == observation.ToNodeID {
 		return errors.New("node observation needs distinct assigned endpoints")
@@ -60,8 +85,14 @@ func (s *Server) RecordTransferObservation(observation types.TransferObservation
 			return errors.New("directional observation limit exceeded")
 		}
 	}
-	if old, exists := s.transferLinks.links[key]; exists && link.ObservedAt.Before(old.ObservedAt) {
-		return errors.New("out-of-order transfer observation")
+	if old, exists := s.transferLinks.links[key]; exists {
+		if link.ObservedAt.Before(old.ObservedAt) {
+			return errors.New("out-of-order transfer observation")
+		}
+		// A successful health probe carries no payload throughput and cannot erase a fresh transfer result.
+		if link.Available && link.ThroughputBPS == 0 && (!old.Available || old.ThroughputBPS > 0) {
+			return nil
+		}
 	}
 	s.transferLinks.links[key] = link
 	return nil
@@ -69,7 +100,13 @@ func (s *Server) RecordTransferObservation(observation types.TransferObservation
 
 func (s *Server) transferLink(observation types.TransferObservation, now time.Time) (scheduler.LinkObservation, error) {
 	var out scheduler.LinkObservation
-	if s.writePlanner == nil || !s.writePlanner.config.TransferPlanning || now.IsZero() || observation.ObservedAt.IsZero() || observation.ObservedAt.After(now.Add(time.Second)) || now.Sub(observation.ObservedAt) > s.writePlanner.config.TransferObservationTTL || math.IsNaN(observation.RTTMs) || math.IsInf(observation.RTTMs, 0) || observation.RTTMs < 0 || observation.ThroughputBPS > 1<<40 || (observation.Path != scheduler.TransferHTTP && observation.Path != scheduler.TransferHTTPS && observation.Path != scheduler.TransferDirect && observation.Path != scheduler.TransferRelay) {
+	ttl := 30 * time.Second
+	enabled := s.autonomy != nil && s.autonomy.config.ProtectionFeedback && observation.FromNodeID != 0
+	if s.writePlanner != nil && s.writePlanner.config.TransferPlanning {
+		enabled = true
+		ttl = s.writePlanner.config.TransferObservationTTL
+	}
+	if !enabled || now.IsZero() || observation.ObservedAt.IsZero() || observation.ObservedAt.After(now.Add(time.Second)) || now.Sub(observation.ObservedAt) > ttl || math.IsNaN(observation.RTTMs) || math.IsInf(observation.RTTMs, 0) || observation.RTTMs < 0 || observation.ThroughputBPS > 1<<40 || (observation.Path != scheduler.TransferHTTP && observation.Path != scheduler.TransferHTTPS && observation.Path != scheduler.TransferDirect && observation.Path != scheduler.TransferRelay) {
 		return out, errors.New("invalid or stale transfer observation")
 	}
 	if s.security != nil && observation.Path == scheduler.TransferHTTP {
@@ -79,7 +116,7 @@ func (s *Server) transferLink(observation types.TransferObservation, now time.Ti
 	if observation.FromNodeID != 0 {
 		from = strconv.FormatUint(observation.FromNodeID, 10)
 	}
-	return scheduler.LinkObservation{From: from, To: strconv.FormatUint(observation.ToNodeID, 10), Path: observation.Path, Available: observation.Available, RTTMs: observation.RTTMs, ThroughputBPS: observation.ThroughputBPS, Confidence: 1, ObservedAt: observation.ObservedAt, ValidUntil: observation.ObservedAt.Add(s.writePlanner.config.TransferObservationTTL)}, nil
+	return scheduler.LinkObservation{From: from, To: strconv.FormatUint(observation.ToNodeID, 10), Path: observation.Path, Available: observation.Available, RTTMs: observation.RTTMs, ThroughputBPS: observation.ThroughputBPS, Confidence: 1, ObservedAt: observation.ObservedAt, ValidUntil: observation.ObservedAt.Add(ttl)}, nil
 }
 
 func (s *Server) handleWriteTransferNodes(w http.ResponseWriter, r *http.Request) {

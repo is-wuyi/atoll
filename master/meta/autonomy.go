@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"atoll/internal/scheduler"
 	"atoll/pkg/transferbudget"
 	"atoll/pkg/types"
 	bolt "go.etcd.io/bbolt"
@@ -395,7 +396,11 @@ func (s *Store) ReserveProtection(req ProtectionRequest, now time.Time) (Protect
 		for _, c := range capacity {
 			free[c.NodeID] = c.Free
 		}
-		out = ProtectionPlan{ID: req.ID, InputHash: inputHash, ProfileRevision: req.ProfileRevision, State: ProtectionPending, Expected: current,
+		feedback, err := protectionFeedbackEnabledTx(w.tx)
+		if err != nil {
+			return err
+		}
+		out = ProtectionPlan{ID: req.ID, InputHash: inputHash, ProfileRevision: req.ProfileRevision, State: ProtectionPending, Feedback: feedback, Expected: current,
 			NodeMaxAge: req.NodeMaxAge, CreatedAt: now, UpdatedAt: now, Reason: req.Reason}
 		seen := map[uint64]bool{}
 		for _, id := range req.Targets {
@@ -454,7 +459,11 @@ func (s *Store) ProtectionDescriptor(planID string, objectID, nodeID uint64) (ty
 				}
 				allowed = node.Addr == t.Addr && (t.Done || time.Now().Before(t.NextAttempt))
 				result.PlanLeaseUntil = t.NextAttempt
-				result.PlanAttempt = t.Attempts
+				if t.AttemptToken != "" {
+					result.PlanAttempt = t.Attempts
+					result.PlanAttemptToken = t.AttemptToken
+					result.PlanHardUntil = protectionHardUntil(t)
+				}
 			}
 		}
 		if !allowed {
@@ -468,11 +477,11 @@ func (s *Store) ProtectionDescriptor(planID string, objectID, nodeID uint64) (ty
 			return ErrProtectionConflict
 		}
 		leaseUntil := result.PlanLeaseUntil
-		attempt := result.PlanAttempt
+		attempt, token, hard := result.PlanAttempt, result.PlanAttemptToken, result.PlanHardUntil
 		result = current
 		result.PlanID = planID
 		result.PlanLeaseUntil = leaseUntil
-		result.PlanAttempt = attempt
+		result.PlanAttempt, result.PlanAttemptToken, result.PlanHardUntil = attempt, token, hard
 		result.Replicas = appendUnique(append([]uint64(nil), current.Replicas...), nodeID)
 		return nil
 	})
@@ -533,7 +542,7 @@ func (s *Store) markProtectionDone(expected types.ObjectIntegrity, nodeID uint64
 		// （token 空，含 gate 开启前已存在的计划）保持 PlanLeaseUntil 严格相等。
 		t := &plan.Targets[idx]
 		if t.AttemptToken != "" {
-			if expected.PlanAttempt != t.Attempts || expected.PlanAttempt == 0 || !time.Now().Before(t.NextAttempt) {
+			if expected.PlanAttempt != t.Attempts || expected.PlanAttempt == 0 || expected.PlanAttemptToken != t.AttemptToken || !time.Now().Before(t.NextAttempt) {
 				return nil
 			}
 		} else if !expected.PlanLeaseUntil.Equal(t.NextAttempt) || !time.Now().Before(t.NextAttempt) {
@@ -813,6 +822,9 @@ func assignProtectionSourceTx(tx *bolt.Tx, plan *ProtectionPlan, target *Protect
 	if len(sources) == 0 {
 		return errNoProtectionSource
 	}
+	if plan.Feedback || target.AttemptToken != "" {
+		return assignFeedbackSourceTx(tx, plan, target, budget, view, now, sources)
+	}
 	targetBudget, err := endpointBudgetTx(tx, target.NodeID)
 	if err != nil {
 		return err
@@ -950,7 +962,7 @@ func budgetCeiling(b *ProtectionExecutionBudget) uint64 {
 // 时必须等于当前 Attempts，否则是已被新 claim 取代的旧尝试，拒绝；0（legacy 票据）
 // 对 legacy 目标放行，对 feedback 目标拒绝——旧版本节点不认识新 fence，宁可拒绝。
 // 只读 tx，供票据校验在已有写事务内调用。
-func protectionSourceMatchesTx(tx *bolt.Tx, planID string, senderNodeID, audienceNodeID uint64, ticketAttempt uint32, now time.Time) (bool, error) {
+func protectionSourceMatchesTx(tx *bolt.Tx, planID string, senderNodeID, audienceNodeID uint64, ticketAttempt uint32, now time.Time, ticketToken ...string) (bool, error) {
 	if planID == "" || audienceNodeID == 0 {
 		return true, nil
 	}
@@ -972,7 +984,7 @@ func protectionSourceMatchesTx(tx *bolt.Tx, planID string, senderNodeID, audienc
 		if t.SourceID == 0 {
 			return true, nil
 		}
-		if t.AttemptToken != "" && ticketAttempt != t.Attempts {
+		if t.AttemptToken != "" && (ticketAttempt != t.Attempts || len(ticketToken) != 1 || ticketToken[0] != t.AttemptToken) {
 			return false, nil
 		}
 		return t.SourceID == audienceNodeID, nil
@@ -1037,8 +1049,7 @@ func (s *Store) ProtectionTransfer(planID string, objectID, nodeID uint64) (*typ
 					return ErrProtectionConflict
 				}
 			}
-			out = &types.ReplicaTransfer{SourceID: t.SourceID, TargetID: t.NodeID, PlanAttempt: t.Attempts,
-				UploadBPS: t.UploadBPS, DownloadBPS: t.DownloadBPS, ExpiresAt: t.NextAttempt}
+			out = protectionTransfer(t)
 			return nil
 		}
 		return ErrProtectionConflict
@@ -1072,7 +1083,11 @@ func (s *Store) ProtectionPlanSnapshot(planID string, objectID, nodeID uint64) (
 				}
 				allowed = node.Addr == t.Addr && (t.Done || time.Now().Before(t.NextAttempt))
 				result.PlanLeaseUntil = t.NextAttempt
-				result.PlanAttempt = t.Attempts
+				if t.AttemptToken != "" {
+					result.PlanAttempt = t.Attempts
+					result.PlanAttemptToken = t.AttemptToken
+					result.PlanHardUntil = protectionHardUntil(t)
+				}
 			}
 		}
 		if !allowed {
@@ -1086,10 +1101,11 @@ func (s *Store) ProtectionPlanSnapshot(planID string, objectID, nodeID uint64) (
 			return ErrProtectionConflict
 		}
 		leaseUntil, attempt := result.PlanLeaseUntil, result.PlanAttempt
+		token, hard := result.PlanAttemptToken, result.PlanHardUntil
 		result = current
 		result.PlanID = planID
 		result.PlanLeaseUntil = leaseUntil
-		result.PlanAttempt = attempt
+		result.PlanAttempt, result.PlanAttemptToken, result.PlanHardUntil = attempt, token, hard
 		result.Replicas = appendUnique(append([]uint64(nil), current.Replicas...), nodeID)
 		if plan.State != ProtectionPending {
 			return nil
@@ -1121,8 +1137,7 @@ func (s *Store) ProtectionPlanSnapshot(planID string, objectID, nodeID uint64) (
 			if !types.ContainsUint64(plan.Expected.Done, t.SourceID) || types.ContainsUint64(plan.Expected.Suspect, t.SourceID) {
 				return ErrProtectionConflict
 			}
-			transfer = &types.ReplicaTransfer{SourceID: t.SourceID, TargetID: t.NodeID, PlanAttempt: t.Attempts,
-				UploadBPS: t.UploadBPS, DownloadBPS: t.DownloadBPS, ExpiresAt: t.NextAttempt}
+			transfer = protectionTransfer(t)
 			return nil
 		}
 		return ErrProtectionConflict
@@ -1184,7 +1199,7 @@ func (s *Store) ClaimProtectionTarget(planID string, now time.Time, retryAfter t
 		}
 		for i := range plan.Targets {
 			t := &plan.Targets[i]
-			if t.Done || now.Before(t.NextAttempt) {
+			if t.Done || now.Before(t.NextAttempt) || now.Before(t.RetryAt) {
 				continue
 			}
 			if t.Attempts == math.MaxUint32 {
@@ -1197,21 +1212,43 @@ func (s *Store) ClaimProtectionTarget(planID string, now time.Time, retryAfter t
 				}
 				return err
 			}
-			// 每次 claim 重生成 attempt token：旧尝试的进度、回执与票据同时失效，
-			// 不依赖时间戳不相等论证。上一尝试的反馈字段一并重置——重试从零开始。
-			token, err := secOpaque("pa1_")
+			feedback, err := protectionFeedbackEnabledTx(w.tx)
 			if err != nil {
 				return err
+			}
+			if (plan.Feedback || t.AttemptToken != "") && !feedback {
+				return errors.New("protection feedback capability is required")
+			}
+			token := ""
+			if plan.Feedback || t.AttemptToken != "" {
+				token, err = secOpaque("pa1_")
+				if err != nil {
+					return err
+				}
 			}
 			view.Leases++
 			t.Attempts++
 			t.AttemptToken = token
 			t.LeaseStart = now
+			t.AttemptIntegrityEpoch = plan.Expected.IntegrityEpoch
+			t.AttemptEpochKnown = true
+			t.HardUntil = time.Time{}
+			if token != "" {
+				total := 30 * time.Minute
+				if budget != nil && budget.MaxTotalLease != 0 {
+					total = budget.MaxTotalLease
+				}
+				if total < retryAfter || total > 30*time.Minute {
+					return errors.New("invalid protection attempt hard limit")
+				}
+				t.HardUntil = now.Add(total)
+			}
 			t.ProgressBytes = 0
 			t.LastProgressAt = time.Time{}
 			t.GoodputBPS = 0
 			t.Renewals = 0
 			t.FailureKind = ""
+			t.RetryAt = time.Time{}
 			t.NextAttempt = now.Add(retryAfter)
 			plan.UpdatedAt = now
 			copy := *t
@@ -1254,15 +1291,18 @@ func (s *Store) RecordProtectionError(planID string, nodeID uint64, message stri
 // FailureKind 为空表示进度报告；"failed" 表示本次尝试的传输已终止（网络/源/落盘
 // 失败），"corrupt" 表示内容校验失败（suspect 仍走既有独立上报，这里只记录类别）。
 type ProtectionProgressReport struct {
-	PlanID      string
-	ObjectID    uint64
-	NodeID      uint64
-	Attempt     uint32
-	BytesDone   int64
-	GoodputBPS  uint64
-	FailureKind string
-	Message     string
-	Now         time.Time
+	PlanID         string
+	ObjectID       uint64
+	NodeID         uint64
+	Attempt        uint32
+	BytesDone      int64
+	GoodputBPS     uint64
+	AttemptToken   string
+	Generation     uint64
+	IntegrityEpoch uint64
+	FailureKind    string
+	Message        string
+	Now            time.Time
 }
 
 // ProtectionRenewPolicy 约束同一次尝试的有界续租。Window<=0 表示只记录进度不续租；
@@ -1278,37 +1318,42 @@ type ProtectionRenewPolicy struct {
 // “报告被忽略”（计划已完成等，返回 nil, false）区分。
 var ErrProtectionProgress = errors.New("invalid protection progress report")
 
-// RecordProtectionProgress 记录一次进度或失败反馈，并按策略续租。
-// 返回 renewed 表示本次是否延长了租约。要点：
-//   - 只作用于 feedback 计划（AttemptToken 非空）且 attempt 必须等于当前 Attempts；
-//     旧尝试、legacy 计划的报告一律拒绝，不静默采纳。
-//   - 进度单调：BytesDone 小于已记录值是非法报告；超过对象大小同样非法。
-//   - 失败（failed/corrupt）把 NextAttempt 收敛到 now：数据流已结束，下一次合法
-//     claim 可以立即重选源。预留与在飞带宽照旧保留到窗口结束——不假释放。
-//   - 续租只在剩余租约不足以按测量 goodput 完成剩余字节时延长，且受次数与总长
-//     双重上限；goodput 未知时不续租（保守，不拿配置预算当测量值）。
-func (s *Store) RecordProtectionProgress(report ProtectionProgressReport, renew ProtectionRenewPolicy) (renewed bool, err error) {
+// RecordProtectionProgress never publishes data or releases capacity reservations.
+// A terminal failure ends the authorization lease; RetryAt separately bounds redispatch.
+// A renewal requires fresh forward progress within the attempt's persisted hard limit.
+func (s *Store) RecordProtectionProgress(report ProtectionProgressReport, renew ProtectionRenewPolicy) (bool, error) {
+	result, err := s.RecordProtectionProgressResult(report, renew)
+	return result.Renewed, err
+}
+
+func (s *Store) RecordProtectionProgressResult(report ProtectionProgressReport, renew ProtectionRenewPolicy) (result types.ProtectionProgressResult, err error) {
 	if report.Now.IsZero() {
 		report.Now = time.Now()
 	}
-	if report.PlanID == "" || report.ObjectID == 0 || report.NodeID == 0 ||
-		(report.FailureKind != "" && report.FailureKind != "failed" && report.FailureKind != "corrupt") ||
-		len(report.Message) > 512 || report.GoodputBPS > 1<<40 {
-		return false, ErrProtectionProgress
+	if report.PlanID == "" || report.ObjectID == 0 || report.NodeID == 0 || report.AttemptToken == "" || len(report.AttemptToken) > 128 || (report.FailureKind != "" && report.FailureKind != "failed" && report.FailureKind != "corrupt") || len(report.Message) > 512 || report.GoodputBPS > 1<<40 || renew.Window < 0 || renew.MaxRenewals > 64 || renew.MaxTotalLease < 0 || renew.MaxTotalLease > 30*time.Minute {
+		return result, ErrProtectionProgress
 	}
 	err = s.write(func(w *txw) error {
-		plan, perr := planTx(w.tx, report.PlanID)
-		if perr != nil {
-			if errors.Is(perr, ErrNotExist) {
-				return ErrProtectionProgress
-			}
-			return perr
+		enabled, e := protectionFeedbackEnabledTx(w.tx)
+		if e != nil {
+			return e
+		}
+		if !enabled {
+			return ErrProtectionProgress
+		}
+		plan, e := planTx(w.tx, report.PlanID)
+		if e != nil {
+			return ErrProtectionProgress
 		}
 		if plan.State != ProtectionPending {
-			// 已完成/已取消的计划不再接受反馈，也不是错误。
+			result.Action = scheduler.TransferDefer
 			return nil
 		}
-		if plan.Expected.ObjectID != report.ObjectID {
+		if plan.Expected.ObjectID != report.ObjectID || plan.ProfileRevision != profileRevisionTx(w.tx) {
+			return ErrProtectionProgress
+		}
+		current, e := integrityTx(w.tx, report.ObjectID)
+		if e != nil || !exactProtectionIdentity(current, plan.Expected) || report.Generation != plan.Expected.Generation {
 			return ErrProtectionProgress
 		}
 		idx := -1
@@ -1321,51 +1366,63 @@ func (s *Store) RecordProtectionProgress(report ProtectionProgressReport, renew 
 			return ErrProtectionProgress
 		}
 		t := &plan.Targets[idx]
-		if t.Done || t.AttemptToken == "" || t.Attempts == 0 || report.Attempt != t.Attempts {
+		attemptEpoch := t.AttemptIntegrityEpoch
+		if !t.AttemptEpochKnown {
+			attemptEpoch = plan.Expected.IntegrityEpoch
+		}
+		if report.IntegrityEpoch < attemptEpoch || report.IntegrityEpoch > plan.Expected.IntegrityEpoch {
 			return ErrProtectionProgress
 		}
-		if report.FailureKind != "" {
-			if !report.Now.Before(t.NextAttempt) {
-				// 租约已过期的失败报告无需收敛（下个 claim 本就可领）。
-				return nil
-			}
-			t.FailureKind = report.FailureKind
-			if report.Message != "" {
-				t.LastError = report.Message
-			}
-			t.NextAttempt = report.Now
-			plan.UpdatedAt = report.Now
-			return putAutonomy(w, "plan", plan.ID, plan)
-		}
-		if report.BytesDone < 0 || report.BytesDone > plan.Expected.Size ||
-			report.BytesDone < t.ProgressBytes {
+		if t.Done || t.AttemptToken == "" || t.Attempts == 0 || report.Attempt != t.Attempts || report.AttemptToken != t.AttemptToken || report.BytesDone < t.ProgressBytes || report.BytesDone > plan.Expected.Size || report.BytesDone < 0 || report.Now.Before(t.LastProgressAt) {
 			return ErrProtectionProgress
 		}
-		t.ProgressBytes = report.BytesDone
-		t.LastProgressAt = report.Now
-		if report.GoodputBPS > 0 {
-			t.GoodputBPS = report.GoodputBPS
+		result.SourceID, result.LeaseUntil, result.HardUntil = t.SourceID, t.NextAttempt, protectionHardUntil(*t)
+		if report.FailureKind == "" && (!report.Now.Before(t.NextAttempt) || !report.Now.Before(result.HardUntil)) {
+			result.Action = scheduler.TransferDefer
+			return nil
 		}
+		if t.FailureKind != "" && report.FailureKind != "" {
+			return nil
+		}
+		result.Recorded = true
+		previousBytes := t.ProgressBytes
+		// Derive the measurement from monotonic payload progress and the master clock.
+		if elapsed := report.Now.Sub(t.LeaseStart); report.BytesDone > 0 && elapsed >= time.Millisecond {
+			measured := float64(report.BytesDone) / elapsed.Seconds()
+			if measured > float64(transferbudget.MaxRate) {
+				measured = float64(transferbudget.MaxRate)
+			}
+			t.GoodputBPS = uint64(measured)
+		}
+		t.ProgressBytes, t.LastProgressAt = report.BytesDone, report.Now
+		result.GoodputBPS = t.GoodputBPS
 		if report.Message != "" {
 			t.LastError = report.Message
 		}
-		if renew.Window > 0 && renew.MaxRenewals > 0 && t.Renewals < renew.MaxRenewals &&
-			report.GoodputBPS > 0 && report.BytesDone < plan.Expected.Size &&
-			report.Now.Before(t.NextAttempt) {
-			remaining := plan.Expected.Size - report.BytesDone
-			needSeconds := float64(remaining) / float64(report.GoodputBPS)
-			if needSeconds > time.Until(t.NextAttempt).Seconds() {
-				candidate := report.Now.Add(renew.Window)
-				if renew.MaxTotalLease > 0 && !t.LeaseStart.IsZero() &&
-					candidate.Sub(t.LeaseStart) > renew.MaxTotalLease {
-					candidate = t.LeaseStart.Add(renew.MaxTotalLease)
-				}
-				if candidate.After(t.NextAttempt) {
-					t.NextAttempt = candidate
-					t.Renewals++
-					renewed = true
-				}
-			}
+		if report.FailureKind != "" {
+			t.FailureKind = report.FailureKind
+			t.NextAttempt = report.Now
+			t.RetryAt = report.Now.Add(protectionFailureBackoff(t.Attempts))
+			result.Action, result.LeaseUntil = scheduler.TransferReassign, t.NextAttempt
+			plan.UpdatedAt = report.Now
+			return putAutonomy(w, "plan", plan.ID, plan)
+		}
+		hard := result.HardUntil
+		path := scheduler.TransferHTTP
+		renewBefore := min(renew.Window/3, time.Minute)
+		state := scheduler.TransferFlightState{PlanID: plan.ID, ObjectID: plan.Expected.ObjectID, Generation: plan.Expected.Generation, IntegrityEpoch: plan.Expected.IntegrityEpoch, Attempt: t.Attempts, Size: plan.Expected.Size, BytesDone: report.BytesDone, PreviousBytes: previousBytes, Source: fmt.Sprint(t.SourceID), Target: fmt.Sprint(t.NodeID), Path: path, Active: true, LeaseStart: t.LeaseStart, LeaseUntil: t.NextAttempt, HardUntil: hard, ProgressAt: report.Now, GoodputBPS: t.GoodputBPS, Renewals: t.Renewals, MaxRenewals: renew.MaxRenewals, RenewWindow: renew.Window, RenewBefore: renewBefore, ObservationTTL: 30 * time.Second, UploadBPS: t.UploadBPS, DownloadBPS: t.DownloadBPS}
+		decision, e := scheduler.DecideTransferFlight(state, report.Now)
+		if e != nil {
+			return e
+		}
+		if e := scheduler.ValidateTransferDecision(state, decision, report.Now); e != nil {
+			return e
+		}
+		result.Action = decision.Action
+		if decision.Action == scheduler.TransferRenew {
+			t.NextAttempt = decision.LeaseUntil
+			t.Renewals++
+			result.Renewed, result.LeaseUntil = true, t.NextAttempt
 		}
 		plan.UpdatedAt = report.Now
 		return putAutonomy(w, "plan", plan.ID, plan)
@@ -1373,7 +1430,7 @@ func (s *Store) RecordProtectionProgress(report ProtectionProgressReport, renew 
 	if err == nil {
 		err = s.EnsureDurable()
 	}
-	return renewed, err
+	return result, err
 }
 
 func (s *Store) CancelProtection(planID string) error {

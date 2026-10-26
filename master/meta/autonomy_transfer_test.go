@@ -362,6 +362,9 @@ func TestProtectionSourceMatchesTx(t *testing.T) {
 		MaxSourceConcurrent: 0, MaxTargetConcurrent: 0, MaxSourceUploadBPS: 0, MaxTargetDownloadBPS: 0}
 	now := time.Now()
 	// 先全部预留再派工（与规划器→派工的真实时序一致），排队块才会进入份额分母。
+	if err := s.EnableProtectionFeedback(); err != nil {
+		t.Fatal(err)
+	}
 	bound := trfReserve(t, s, "trf-match-bound", objs[0], ids[2])
 	empty := trfReserve(t, s, "trf-match-empty", objs[1], ids[2])
 	legacy := trfReserve(t, s, "trf-match-legacy", objs[2], ids[2])
@@ -399,7 +402,16 @@ func TestProtectionSourceMatchesTx(t *testing.T) {
 		var ok bool
 		var err error
 		err = s.db.View(func(tx *bolt.Tx) error {
-			ok, err = protectionSourceMatchesTx(tx, planID, sender, audience, attempt, at)
+			p, perr := planTx(tx, planID)
+			token := ""
+			if perr == nil {
+				for _, target := range p.Targets {
+					if target.NodeID == sender {
+						token = target.AttemptToken
+					}
+				}
+			}
+			ok, err = protectionSourceMatchesTx(tx, planID, sender, audience, attempt, at, token)
 			return err
 		})
 		return ok, err

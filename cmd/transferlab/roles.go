@@ -81,7 +81,7 @@ func runMasterRole(cfg *Config) int {
 	aut, err := master.NewAutonomy(store, cfg.NodeMaxAge.D(), master.AutonomyConfig{
 		Mode: master.AutonomyAdd, Interval: cfg.AutonomyInterval.D(), RetryInterval: cfg.AutonomyRetry.D(),
 		MaxDispatchPerTick: cfg.AutonomyDispatch, MaxBytesPerRound: cfg.AutonomyBytes,
-		MaxReplicas: cfg.WriteMaxReplicas,
+		MaxReplicas: cfg.WriteMaxReplicas, ProtectionFeedback: true,
 	})
 	if err != nil {
 		log.Printf("transferlab master: autonomy 装配失败: %v", err)

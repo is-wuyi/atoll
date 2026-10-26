@@ -40,8 +40,7 @@ type Node struct {
 	heartbeatInterval time.Duration
 	httpClient        *http.Client  // 与 master 交互（小请求，60s 全程超时）
 	bulkClient        *http.Client  // 对等节点大对象传输（push/pull，不设全程超时）
-	pulling           sync.Map      // map[uint64]struct{}: 正在拉取的 inode，去重用
-	pullingKey        sync.Map      // map[uint64]pullKey: 去重命中时的在飞计划/尝试身份
+	pulling           sync.Map      // object ID -> pullKey
 	token             auth.Token    // 集群认证；空 = 兼容模式
 	sec               *nodeSecurity // 独立身份+在线票据模式；nil = legacy 行为
 	uploadBudget      *transferbudget.Limiter
@@ -340,11 +339,12 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 
 func (n *Node) handlePull(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		InodeID    uint64 `json:"inode_id"`
-		SourceAddr string `json:"source_addr"`
-		Checksum   uint32 `json:"checksum"`
-		PlanID     string `json:"plan_id"`
-		Attempt    uint32 `json:"attempt"`
+		InodeID    uint64                 `json:"inode_id"`
+		SourceAddr string                 `json:"source_addr"`
+		Checksum   uint32                 `json:"checksum"`
+		PlanID     string                 `json:"plan_id"`
+		Attempt    uint32                 `json:"attempt"`
+		Object     *types.ObjectIntegrity `json:"object,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.InodeID == 0 || req.SourceAddr == "" {
 		httpError(w, http.StatusBadRequest, "inode_id and source_addr are required")
@@ -355,13 +355,13 @@ func (n *Node) handlePull(w http.ResponseWriter, r *http.Request) {
 	// 计划/尝试不同（旧租约的飞行、另一计划的拉取）必须显式 409，master 的
 	// executeTarget 会把它当派工失败记录，而不是误以为新传输已启动。
 	key := pullKey{PlanID: req.PlanID, Attempt: req.Attempt}
-	if _, loaded := n.pulling.LoadOrStore(req.InodeID, struct{}{}); !loaded {
-		n.pullingKey.Store(req.InodeID, key)
-		go n.pullObject(req.InodeID, req.SourceAddr, req.Checksum, req.PlanID, req.Attempt)
+	current, loaded := n.pulling.LoadOrStore(req.InodeID, key)
+	if !loaded {
+		go n.pullObject(req.InodeID, req.SourceAddr, req.Checksum, req.PlanID, req.Attempt, req.Object)
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	if current, ok := n.pullingKey.Load(req.InodeID); ok && current == key {
+	if current == key {
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -398,44 +398,52 @@ type pullKey struct {
 	Attempt uint32
 }
 
-func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, planID string, attempt uint32) {
+func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, planID string, attempt uint32, dispatched ...*types.ObjectIntegrity) {
 	wantPlan, wantAttempt := planID, attempt
 	defer n.pulling.Delete(objectID)
-	defer n.pullingKey.Delete(objectID)
-	ctx := context.Background()
-	var cancel context.CancelFunc
-	if wantPlan != "" {
-		// 计划拉取的硬总上界：feedback 计划（PlanAttempt>0）的租约由 master 依据
-		// 进度反馈续租，节点侧不再把首 descriptor 的租约截止当作唯一网络 deadline；
-		// 授权仍 fail-closed——descriptor 获取与最终回执都在 master 侧校验租约。
-		ctx, cancel = context.WithTimeout(ctx, planPullTimeout)
-	}
-	if cancel != nil {
-		defer cancel()
-	}
+	started := time.Now()
+	metadataCtx, metadataCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	plan, err := n.replicationPlan(metadataCtx, objectID, wantPlan)
+	metadataCancel()
+	var ctx context.Context = context.Background()
+	var cancel context.CancelCauseFunc
+	var pullDeadlineCancel context.CancelFunc
 	report := func(bytes int64, kind, message string) {
-		n.reportPullFeedback(wantPlan, wantAttempt, objectID, bytes, kind, message)
+		d := plan.Object
+		if len(dispatched) > 0 && dispatched[0] != nil {
+			d = *dispatched[0]
+		}
+		if d.PlanID == wantPlan && d.PlanAttempt == wantAttempt && d.ObjectID == objectID {
+			n.reportPullFeedbackFor(d, objectID, bytes, kind, message)
+		}
 	}
-	plan, err := n.replicationPlan(ctx, objectID, wantPlan)
 	if err != nil {
 		log.Printf("pull %d metadata: %v", objectID, err)
 		report(0, "failed", err.Error())
 		return
 	}
-	if plan.Object.PlanAttempt > 0 {
-		wantAttempt = plan.Object.PlanAttempt
-		n.pullingKey.Store(objectID, pullKey{PlanID: wantPlan, Attempt: wantAttempt})
+	if wantAttempt != plan.Object.PlanAttempt || len(dispatched) > 0 && dispatched[0] != nil && !samePullAttempt(*dispatched[0], plan.Object) {
+		log.Printf("pull %d: mismatched dispatched attempt", objectID)
+		report(0, "failed", "mismatched dispatched attempt")
+		return
 	}
-	if wantPlan != "" && plan.Object.PlanAttempt == 0 {
-		// legacy 计划（无 PlanAttempt）保持原租约收窄语义。
-		deadline, lerr := planDeadline(planPullTimeout, plan.Object.PlanLeaseUntil)
-		if lerr != nil {
-			log.Printf("pull %d: %v", objectID, lerr)
-			report(0, "failed", lerr.Error())
-			return
+	if wantPlan != "" {
+		deadline := minTime(started.Add(planPullTimeout), plan.Object.PlanLeaseUntil)
+		if plan.Object.PlanAttempt > 0 {
+			deadline = minTime(started.Add(feedbackPullMaxTime), plan.Object.PlanHardUntil)
 		}
-		ctx, cancel = context.WithDeadline(ctx, deadline)
-		defer cancel()
+		ctx, pullDeadlineCancel = context.WithDeadline(ctx, deadline)
+		defer pullDeadlineCancel()
+	}
+	ctx, cancel = context.WithCancelCause(ctx)
+	defer cancel(nil)
+	counter := &progressCounter{}
+	stopWatch := make(chan struct{})
+	var lease *pullLease
+	if plan.Object.PlanAttempt > 0 {
+		lease = newPullLease(plan.Object.PlanLeaseUntil, plan.Object.PlanHardUntil, feedbackPullIdleTime, counter, cancel)
+		go lease.watch(ctx, stopWatch)
+		defer close(stopWatch)
 	}
 	var sourceID uint64
 	for _, src := range plan.Sources {
@@ -476,6 +484,7 @@ func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, 
 		req.Header.Set(access.PlanHeader, wantPlan)
 		if plan.Object.PlanAttempt > 0 {
 			req.Header.Set(access.PlanAttemptHeader, strconv.FormatUint(uint64(plan.Object.PlanAttempt), 10))
+			req.Header.Set(access.PlanAttemptTokenHeader, plan.Object.PlanAttemptToken)
 		}
 	}
 	resp, err := n.bulkClient.Do(req)
@@ -509,17 +518,21 @@ func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, 
 	}
 	// 字节计数只统计实际读到的对象 payload；HTTP 头/框架不计入。周期进度报告
 	// 携带测量 goodput（累计字节/累计耗时），master 用它决定是否续租。
-	counter := &progressCounter{}
-	var body io.Reader = io.TeeReader(resp.Body, counter)
+	counter.last.Store(time.Now().UnixNano())
+	if lease != nil {
+		lease.signal()
+	}
+	var body io.Reader = &contextReader{ctx: ctx, r: resp.Body}
 	if n.downloadBudget != nil {
 		body = n.downloadBudget.Reader(ctx, body, flowBPS)
 	}
+	body = io.TeeReader(body, counter)
 	stopProgress := make(chan struct{})
 	progressDone := make(chan struct{})
 	if plan.Object.PlanAttempt > 0 {
 		go func() {
 			defer close(progressDone)
-			n.progressLoop(ctx, stopProgress, plan.Object.PlanID, plan.Object.PlanAttempt, objectID, counter)
+			n.progressLoopFor(ctx, stopProgress, plan.Object, counter, lease)
 		}()
 	} else {
 		close(progressDone)
@@ -528,27 +541,45 @@ func (n *Node) pullObject(objectID uint64, sourceAddr string, expectCRC uint32, 
 	close(stopProgress)
 	<-progressDone
 	if serr != nil {
-		log.Printf("pull %d: %v", objectID, serr)
 		kind := "failed"
 		if errors.Is(serr, errIntegrityMismatch) {
 			kind = "corrupt"
-			_ = n.reportIntegrityFor(ctx, "/files/objects/suspect", plan.Object, sourceID)
+			suspectCtx, suspectCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = n.reportIntegrityFor(suspectCtx, "/files/objects/suspect", plan.Object, sourceID)
+			suspectCancel()
+		} else if cause := context.Cause(ctx); cause != nil {
+			serr = cause
 		}
+		log.Printf("pull %d: %v", objectID, serr)
 		report(counter.n.Load(), kind, serr.Error())
 		return
 	}
-	if err := n.reportStored(ctx, plan.Object); err != nil {
+	receiptCtx, receiptCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer receiptCancel()
+	if plan.Object.PlanAttempt > 0 {
+		fresh, err := n.replicationPlan(receiptCtx, objectID, wantPlan)
+		if err != nil || !samePullAttempt(plan.Object, fresh.Object) {
+			log.Printf("pull %d receipt: attempt or object changed", objectID)
+			return
+		}
+		plan.Object = fresh.Object
+	}
+	if err := n.reportStored(receiptCtx, plan.Object); err != nil {
 		log.Printf("pull %d receipt: %v", objectID, err)
 	}
 }
 
 // progressCounter 统计流过的对象字节（原子，供进度 goroutine 无锁读取）。
 type progressCounter struct {
-	n atomic.Int64
+	n    atomic.Int64
+	last atomic.Int64
 }
 
 func (p *progressCounter) Write(b []byte) (int, error) {
 	p.n.Add(int64(len(b)))
+	if len(b) > 0 {
+		p.last.Store(time.Now().UnixNano())
+	}
 	return len(b), nil
 }
 
@@ -559,6 +590,10 @@ var progressReportInterval = 15 * time.Second
 // progressLoop 周期上报进度；上报失败只记日志（进度是尽力而为的续租心跳，
 // 真正的授权闸在 descriptor 与回执两处）。stop 关闭或 ctx 结束即退出。
 func (n *Node) progressLoop(ctx context.Context, stop <-chan struct{}, planID string, attempt uint32, objectID uint64, counter *progressCounter) {
+	n.progressLoopFor(ctx, stop, types.ObjectIntegrity{PlanID: planID, PlanAttempt: attempt, ObjectID: objectID}, counter, nil)
+}
+
+func (n *Node) progressLoopFor(ctx context.Context, stop <-chan struct{}, d types.ObjectIntegrity, counter *progressCounter, lease *pullLease) {
 	started := time.Now()
 	ticker := time.NewTicker(progressReportInterval)
 	defer ticker.Stop()
@@ -569,13 +604,27 @@ func (n *Node) progressLoop(ctx context.Context, stop <-chan struct{}, planID st
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			bytes := counter.n.Load()
+			bytesDone := counter.n.Load()
 			elapsed := time.Since(started).Seconds()
 			var goodput uint64
-			if bytes > 0 && elapsed > 0 {
-				goodput = uint64(float64(bytes) / elapsed)
+			if bytesDone > 0 && elapsed > 0 {
+				goodput = uint64(float64(bytesDone) / elapsed)
 			}
-			n.reportPullProgress(ctx, planID, attempt, objectID, bytes, goodput, "", "")
+			result, err := n.sendPullProgress(ctx, types.ProtectionProgress{PlanID: d.PlanID, ObjectID: d.ObjectID, Generation: d.Generation, IntegrityEpoch: d.IntegrityEpoch, NodeID: uint64(n.nodeID.Load()), Attempt: d.PlanAttempt, AttemptToken: d.PlanAttemptToken, BytesDone: bytesDone, GoodputBPS: goodput})
+			if err != nil {
+				log.Printf("pull %d progress report: %v", d.ObjectID, err)
+				continue
+			}
+			if lease != nil {
+				if !result.Recorded || result.Action == "reassign" {
+					lease.cancel(errLeaseExpired)
+					return
+				}
+				if err := lease.extend(result.LeaseUntil, result.HardUntil); err != nil {
+					lease.cancel(err)
+					return
+				}
+			}
 		}
 	}
 }
@@ -594,30 +643,56 @@ func (n *Node) reportPullFeedback(planID string, attempt uint32, objectID uint64
 
 // reportPullProgress 发一条进度/失败反馈到 master。节点上报走自身控制通道
 // （legacy 集群 token / secure 设备会话由 n.httpClient 的 transport 注入）。
-func (n *Node) reportPullProgress(ctx context.Context, planID string, attempt uint32, objectID uint64, bytesDone int64, goodput uint64, kind, message string) {
-	if planID == "" || attempt == 0 {
+func (n *Node) reportPullFeedbackFor(d types.ObjectIntegrity, objectID uint64, bytesDone int64, kind, message string) {
+	if d.PlanID == "" || d.PlanAttempt == 0 || d.PlanAttemptToken == "" {
 		return
 	}
-	body, err := json.Marshal(map[string]any{
-		"plan_id": planID, "object_id": objectID, "node_id": n.nodeID.Load(),
-		"attempt": attempt, "bytes_done": bytesDone, "goodput_bps": goodput,
-		"failure_kind": kind, "message": message,
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if len(message) > 512 {
+		message = message[:512]
+	}
+	if _, err := n.sendPullProgress(ctx, types.ProtectionProgress{PlanID: d.PlanID, ObjectID: objectID, Generation: d.Generation, IntegrityEpoch: d.IntegrityEpoch, NodeID: uint64(n.nodeID.Load()), Attempt: d.PlanAttempt, AttemptToken: d.PlanAttemptToken, BytesDone: bytesDone, FailureKind: kind, Message: message}); err != nil {
+		log.Printf("pull %d failure report: %v", objectID, err)
+	}
+}
+
+func (n *Node) reportPullProgress(ctx context.Context, planID string, attempt uint32, objectID uint64, bytesDone int64, goodput uint64, kind, message string) {
+	_, err := n.sendPullProgress(ctx, types.ProtectionProgress{PlanID: planID, ObjectID: objectID, NodeID: uint64(n.nodeID.Load()), Attempt: attempt, BytesDone: bytesDone, GoodputBPS: goodput, FailureKind: kind, Message: message})
 	if err != nil {
-		return
+		log.Printf("pull %d progress report: %v", objectID, err)
+	}
+}
+
+func (n *Node) sendPullProgress(ctx context.Context, report types.ProtectionProgress) (types.ProtectionProgressResult, error) {
+	var result types.ProtectionProgressResult
+	if report.PlanID == "" || report.Attempt == 0 {
+		return result, errors.New("missing feedback attempt")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	body, err := json.Marshal(report)
+	if err != nil {
+		return result, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.masterURL+"/files/protection/progress", bytes.NewReader(body))
 	if err != nil {
-		return
+		return result, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := n.httpClient.Do(req)
 	if err != nil {
-		log.Printf("pull %d progress report: %v", objectID, err)
-		return
+		return result, err
 	}
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return result, fmt.Errorf("progress report rejected: status %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&result); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func (n *Node) storeObject(id uint64, r io.Reader, expectCRC uint32) (int64, uint32, error) {

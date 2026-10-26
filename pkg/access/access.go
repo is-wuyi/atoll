@@ -16,15 +16,17 @@ const (
 // Empty means a legacy plan; ticket normalization only accepts a non-zero
 // attempt for device GET /objects requests that also carry a PlanID.
 const PlanAttemptHeader = "X-Atoll-Plan-Attempt"
+const PlanAttemptTokenHeader = "X-Atoll-Plan-Attempt-Token"
 
 type TicketRequest struct {
-	NodeAddr    string `json:"node_addr"`
-	Method      string `json:"method"`
-	Path        string `json:"path"`
-	Query       string `json:"query,omitempty"`
-	PlanID      string `json:"plan_id,omitempty"`
-	PlanAttempt uint32 `json:"plan_attempt,omitempty"`
-	BodyHash    string `json:"body_hash,omitempty"`
+	NodeAddr         string `json:"node_addr"`
+	Method           string `json:"method"`
+	Path             string `json:"path"`
+	Query            string `json:"query,omitempty"`
+	PlanID           string `json:"plan_id,omitempty"`
+	PlanAttempt      uint32 `json:"plan_attempt,omitempty"`
+	PlanAttemptToken string `json:"plan_attempt_token,omitempty"`
+	BodyHash         string `json:"body_hash,omitempty"`
 }
 
 type Ticket struct {
@@ -33,13 +35,14 @@ type Ticket struct {
 }
 
 type CheckRequest struct {
-	Token       string `json:"token"`
-	Method      string `json:"method"`
-	Path        string `json:"path"`
-	Query       string `json:"query,omitempty"`
-	PlanID      string `json:"plan_id,omitempty"`
-	PlanAttempt uint32 `json:"plan_attempt,omitempty"`
-	BodyHash    string `json:"body_hash,omitempty"`
+	Token            string `json:"token"`
+	Method           string `json:"method"`
+	Path             string `json:"path"`
+	Query            string `json:"query,omitempty"`
+	PlanID           string `json:"plan_id,omitempty"`
+	PlanAttempt      uint32 `json:"plan_attempt,omitempty"`
+	PlanAttemptToken string `json:"plan_attempt_token,omitempty"`
+	BodyHash         string `json:"body_hash,omitempty"`
 }
 
 type CheckResult struct {

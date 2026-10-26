@@ -151,6 +151,7 @@ func runMaster(args []string, stderr io.Writer) int {
 	repairIntv := fs.Duration("repair-interval", 15*time.Second, "副本修复扫描周期")
 	gcIntv := fs.Duration("gc-interval", 10*time.Minute, "GC 对账扫描周期")
 	autonomyMode := fs.String("autonomy", "off", "自治保护：off|observe|shadow|add（add 仅增加副本）")
+	protectionFeedback := fs.Bool("protection-feedback", false, "启用 protection-feedback-v1（状态持久化，重启须保留此开关）")
 	secure := fs.Bool("secure", false, "启用受邀账号、空间与节点独立身份")
 	allowInsecure := fs.Bool("allow-insecure", false, "仅供隔离测试：允许安全模式使用明文 HTTP")
 	controlEnv := fs.String("control-token-env", "ATOLL_CONTROL_TOKEN", "Master 私有控制凭据环境变量")
@@ -241,6 +242,17 @@ func runMaster(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "write transfer database requires -write-transfer-planning and intact configuration")
 		return 1
 	}
+	if *protectionFeedback {
+		if err := store.EnableProtectionFeedback(); err != nil {
+			store.Close()
+			fmt.Fprintln(stderr, "protection feedback:", err)
+			return 1
+		}
+	} else if initialized, err := store.ProtectionFeedbackEnabled(); err != nil || initialized {
+		store.Close()
+		fmt.Fprintln(stderr, "protection feedback database requires -protection-feedback and intact capability")
+		return 1
+	}
 	backup.SetStore(store)
 	// 恢复完成：清除恢复签名，备份通道交还在线控制票据（AttachSecureTransports）。
 	// 两个凭据头并存会被节点恢复验签拒绝，必须显式切换。
@@ -250,7 +262,7 @@ func runMaster(args []string, stderr io.Writer) int {
 	var autonomy *master.Autonomy
 	if *autonomyMode != "off" {
 		autonomy, err = master.NewAutonomy(store, *nodeMaxAge, master.AutonomyConfig{
-			Mode: *autonomyMode, Interval: *autonomyInterval, MaxBytesPerRound: *autonomyBytes, MaxReplicas: *autonomyReplicas,
+			Mode: *autonomyMode, Interval: *autonomyInterval, MaxBytesPerRound: *autonomyBytes, MaxReplicas: *autonomyReplicas, ProtectionFeedback: *protectionFeedback,
 		})
 		if err != nil {
 			store.Close()

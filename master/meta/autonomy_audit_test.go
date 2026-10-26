@@ -248,6 +248,9 @@ func TestAuditProfileRevisionFencesPlans(t *testing.T) {
 // receipt carrying a mismatched lease is rejected.
 func TestAuditCancelKeepsAttemptedReservationAndClaimLeases(t *testing.T) {
 	s := auditStore(t)
+	if err := s.EnableProtectionFeedback(); err != nil {
+		t.Fatal(err)
+	}
 	ids := auditNodes(t, s, 3, 1000)
 	d := auditFile(t, s, "lease", ids[:1], 10, 666)
 	plan := auditReserve(t, s, auditReq("lease-plan", d, ids[1]))

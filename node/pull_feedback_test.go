@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -18,75 +17,62 @@ import (
 // pullDedupProbe 起一个真实 node Handler，验证 /pull 去重身份：
 // 相同 (对象, 计划, 尝试) 幂等 202；不同计划或尝试 409；不同对象互不影响。
 func TestPullDedupConflictOnDifferentPlanOrAttempt(t *testing.T) {
-	var mu sync.Mutex
-	pulls := map[uint64]int{}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer source.Close()
+	sourceAddr := source.Listener.Addr().String()
 	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/files/replication" {
-			q := r.URL.Query()
-			objectID := uint64(0)
-			fmt.Sscanf(q.Get("object_id"), "%d", &objectID)
-			mu.Lock()
-			pulls[objectID]++
-			mu.Unlock()
 			lease := time.Now().Add(time.Minute)
-			_ = json.NewEncoder(w).Encode(types.ReplicationPlan{
-				Protocol: types.IntegrityProtocol,
-				Object: types.ObjectIntegrity{
-					ObjectID: objectID, InodeID: 1000 + objectID, Chunked: true, ChunkIndex: 0,
-					Size: 1, Checksum: 1, ChecksumKnown: true, PlanID: q.Get("plan_id"),
-					PlanLeaseUntil: lease, PlanAttempt: 3, Replicas: []uint64{7, 8}, Done: []uint64{8},
-				},
-				Sources: []types.NodeInfo{{ID: 8, Addr: "src:1"}},
-			})
-			return
-		}
-		if r.URL.Path == "/files/protection/progress" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"recorded":true}`))
+			_ = json.NewEncoder(w).Encode(types.ReplicationPlan{Protocol: types.IntegrityProtocol, Object: types.ObjectIntegrity{ObjectID: 5000, InodeID: 10000, Size: 1, Checksum: 1, ChecksumKnown: true, PlanID: r.URL.Query().Get("plan_id"), PlanLeaseUntil: lease, PlanAttempt: 3, PlanAttemptToken: "test-token", PlanHardUntil: time.Now().Add(30*time.Minute + time.Second), Replicas: []uint64{7, 8}, Done: []uint64{8}}, Sources: []types.NodeInfo{{ID: 8, Addr: sourceAddr}}})
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"recorded":true}`))
 	}))
 	defer master.Close()
 	n := New(t.TempDir(), master.URL, "", 1<<20)
 	n.SetNodeIDForTest(7)
-	go func() { // 阻塞传输：第一个 pull 永不完成，保持"在飞"。
-		n.pullObject(5000, "src:1", 0, "plan-x", 3)
-	}()
-	waitFor := func(cond func() bool) {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			if cond() {
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		t.Fatal("condition not reached")
-	}
-	mu.Lock()
-	start := pulls[5000]
-	mu.Unlock()
-	waitFor(func() bool { mu.Lock(); defer mu.Unlock(); return pulls[5000] > start })
 	h := n.Handler()
-
-	do := func(objectID uint64, plan string, attempt string) int {
-		body := fmt.Sprintf(`{"inode_id":%d,"source_addr":"src:1","plan_id":%q,"attempt":%s}`, objectID, plan, attempt)
-		req := httptest.NewRequest(http.MethodPost, "/pull", bytes.NewReader([]byte(body)))
+	defer func() {
+		close(release)
+		waitForPullIdle(t, n, 5000)
+	}()
+	do := func(plan string, attempt uint32) int {
+		body, _ := json.Marshal(map[string]any{"inode_id": 5000, "source_addr": sourceAddr, "plan_id": plan, "attempt": attempt})
+		req := httptest.NewRequest(http.MethodPost, "/pull", bytes.NewReader(body))
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, req)
 		return w.Code
 	}
-	if code := do(5000, "plan-x", "3"); code != http.StatusAccepted {
-		t.Fatalf("same identity duplicate = %d, want 202", code)
+	if code := do("plan-x", 3); code != http.StatusAccepted {
+		t.Fatalf("first dispatch = %d", code)
 	}
-	if code := do(5000, "plan-x", "4"); code != http.StatusConflict {
-		t.Fatalf("different attempt = %d, want 409", code)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("valid feedback attempt never reached source")
 	}
-	if code := do(5000, "plan-y", "3"); code != http.StatusConflict {
-		t.Fatalf("different plan = %d, want 409", code)
+	if code := do("plan-x", 3); code != http.StatusAccepted {
+		t.Fatalf("same identity duplicate = %d", code)
 	}
-	if code := do(5000, "", "0"); code != http.StatusConflict {
-		t.Fatalf("planless while planned flight in progress = %d, want 409", code)
+	for _, identity := range []struct {
+		plan    string
+		attempt uint32
+	}{{"plan-x", 4}, {"plan-y", 3}, {"", 0}} {
+		if code := do(identity.plan, identity.attempt); code != http.StatusConflict {
+			t.Fatalf("different identity %+v = %d", identity, code)
+		}
 	}
 }
 

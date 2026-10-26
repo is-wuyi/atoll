@@ -3,6 +3,7 @@ package meta
 import (
 	"time"
 
+	"atoll/internal/scheduler"
 	"atoll/pkg/types"
 )
 
@@ -62,23 +63,27 @@ type NodePlacementProfile struct {
 // lease extensions of the current attempt; FailureKind is ""|"failed"|
 // "corrupt". Progress never marks Done and never releases reservations.
 type ProtectionTarget struct {
-	NodeID         uint64    `json:"node_id"`
-	Addr           string    `json:"addr"`
-	SourceID       uint64    `json:"source_id,omitempty"`
-	SourceAddr     string    `json:"source_addr,omitempty"`
-	UploadBPS      uint64    `json:"upload_bps,omitempty"`
-	DownloadBPS    uint64    `json:"download_bps,omitempty"`
-	AttemptToken   string    `json:"attempt_token,omitempty"`
-	LeaseStart     time.Time `json:"lease_start,omitempty"`
-	ProgressBytes  int64     `json:"progress_bytes,omitempty"`
-	LastProgressAt time.Time `json:"last_progress_at,omitempty"`
-	GoodputBPS     uint64    `json:"goodput_bps,omitempty"`
-	Renewals       uint32    `json:"renewals,omitempty"`
-	FailureKind    string    `json:"failure_kind,omitempty"`
-	Done           bool      `json:"done"`
-	Attempts       uint32    `json:"attempts"`
-	NextAttempt    time.Time `json:"next_attempt,omitempty"`
-	LastError      string    `json:"last_error,omitempty"`
+	NodeID                uint64    `json:"node_id"`
+	Addr                  string    `json:"addr"`
+	SourceID              uint64    `json:"source_id,omitempty"`
+	SourceAddr            string    `json:"source_addr,omitempty"`
+	UploadBPS             uint64    `json:"upload_bps,omitempty"`
+	DownloadBPS           uint64    `json:"download_bps,omitempty"`
+	AttemptToken          string    `json:"attempt_token,omitempty"`
+	LeaseStart            time.Time `json:"lease_start,omitempty"`
+	HardUntil             time.Time `json:"hard_until,omitzero"`
+	AttemptIntegrityEpoch uint64    `json:"attempt_integrity_epoch,omitempty"`
+	AttemptEpochKnown     bool      `json:"attempt_epoch_known,omitempty"`
+	ProgressBytes         int64     `json:"progress_bytes,omitempty"`
+	LastProgressAt        time.Time `json:"last_progress_at,omitempty"`
+	GoodputBPS            uint64    `json:"goodput_bps,omitempty"`
+	Renewals              uint32    `json:"renewals,omitempty"`
+	FailureKind           string    `json:"failure_kind,omitempty"`
+	Done                  bool      `json:"done"`
+	Attempts              uint32    `json:"attempts"`
+	NextAttempt           time.Time `json:"next_attempt,omitempty"`
+	RetryAt               time.Time `json:"retry_at,omitzero"`
+	LastError             string    `json:"last_error,omitempty"`
 }
 
 type ProtectionPlan struct {
@@ -86,6 +91,7 @@ type ProtectionPlan struct {
 	InputHash       string                `json:"input_hash"`
 	ProfileRevision uint64                `json:"profile_revision"`
 	State           string                `json:"state"`
+	Feedback        bool                  `json:"feedback,omitempty"`
 	Expected        types.ObjectIntegrity `json:"expected"`
 	Targets         []ProtectionTarget    `json:"targets"`
 	// NodeMaxAge is the liveness window captured at reservation time. Source
@@ -117,13 +123,16 @@ type ProtectionRequest struct {
 // allocated rate. NodeMaxAge is the liveness window for source binding when
 // the plan predates the field (<= 0 keeps the identity-only fallback).
 type ProtectionExecutionBudget struct {
-	MaxConcurrent        int           `json:"max_concurrent"`
-	MaxBytes             int64         `json:"max_bytes"`
-	MaxSourceConcurrent  int           `json:"max_source_concurrent"`
-	MaxTargetConcurrent  int           `json:"max_target_concurrent"`
-	MaxSourceUploadBPS   uint64        `json:"max_source_upload_bps"`
-	MaxTargetDownloadBPS uint64        `json:"max_target_download_bps"`
-	NodeMaxAge           time.Duration `json:"node_max_age,omitempty"`
+	MaxConcurrent        int                         `json:"max_concurrent"`
+	MaxBytes             int64                       `json:"max_bytes"`
+	MaxSourceConcurrent  int                         `json:"max_source_concurrent"`
+	MaxTargetConcurrent  int                         `json:"max_target_concurrent"`
+	MaxSourceUploadBPS   uint64                      `json:"max_source_upload_bps"`
+	MaxTargetDownloadBPS uint64                      `json:"max_target_download_bps"`
+	NodeMaxAge           time.Duration               `json:"node_max_age,omitempty"`
+	MaxTotalLease        time.Duration               `json:"max_total_lease,omitempty"`
+	Links                []scheduler.LinkObservation `json:"links,omitempty"`
+	Path                 string                      `json:"path,omitempty"`
 }
 
 type NodeCapacity struct {

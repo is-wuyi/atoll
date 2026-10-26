@@ -6,7 +6,12 @@ import (
 	"atoll/master/meta"
 )
 
-func (s *Server) SetAutonomy(a *Autonomy) { s.autonomy = a }
+func (s *Server) SetAutonomy(a *Autonomy) {
+	s.autonomy = a
+	if a != nil {
+		a.transferObservations = s.transferObservationsAt
+	}
+}
 
 func (s *Server) handleAutonomyStatus(w http.ResponseWriter, r *http.Request) {
 	if s.autonomy == nil {

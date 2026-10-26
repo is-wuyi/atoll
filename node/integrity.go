@@ -99,6 +99,9 @@ func (n *Node) replicationPlan(ctx context.Context, objectID uint64, planID ...s
 		if _, lerr := planDeadline(planPullTimeout, d.PlanLeaseUntil); lerr != nil {
 			return plan, fmt.Errorf("plan %s object %d: %w", wantPlan, objectID, lerr)
 		}
+		if d.PlanAttempt > 0 && (d.PlanAttemptToken == "" || d.PlanHardUntil.IsZero() || d.PlanLeaseUntil.After(d.PlanHardUntil) || !time.Now().Before(d.PlanHardUntil)) {
+			return plan, fmt.Errorf("invalid feedback attempt identity or hard deadline")
+		}
 	} else if d.PlanID != "" {
 		return plan, fmt.Errorf("unexpected plan context in replication metadata for object %d", objectID)
 	}
@@ -111,7 +114,7 @@ func (n *Node) replicationPlan(ctx context.Context, objectID uint64, planID ...s
 		t := plan.Transfer
 		// feedback 计划：票据/传输绑定的 attempt 必须与 descriptor 一致，旧尝试
 		// 的绑定整体失效。legacy 计划（双方 PlanAttempt 均为 0）不比较。
-		attemptMismatch := d.PlanAttempt > 0 && t.PlanAttempt != d.PlanAttempt
+		attemptMismatch := t.PlanAttempt != d.PlanAttempt || t.PlanAttemptToken != d.PlanAttemptToken || !t.HardUntil.Equal(d.PlanHardUntil)
 		if wantPlan == "" || t.SourceID == 0 || t.TargetID != uint64(n.nodeID.Load()) || t.ExpiresAt != d.PlanLeaseUntil || attemptMismatch || !types.ContainsUint64(d.Done, t.SourceID) || types.ContainsUint64(d.Suspect, t.SourceID) || t.UploadBPS > 1<<40 || t.DownloadBPS > 1<<40 {
 			return plan, fmt.Errorf("invalid source-bound replica transfer")
 		}
