@@ -1,0 +1,2170 @@
+{
+  "date": "2026-10-27",
+  "base_commit": "f238548b1bc292012210a57926b0e912e0946c90",
+  "branch": "feat/admin-console",
+  "run_id": "wan-direct-d3ecf815af94",
+  "status": "partial_pass",
+  "scope": "Standalone peertransport WAN prototype; not production payload wiring, AEAD integration, all-NAT compatibility, or deployment approval.",
+  "linux_amd64_binary_sha256": "c1fb32ebd976c81b9a83088f2eaff773b2925dedde41711e80a523bafa80aeae",
+  "identities": {
+    "relay": {
+      "host": "26666.et.net",
+      "state": "relay",
+      "peer_id": "12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE"
+    },
+    "control": {
+      "host": "26666.et.net",
+      "state": "control",
+      "peer_id": "12D3KooWNKtUxz8GAq2j6qmNbFUkLF3bFtTszzKFHMfu3h6RYViw"
+    },
+    "peer-a": {
+      "host": "28425.et.net",
+      "state": "peer-a",
+      "peer_id": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ"
+    },
+    "peer-b": {
+      "host": "29663.et.net",
+      "state": "peer-b",
+      "peer_id": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb"
+    }
+  },
+  "claims": {
+    "public_endpoint_non_circuit_transfer": "passed for 28425 and 29663",
+    "host_route_uses_physical_eth0_not_overlay_interface": "observed in endpoint route snapshots",
+    "dcutr_initiator_or_all_network_hops_proven": false,
+    "repeatable_one_sided_cold_direct_dial": "failed: 0/8 in each direction",
+    "controlled_forced_relay_32mib_upload_download": "failed: uploads timed out in both directions; downloads not reached",
+    "controlled_forced_relay_64kib": "passed A; B twice rejected non-circuit upgrade at connect phase",
+    "stable_long_duration_transfer": "not passed; all failures preserved",
+    "production_ready": false
+  },
+  "measurement_contract": {
+    "rate_unit": "MiB/s",
+    "probe_success": "err absent, match=true, positive acknowledged payload bytes",
+    "upload_confirmation": "HTTP 201 plus manifest sha256 and size match",
+    "download_confirmation": "Downloaded length and SHA-256 match the upload",
+    "latency_scope": "Application operation completion, not physical RTT",
+    "wire_bytes": "Counting stream bytes including HTTP framing; not packet-level network bytes and not acknowledged payload",
+    "stats": "64KiB and 32MiB separate; median per-operation and aggregate success-window rates both shown; failed and cancelled operations excluded from rates but included in failure counts",
+    "perf_quantiles": "Runner upper-middle median and floor(n*0.95) index on successes; retained as emitted",
+    "probe_quantiles": "Python statistics.median and nearest-rank p95 on successful same-size operations"
+  },
+  "public_only_gate_observations": {
+    "28425.et.net": {
+      "public_only": true,
+      "public_only_startup_identity": {
+        "role": "peer",
+        "peer_id": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+        "addresses": [
+          "/ip4/10.126.126.6/tcp/44431",
+          "/ip4/10.126.126.6/udp/44431/quic-v1",
+          "/ip4/100.93.186.99/tcp/44431",
+          "/ip4/100.93.186.99/udp/44431/quic-v1",
+          "/ip4/127.0.0.1/tcp/44431",
+          "/ip4/127.0.0.1/udp/44431/quic-v1",
+          "/ip4/172.17.0.1/tcp/44431",
+          "/ip4/172.17.0.1/udp/44431/quic-v1",
+          "/ip4/192.168.1.4/tcp/44431",
+          "/ip4/192.168.1.4/udp/44431/quic-v1"
+        ],
+        "public_only": true
+      },
+      "refusal_log_lines": 120,
+      "denied_multiaddrs": [
+        "/ip4/10.126.126.9/tcp/44431（非公网端点：loopback/私网/CGNAT/链路本地/DNS",
+        "/ip4/10.126.126.9/udp/44431/quic-v1（非公网端点：loopback/私网/CGNAT/链路本地/DNS",
+        "/ip4/100.79.127.104/tcp/44431（非公网端点：loopback/私网/CGNAT/链路本地/DNS",
+        "/ip4/100.79.127.104/udp/44431/quic-v1（非公网端点：loopback/私网/CGNAT/链路本地/DNS",
+        "/ip4/192.168.3.85/tcp/44431（非公网端点：loopback/私网/CGNAT/链路本地/DNS",
+        "/ip4/192.168.3.85/udp/44431/quic-v1（非公网端点：loopback/私网/CGNAT/链路本地/DNS"
+      ],
+      "refusal_examples": [
+        "2026/10/27 07:07:54.488362 conn-gater: public-only 拒绝拨号 peer=12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb addr=/ip4/10.126.126.9/tcp/44431（非公网端点：loopback/私网/CGNAT/链路本地/DNS 一律禁止）",
+        "2026/10/27 07:07:54.488538 conn-gater: public-only 拒绝拨号 peer=12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb addr=/ip4/10.126.126.9/udp/44431/quic-v1（非公网端点：loopback/私网/CGNAT/链路本地/DNS 一律禁止）",
+        "2026/10/27 07:07:54.488587 conn-gater: public-only 拒绝拨号 peer=12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb addr=/ip4/100.79.127.104/tcp/44431（非公网端点：loopback/私网/CGNAT/链路本地/DNS 一律禁止）"
+      ]
+    },
+    "29663.et.net": {
+      "public_only": true,
+      "public_only_startup_identity": {
+        "role": "peer",
+        "peer_id": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+        "addresses": [
+          "/ip4/10.126.126.9/tcp/44431",
+          "/ip4/10.126.126.9/udp/44431/quic-v1",
+          "/ip4/100.79.127.104/tcp/44431",
+          "/ip4/100.79.127.104/udp/44431/quic-v1",
+          "/ip4/127.0.0.1/tcp/44431",
+          "/ip4/127.0.0.1/udp/44431/quic-v1",
+          "/ip4/172.17.0.1/tcp/44431",
+          "/ip4/172.17.0.1/udp/44431/quic-v1",
+          "/ip4/192.168.3.85/tcp/44431",
+          "/ip4/192.168.3.85/udp/44431/quic-v1"
+        ],
+        "public_only": true
+      },
+      "refusal_log_lines": 282,
+      "denied_multiaddrs": [
+        "/ip4/10.126.126.6/tcp/44431（非公网端点：loopback/私网/CGNAT/链路本地/DNS",
+        "/ip4/10.126.126.6/udp/44431/quic-v1（非公网端点：loopback/私网/CGNAT/链路本地/DNS",
+        "/ip4/100.93.186.99/tcp/44431（非公网端点：loopback/私网/CGNAT/链路本地/DNS",
+        "/ip4/100.93.186.99/udp/44431/quic-v1（非公网端点：loopback/私网/CGNAT/链路本地/DNS",
+        "/ip4/192.168.1.4/tcp/44431（非公网端点：loopback/私网/CGNAT/链路本地/DNS",
+        "/ip4/192.168.1.4/udp/44431/quic-v1（非公网端点：loopback/私网/CGNAT/链路本地/DNS"
+      ],
+      "refusal_examples": [
+        "2026/10/27 07:07:07.340212 conn-gater: public-only 拒绝拨号 peer=12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ addr=/ip4/10.126.126.6/tcp/44431（非公网端点：loopback/私网/CGNAT/链路本地/DNS 一律禁止）",
+        "2026/10/27 07:07:07.340252 conn-gater: public-only 拒绝拨号 peer=12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ addr=/ip4/10.126.126.6/udp/44431/quic-v1（非公网端点：loopback/私网/CGNAT/链路本地/DNS 一律禁止）",
+        "2026/10/27 07:07:07.340267 conn-gater: public-only 拒绝拨号 peer=12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ addr=/ip4/100.93.186.99/tcp/44431（非公网端点：loopback/私网/CGNAT/链路本地/DNS 一律禁止）"
+      ]
+    }
+  },
+  "endpoint_route_evidence": {
+    "28425.et.net": {
+      "collected_at_utc": "2026-10-27T10:04:18Z",
+      "target_public_ip": "161.142.118.111",
+      "command": "ip route get 161.142.118.111",
+      "output": "161.142.118.111 via 192.168.1.1 dev eth0  src 192.168.1.4 \n    cache",
+      "evidence_scope": "Host routing-table snapshot for the recorded public endpoint; not a per-packet capture or proof of every external hop."
+    },
+    "29663.et.net": {
+      "collected_at_utc": "2026-10-27T10:04:19Z",
+      "target_public_ip": "183.241.108.130",
+      "command": "ip route get 183.241.108.130",
+      "output": "183.241.108.130 via 192.168.3.1 dev eth0 src 192.168.3.85 uid 1026 \n    cache",
+      "evidence_scope": "Host routing-table snapshot for the recorded public endpoint; not a per-packet capture or proof of every external hop."
+    }
+  },
+  "probe_totals": {
+    "operations": 3141,
+    "successes": 2762,
+    "direct_successes": 2699,
+    "circuit_successes": 63,
+    "failures_or_interruptions": 379,
+    "termination_correlated_operations": 2,
+    "termination_correlation_note": "Last PUT on each peer completed at the recorded SIGTERM stop window; one explicitly reports terminated signal received, the other stream closed. Both remain in the failure count."
+  },
+  "full_probe_results": {
+    "28425.et.net": {
+      "operations": 1485,
+      "successes": 1326,
+      "failures_or_interruptions": 159,
+      "direct_successes": 1302,
+      "circuit_successes": 24,
+      "acked_bytes": 18706726912,
+      "fallback_upgraded_successes": 0,
+      "first_operation_at": "2026-10-27T07:07:04.294507989+08:00",
+      "last_operation_at": "2026-10-27T18:01:55.169764013+08:00",
+      "success_groups": [
+        {
+          "path": "direct",
+          "operation": "put",
+          "payload_bytes": 65536,
+          "successes": 375,
+          "total_acked_bytes": 24576000,
+          "latency_ms": {
+            "min": 109.683,
+            "median": 323.429,
+            "p95_nearest_rank": 7566.059,
+            "max": 21536.014
+          },
+          "median_per_operation_mibps": 0.1932417934075176,
+          "aggregate_success_window_mibps": 0.04031063482692656,
+          "remote_multiaddrs": [
+            "/ip4/161.142.118.111/tcp/1375"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "put",
+          "payload_bytes": 33554432,
+          "successes": 314,
+          "total_acked_bytes": 10536091648,
+          "latency_ms": {
+            "min": 2364.447,
+            "median": 4113.8295,
+            "p95_nearest_rank": 116999.844,
+            "max": 148213.369
+          },
+          "median_per_operation_mibps": 7.779002604761562,
+          "aggregate_success_window_mibps": 1.2342703248720845,
+          "remote_multiaddrs": [
+            "/ip4/161.142.118.111/tcp/1375"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "get",
+          "payload_bytes": 65536,
+          "successes": 374,
+          "total_acked_bytes": 24510464,
+          "latency_ms": {
+            "min": 109.083,
+            "median": 323.877,
+            "p95_nearest_rank": 10959.898,
+            "max": 36933.68
+          },
+          "median_per_operation_mibps": 0.1929744934107186,
+          "aggregate_success_window_mibps": 0.028437392854518843,
+          "remote_multiaddrs": [
+            "/ip4/161.142.118.111/tcp/1375"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "get",
+          "payload_bytes": 33554432,
+          "successes": 239,
+          "total_acked_bytes": 8019509248,
+          "latency_ms": {
+            "min": 2435.328,
+            "median": 2996.951,
+            "p95_nearest_rank": 28326.383,
+            "max": 123698.871
+          },
+          "median_per_operation_mibps": 10.677518584721605,
+          "aggregate_success_window_mibps": 4.2263246589327546,
+          "remote_multiaddrs": [
+            "/ip4/161.142.118.111/tcp/1375"
+          ]
+        },
+        {
+          "path": "circuit",
+          "operation": "put",
+          "payload_bytes": 65536,
+          "successes": 11,
+          "total_acked_bytes": 720896,
+          "latency_ms": {
+            "min": 874.984,
+            "median": 5524.054,
+            "p95_nearest_rank": 7300.183,
+            "max": 7300.183
+          },
+          "median_per_operation_mibps": 0.011314154423544736,
+          "aggregate_success_window_mibps": 0.01282528657753077,
+          "remote_multiaddrs": [
+            "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit"
+          ]
+        },
+        {
+          "path": "circuit",
+          "operation": "put",
+          "payload_bytes": 33554432,
+          "successes": 3,
+          "total_acked_bytes": 100663296,
+          "latency_ms": {
+            "min": 3867.134,
+            "median": 6211.381,
+            "p95_nearest_rank": 14067.434,
+            "max": 14067.434
+          },
+          "median_per_operation_mibps": 5.15183338455651,
+          "aggregate_success_window_mibps": 3.9758221969242125,
+          "remote_multiaddrs": [
+            "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit"
+          ]
+        },
+        {
+          "path": "circuit",
+          "operation": "get",
+          "payload_bytes": 65536,
+          "successes": 10,
+          "total_acked_bytes": 655360,
+          "latency_ms": {
+            "min": 486.803,
+            "median": 1480.5565000000001,
+            "p95_nearest_rank": 3239.55,
+            "max": 3239.55
+          },
+          "median_per_operation_mibps": 0.0422667546530429,
+          "aggregate_success_window_mibps": 0.03755712814762536,
+          "remote_multiaddrs": [
+            "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit"
+          ]
+        }
+      ],
+      "failure_categories": {
+        "dial_context_deadline": {
+          "count": 4,
+          "example": {
+            "time": "2026-10-27T10:16:59.931648734+08:00",
+            "op": "put",
+            "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+            "policy": "direct-then-relay",
+            "path": "",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 0,
+            "sha256": "ee2e112c12f34746c81c5215852d085ea7ab06334efb09de83dc75e5b8735a86",
+            "match": false,
+            "latency_ms": 15001.811,
+            "err": "Put \"http://peer/objects/probe-65536-1793067404929821668\": peertransport: relay connect to 12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb via 12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE: failed to dial: context deadline exceeded"
+          }
+        },
+        "keepalive_timeout": {
+          "count": 12,
+          "example": {
+            "time": "2026-10-27T09:15:22.935051379+08:00",
+            "op": "put",
+            "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+            "policy": "direct-then-relay",
+            "path": "direct",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 524249,
+            "sha256": "74a624e49307f2bbf332ea812f6fe992ef5848c0fb046c909fb6203a98ddb597",
+            "match": false,
+            "latency_ms": 54147.139,
+            "remote_multiaddr": "/ip4/161.142.118.111/tcp/1375",
+            "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+            "err": "Put \"http://peer/objects/probe-33554432-1793063668787886009\": stream reset: stream reset: connection closed: keepalive timeout"
+          }
+        },
+        "no_reservation": {
+          "count": 1,
+          "example": {
+            "time": "2026-10-27T07:07:04.294507989+08:00",
+            "op": "put",
+            "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+            "policy": "direct-then-relay",
+            "path": "",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 0,
+            "sha256": "daf8fd0b359dcff51ef1e7588c6114151d9ba4036025d6a290237eaa4991ec54",
+            "match": false,
+            "latency_ms": 46.804,
+            "err": "Put \"http://peer/objects/probe-65536-1793056024247680682\": peertransport: relay connect to 12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb via 12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE: failed to dial: failed to dial 12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb: all dials failed\n  * [/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit] error opening relay circuit: NO_RESERVATION (204)"
+          }
+        },
+        "server_read_deadline": {
+          "count": 64,
+          "example": {
+            "time": "2026-10-27T10:29:06.851410714+08:00",
+            "op": "put",
+            "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+            "policy": "direct-then-relay",
+            "path": "direct",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 25923584,
+            "sha256": "0e238bdbc5b82c499b7d839471177b974e23702cca894fa8f14cd0eca932cc7f",
+            "match": false,
+            "latency_ms": 124882.935,
+            "remote_multiaddr": "/ip4/161.142.118.111/tcp/1375",
+            "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+            "err": "HTTP 400: {\"error\":\"read body: i/o deadline reached\"}"
+          }
+        },
+        "stream_reset": {
+          "count": 7,
+          "example": {
+            "time": "2026-10-27T07:07:54.420875221+08:00",
+            "op": "get",
+            "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+            "policy": "direct-then-relay",
+            "path": "circuit",
+            "fallback": true,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 13599221,
+            "sha256": "ddd4305e1a21b1db09f1d85619711810e208b624d08e2b693cd3f8cc120ef775",
+            "match": false,
+            "latency_ms": 34708.414,
+            "remote_multiaddr": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+            "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+            "err": "read body: stream reset (remote): code: 0x0: transport error: stream reset: connection closed: stream reset (remote): code: 0x0: transport error: stream reset by remote, error code: 0"
+          }
+        },
+        "terminated_signal": {
+          "count": 1,
+          "example": {
+            "time": "2026-10-27T18:01:55.169764013+08:00",
+            "op": "put",
+            "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+            "policy": "direct-then-relay",
+            "path": "direct",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 1048537,
+            "sha256": "eabef10282dec2f49be175568c7ebc83e5336af9b8d36270504ae4afe6b0b571",
+            "match": false,
+            "latency_ms": 17715.062,
+            "remote_multiaddr": "/ip4/161.142.118.111/tcp/1375",
+            "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+            "err": "Put \"http://peer/objects/probe-33554432-1793095297454686745\": terminated signal received"
+          }
+        },
+        "unexpected_eof": {
+          "count": 70,
+          "example": {
+            "time": "2026-10-27T09:40:07.281968215+08:00",
+            "op": "get",
+            "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+            "policy": "direct-then-relay",
+            "path": "direct",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 26345973,
+            "sha256": "3bd923a7c3059c08a10f08fac5013d195403cbd4393b673084a77e66a349b565",
+            "match": false,
+            "latency_ms": 120939.439,
+            "remote_multiaddr": "/ip4/161.142.118.111/tcp/1375",
+            "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+            "err": "read body: unexpected EOF"
+          }
+        }
+      }
+    },
+    "29663.et.net": {
+      "operations": 1656,
+      "successes": 1436,
+      "failures_or_interruptions": 220,
+      "direct_successes": 1397,
+      "circuit_successes": 39,
+      "acked_bytes": 17173446656,
+      "fallback_upgraded_successes": 2,
+      "first_operation_at": "2026-10-27T07:07:07.926164536+08:00",
+      "last_operation_at": "2026-10-27T18:01:55.28050687+08:00",
+      "success_groups": [
+        {
+          "path": "direct",
+          "operation": "put",
+          "payload_bytes": 65536,
+          "successes": 444,
+          "total_acked_bytes": 29097984,
+          "latency_ms": {
+            "min": 110.146,
+            "median": 325.573,
+            "p95_nearest_rank": 22863.311,
+            "max": 47587.563
+          },
+          "median_per_operation_mibps": 0.19196923995085302,
+          "aggregate_success_window_mibps": 0.010927845846272866,
+          "remote_multiaddrs": [
+            "/ip4/183.241.108.130/tcp/34950"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "put",
+          "payload_bytes": 33554432,
+          "successes": 255,
+          "total_acked_bytes": 8556380160,
+          "latency_ms": {
+            "min": 2654.008,
+            "median": 3278.631,
+            "p95_nearest_rank": 60626.02,
+            "max": 115382.759
+          },
+          "median_per_operation_mibps": 9.760171242204445,
+          "aggregate_success_window_mibps": 2.843051461711462,
+          "remote_multiaddrs": [
+            "/ip4/183.241.108.130/tcp/34950"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "get",
+          "payload_bytes": 65536,
+          "successes": 443,
+          "total_acked_bytes": 29032448,
+          "latency_ms": {
+            "min": 108.423,
+            "median": 323.003,
+            "p95_nearest_rank": 4965.418,
+            "max": 25355.23
+          },
+          "median_per_operation_mibps": 0.1934966548298313,
+          "aggregate_success_window_mibps": 0.06245988566715391,
+          "remote_multiaddrs": [
+            "/ip4/183.241.108.130/tcp/34950"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "get",
+          "payload_bytes": 33554432,
+          "successes": 255,
+          "total_acked_bytes": 8556380160,
+          "latency_ms": {
+            "min": 2430.117,
+            "median": 3412.739,
+            "p95_nearest_rank": 11400.161,
+            "max": 104344.42
+          },
+          "median_per_operation_mibps": 9.37663266953611,
+          "aggregate_success_window_mibps": 5.371701013270282,
+          "remote_multiaddrs": [
+            "/ip4/183.241.108.130/tcp/34950"
+          ]
+        },
+        {
+          "path": "circuit",
+          "operation": "put",
+          "payload_bytes": 65536,
+          "successes": 19,
+          "total_acked_bytes": 1245184,
+          "latency_ms": {
+            "min": 586.116,
+            "median": 3276.354,
+            "p95_nearest_rank": 16456.673,
+            "max": 16456.673
+          },
+          "median_per_operation_mibps": 0.019076082743195638,
+          "aggregate_success_window_mibps": 0.011611175968559808,
+          "remote_multiaddrs": [
+            "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit"
+          ]
+        },
+        {
+          "path": "circuit",
+          "operation": "get",
+          "payload_bytes": 65536,
+          "successes": 20,
+          "total_acked_bytes": 1310720,
+          "latency_ms": {
+            "min": 135.896,
+            "median": 718.599,
+            "p95_nearest_rank": 17846.155,
+            "max": 74593.365
+          },
+          "median_per_operation_mibps": 0.08906076883141359,
+          "aggregate_success_window_mibps": 0.010185943585273685,
+          "remote_multiaddrs": [
+            "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit"
+          ]
+        }
+      ],
+      "failure_categories": {
+        "connection_write_timeout": {
+          "count": 12,
+          "example": {
+            "time": "2026-10-27T09:14:43.045560428+08:00",
+            "op": "put",
+            "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+            "policy": "direct-then-relay",
+            "path": "direct",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 17141760,
+            "sha256": "ad5790164277554c02cc377f16d429c0f510506283142df92ebef67a5ee4fac4",
+            "match": false,
+            "latency_ms": 91684.375,
+            "remote_multiaddr": "/ip4/183.241.108.130/tcp/34950",
+            "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+            "err": "Put \"http://peer/objects/probe-33554432-1793063591361176647\": connection write timeout"
+          }
+        },
+        "dial_context_deadline": {
+          "count": 4,
+          "example": {
+            "time": "2026-10-27T10:54:43.752278082+08:00",
+            "op": "put",
+            "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+            "policy": "direct-then-relay",
+            "path": "",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 0,
+            "sha256": "df617df599ade0561ba6d70a7ae1d503f4f4a79d781dc10a33c663d431104f7d",
+            "match": false,
+            "latency_ms": 15038.962,
+            "err": "Put \"http://peer/objects/probe-65536-1793069668713310974\": peertransport: relay connect to 12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ via 12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE: failed to dial: context deadline exceeded"
+          }
+        },
+        "other": {
+          "count": 4,
+          "example": {
+            "time": "2026-10-27T10:54:45.204451312+08:00",
+            "op": "put",
+            "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+            "policy": "direct-then-relay",
+            "path": "",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 0,
+            "sha256": "1cae7947befb5d860472020f0c1c2835adccc59fd1897008a7fe18b09a5cfcbb",
+            "match": false,
+            "latency_ms": 991.29,
+            "err": "Put \"http://peer/objects/probe-33554432-1793069684213153040\": peertransport: relay connect to 12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ via 12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE: failed to dial: failed to dial 12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ: all dials failed\n  * [/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit] concurrent active dial succeeded"
+          }
+        },
+        "server_read_deadline": {
+          "count": 184,
+          "example": {
+            "time": "2026-10-27T10:14:10.28613968+08:00",
+            "op": "put",
+            "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+            "policy": "direct-then-relay",
+            "path": "direct",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 14651392,
+            "sha256": "4714851665c04840f2ad7381b2e0f4260ab9dbc423a81b151153909ed98ef729",
+            "match": false,
+            "latency_ms": 125340.679,
+            "remote_multiaddr": "/ip4/183.241.108.130/tcp/34950",
+            "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+            "err": "HTTP 400: {\"error\":\"read body: i/o deadline reached\"}"
+          }
+        },
+        "stream_closed": {
+          "count": 1,
+          "example": {
+            "time": "2026-10-27T18:01:55.28050687+08:00",
+            "op": "put",
+            "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+            "policy": "direct-then-relay",
+            "path": "direct",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 2097113,
+            "sha256": "9f81bfcf706400de01d600f7a99994049830fdf67e56d931769172d13f500da4",
+            "match": false,
+            "latency_ms": 30877.671,
+            "remote_multiaddr": "/ip4/183.241.108.130/tcp/34950",
+            "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+            "err": "Put \"http://peer/objects/probe-33554432-1793095284402827228\": stream closed"
+          }
+        },
+        "stream_reset": {
+          "count": 15,
+          "example": {
+            "time": "2026-10-27T09:15:23.051235093+08:00",
+            "op": "put",
+            "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+            "policy": "direct-then-relay",
+            "path": "circuit",
+            "fallback": true,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 3280896,
+            "sha256": "31fd803b1980bd2f0e6e4b31db7a583b2c973a3e95eed60771951aaefb8dcbef",
+            "match": false,
+            "latency_ms": 37141.07,
+            "remote_multiaddr": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+            "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+            "err": "Put \"http://peer/objects/probe-33554432-1793063685910156248\": stream reset (remote): code: 0x0: transport error: stream reset: connection closed: stream reset (remote): code: 0x0: transport error: stream reset by remote, error code: 0"
+          }
+        }
+      }
+    }
+  },
+  "early_snapshot_subset_not_added_to_totals": {
+    "28425.et.net": {
+      "operations": 31,
+      "successes": 29,
+      "failures_or_interruptions": 2,
+      "direct_successes": 26,
+      "circuit_successes": 3,
+      "acked_bytes": 504233984,
+      "fallback_upgraded_successes": 0,
+      "first_operation_at": "2026-10-27T07:07:04.294507989+08:00",
+      "last_operation_at": "2026-10-27T07:12:37.460076157+08:00",
+      "success_groups": [
+        {
+          "path": "direct",
+          "operation": "put",
+          "payload_bytes": 65536,
+          "successes": 6,
+          "total_acked_bytes": 393216,
+          "latency_ms": {
+            "min": 322.092,
+            "median": 322.86400000000003,
+            "p95_nearest_rank": 323.135,
+            "max": 323.135
+          },
+          "median_per_operation_mibps": 0.19357998349778366,
+          "aggregate_success_window_mibps": 0.19365753498229712,
+          "remote_multiaddrs": [
+            "/ip4/161.142.118.111/tcp/1375"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "put",
+          "payload_bytes": 33554432,
+          "successes": 7,
+          "total_acked_bytes": 234881024,
+          "latency_ms": {
+            "min": 2895.519,
+            "median": 4295.894,
+            "p95_nearest_rank": 6520.018,
+            "max": 6520.018
+          },
+          "median_per_operation_mibps": 7.448973368523524,
+          "aggregate_success_window_mibps": 7.7158654590051245,
+          "remote_multiaddrs": [
+            "/ip4/161.142.118.111/tcp/1375"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "get",
+          "payload_bytes": 65536,
+          "successes": 6,
+          "total_acked_bytes": 393216,
+          "latency_ms": {
+            "min": 323.309,
+            "median": 323.7395,
+            "p95_nearest_rank": 324.449,
+            "max": 324.449
+          },
+          "median_per_operation_mibps": 0.19305652913054872,
+          "aggregate_success_window_mibps": 0.19301352793214568,
+          "remote_multiaddrs": [
+            "/ip4/161.142.118.111/tcp/1375"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "get",
+          "payload_bytes": 33554432,
+          "successes": 7,
+          "total_acked_bytes": 234881024,
+          "latency_ms": {
+            "min": 2671.742,
+            "median": 3072.563,
+            "p95_nearest_rank": 5919.821,
+            "max": 5919.821
+          },
+          "median_per_operation_mibps": 10.414757972415861,
+          "aggregate_success_window_mibps": 8.881319326329727,
+          "remote_multiaddrs": [
+            "/ip4/161.142.118.111/tcp/1375"
+          ]
+        },
+        {
+          "path": "circuit",
+          "operation": "put",
+          "payload_bytes": 65536,
+          "successes": 1,
+          "total_acked_bytes": 65536,
+          "latency_ms": {
+            "min": 1117.203,
+            "median": 1117.203,
+            "p95_nearest_rank": 1117.203,
+            "max": 1117.203
+          },
+          "median_per_operation_mibps": 0.05594327977995047,
+          "aggregate_success_window_mibps": 0.05594327977995047,
+          "remote_multiaddrs": [
+            "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit"
+          ]
+        },
+        {
+          "path": "circuit",
+          "operation": "put",
+          "payload_bytes": 33554432,
+          "successes": 1,
+          "total_acked_bytes": 33554432,
+          "latency_ms": {
+            "min": 3867.134,
+            "median": 3867.134,
+            "p95_nearest_rank": 3867.134,
+            "max": 3867.134
+          },
+          "median_per_operation_mibps": 8.27486195202959,
+          "aggregate_success_window_mibps": 8.27486195202959,
+          "remote_multiaddrs": [
+            "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit"
+          ]
+        },
+        {
+          "path": "circuit",
+          "operation": "get",
+          "payload_bytes": 65536,
+          "successes": 1,
+          "total_acked_bytes": 65536,
+          "latency_ms": {
+            "min": 486.803,
+            "median": 486.803,
+            "p95_nearest_rank": 486.803,
+            "max": 486.803
+          },
+          "median_per_operation_mibps": 0.12838869111324294,
+          "aggregate_success_window_mibps": 0.12838869111324294,
+          "remote_multiaddrs": [
+            "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit"
+          ]
+        }
+      ],
+      "failure_categories": {
+        "no_reservation": {
+          "count": 1,
+          "example": {
+            "time": "2026-10-27T07:07:04.294507989+08:00",
+            "op": "put",
+            "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+            "policy": "direct-then-relay",
+            "path": "",
+            "fallback": false,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 0,
+            "sha256": "daf8fd0b359dcff51ef1e7588c6114151d9ba4036025d6a290237eaa4991ec54",
+            "match": false,
+            "latency_ms": 46.804,
+            "err": "Put \"http://peer/objects/probe-65536-1793056024247680682\": peertransport: relay connect to 12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb via 12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE: failed to dial: failed to dial 12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb: all dials failed\n  * [/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit] error opening relay circuit: NO_RESERVATION (204)"
+          }
+        },
+        "stream_reset": {
+          "count": 1,
+          "example": {
+            "time": "2026-10-27T07:07:54.420875221+08:00",
+            "op": "get",
+            "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+            "policy": "direct-then-relay",
+            "path": "circuit",
+            "fallback": true,
+            "fallback_upgraded": false,
+            "bytes": 0,
+            "wire_bytes": 13599221,
+            "sha256": "ddd4305e1a21b1db09f1d85619711810e208b624d08e2b693cd3f8cc120ef775",
+            "match": false,
+            "latency_ms": 34708.414,
+            "remote_multiaddr": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+            "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+            "err": "read body: stream reset (remote): code: 0x0: transport error: stream reset: connection closed: stream reset (remote): code: 0x0: transport error: stream reset by remote, error code: 0"
+          }
+        }
+      }
+    },
+    "29663.et.net": {
+      "operations": 32,
+      "successes": 32,
+      "failures_or_interruptions": 0,
+      "direct_successes": 28,
+      "circuit_successes": 4,
+      "acked_bytes": 537919488,
+      "fallback_upgraded_successes": 2,
+      "first_operation_at": "2026-10-27T07:07:07.926164536+08:00",
+      "last_operation_at": "2026-10-27T07:12:30.56621313+08:00",
+      "success_groups": [
+        {
+          "path": "direct",
+          "operation": "put",
+          "payload_bytes": 65536,
+          "successes": 6,
+          "total_acked_bytes": 393216,
+          "latency_ms": {
+            "min": 322.693,
+            "median": 323.487,
+            "p95_nearest_rank": 324.381,
+            "max": 324.381
+          },
+          "median_per_operation_mibps": 0.19320720438137828,
+          "aggregate_success_window_mibps": 0.19315171577956805,
+          "remote_multiaddrs": [
+            "/ip4/183.241.108.130/tcp/34950"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "put",
+          "payload_bytes": 33554432,
+          "successes": 8,
+          "total_acked_bytes": 268435456,
+          "latency_ms": {
+            "min": 2818.173,
+            "median": 3083.8805,
+            "p95_nearest_rank": 11198.903,
+            "max": 11198.903
+          },
+          "median_per_operation_mibps": 10.401163109759473,
+          "aggregate_success_window_mibps": 7.754258109992273,
+          "remote_multiaddrs": [
+            "/ip4/183.241.108.130/tcp/34950"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "get",
+          "payload_bytes": 65536,
+          "successes": 6,
+          "total_acked_bytes": 393216,
+          "latency_ms": {
+            "min": 322.119,
+            "median": 322.6465,
+            "p95_nearest_rank": 323.194,
+            "max": 323.194
+          },
+          "median_per_operation_mibps": 0.19371054863288417,
+          "aggregate_success_window_mibps": 0.1937097535701999,
+          "remote_multiaddrs": [
+            "/ip4/183.241.108.130/tcp/34950"
+          ]
+        },
+        {
+          "path": "direct",
+          "operation": "get",
+          "payload_bytes": 33554432,
+          "successes": 8,
+          "total_acked_bytes": 268435456,
+          "latency_ms": {
+            "min": 3152.283,
+            "median": 4178.437,
+            "p95_nearest_rank": 6023.283,
+            "max": 6023.283
+          },
+          "median_per_operation_mibps": 7.659522961124953,
+          "aggregate_success_window_mibps": 7.3060774406536755,
+          "remote_multiaddrs": [
+            "/ip4/183.241.108.130/tcp/34950"
+          ]
+        },
+        {
+          "path": "circuit",
+          "operation": "put",
+          "payload_bytes": 65536,
+          "successes": 2,
+          "total_acked_bytes": 131072,
+          "latency_ms": {
+            "min": 586.116,
+            "median": 1881.551,
+            "p95_nearest_rank": 3176.986,
+            "max": 3176.986
+          },
+          "median_per_operation_mibps": 0.06315345773614002,
+          "aggregate_success_window_mibps": 0.03321727659787059,
+          "remote_multiaddrs": [
+            "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit"
+          ]
+        },
+        {
+          "path": "circuit",
+          "operation": "get",
+          "payload_bytes": 65536,
+          "successes": 2,
+          "total_acked_bytes": 131072,
+          "latency_ms": {
+            "min": 135.896,
+            "median": 177.3265,
+            "p95_nearest_rank": 218.757,
+            "max": 218.757
+          },
+          "median_per_operation_mibps": 0.37280783147948543,
+          "aggregate_success_window_mibps": 0.35245719054963587,
+          "remote_multiaddrs": [
+            "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit"
+          ]
+        }
+      ],
+      "failure_categories": {}
+    }
+  },
+  "selected_probe_events": {
+    "28425.et.net": {
+      "first_verified_direct_large_upload": {
+        "time": "2026-10-27T07:08:10.098891655+08:00",
+        "op": "put",
+        "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+        "policy": "direct-then-relay",
+        "path": "direct",
+        "fallback": false,
+        "fallback_upgraded": false,
+        "bytes": 33554432,
+        "wire_bytes": 33554708,
+        "sha256": "e028a2bc351f160393c95df07c7210ab2e304e80cbb20628d120caff1cedd20b",
+        "match": true,
+        "latency_ms": 3060.441,
+        "remote_multiaddr": "/ip4/161.142.118.111/tcp/1375",
+        "local_multiaddr": "/ip4/192.168.1.4/tcp/44431"
+      },
+      "first_verified_direct_large_download": {
+        "time": "2026-10-27T07:08:12.770634788+08:00",
+        "op": "get",
+        "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+        "policy": "direct-then-relay",
+        "path": "direct",
+        "fallback": false,
+        "fallback_upgraded": false,
+        "bytes": 33554432,
+        "wire_bytes": 33554933,
+        "sha256": "e028a2bc351f160393c95df07c7210ab2e304e80cbb20628d120caff1cedd20b",
+        "match": true,
+        "latency_ms": 2671.742,
+        "remote_multiaddr": "/ip4/161.142.118.111/tcp/1375",
+        "local_multiaddr": "/ip4/192.168.1.4/tcp/44431"
+      },
+      "fallback_upgraded_successes": [],
+      "last_operation_correlated_with_stop": {
+        "time": "2026-10-27T18:01:55.169764013+08:00",
+        "op": "put",
+        "remote": "12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb",
+        "policy": "direct-then-relay",
+        "path": "direct",
+        "fallback": false,
+        "fallback_upgraded": false,
+        "bytes": 0,
+        "wire_bytes": 1048537,
+        "sha256": "eabef10282dec2f49be175568c7ebc83e5336af9b8d36270504ae4afe6b0b571",
+        "match": false,
+        "latency_ms": 17715.062,
+        "remote_multiaddr": "/ip4/161.142.118.111/tcp/1375",
+        "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+        "err": "Put \"http://peer/objects/probe-33554432-1793095297454686745\": terminated signal received"
+      }
+    },
+    "29663.et.net": {
+      "first_verified_direct_large_upload": {
+        "time": "2026-10-27T07:07:11.866122481+08:00",
+        "op": "put",
+        "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+        "policy": "direct-then-relay",
+        "path": "direct",
+        "fallback": false,
+        "fallback_upgraded": false,
+        "bytes": 33554432,
+        "wire_bytes": 33554708,
+        "sha256": "71e4e34542677998505820df0de0c4e996acbd70387dd8dd7621d305d4e90a55",
+        "match": true,
+        "latency_ms": 3249.571,
+        "remote_multiaddr": "/ip4/183.241.108.130/tcp/34950",
+        "local_multiaddr": "/ip4/192.168.3.85/tcp/44431"
+      },
+      "first_verified_direct_large_download": {
+        "time": "2026-10-27T07:07:15.221862796+08:00",
+        "op": "get",
+        "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+        "policy": "direct-then-relay",
+        "path": "direct",
+        "fallback": false,
+        "fallback_upgraded": false,
+        "bytes": 33554432,
+        "wire_bytes": 33554933,
+        "sha256": "71e4e34542677998505820df0de0c4e996acbd70387dd8dd7621d305d4e90a55",
+        "match": true,
+        "latency_ms": 3355.74,
+        "remote_multiaddr": "/ip4/183.241.108.130/tcp/34950",
+        "local_multiaddr": "/ip4/192.168.3.85/tcp/44431"
+      },
+      "fallback_upgraded_successes": [
+        {
+          "time": "2026-10-27T07:07:59.969285387+08:00",
+          "op": "put",
+          "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+          "policy": "direct-then-relay",
+          "path": "direct",
+          "fallback": true,
+          "fallback_upgraded": true,
+          "bytes": 33554432,
+          "wire_bytes": 33554708,
+          "sha256": "c3a4ebd4fd059356714425bad2e399d4146b5bc1881a782a7cf8325c76d1eb69",
+          "match": true,
+          "latency_ms": 3847.026,
+          "remote_multiaddr": "/ip4/183.241.108.130/tcp/34950",
+          "local_multiaddr": "/ip4/192.168.3.85/tcp/44431"
+        },
+        {
+          "time": "2026-10-27T07:08:03.121568395+08:00",
+          "op": "get",
+          "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+          "policy": "direct-then-relay",
+          "path": "direct",
+          "fallback": true,
+          "fallback_upgraded": true,
+          "bytes": 33554432,
+          "wire_bytes": 33554933,
+          "sha256": "c3a4ebd4fd059356714425bad2e399d4146b5bc1881a782a7cf8325c76d1eb69",
+          "match": true,
+          "latency_ms": 3152.283,
+          "remote_multiaddr": "/ip4/183.241.108.130/tcp/34950",
+          "local_multiaddr": "/ip4/192.168.3.85/tcp/44431"
+        }
+      ],
+      "last_operation_correlated_with_stop": {
+        "time": "2026-10-27T18:01:55.28050687+08:00",
+        "op": "put",
+        "remote": "12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ",
+        "policy": "direct-then-relay",
+        "path": "direct",
+        "fallback": false,
+        "fallback_upgraded": false,
+        "bytes": 0,
+        "wire_bytes": 2097113,
+        "sha256": "9f81bfcf706400de01d600f7a99994049830fdf67e56d931769172d13f500da4",
+        "match": false,
+        "latency_ms": 30877.671,
+        "remote_multiaddr": "/ip4/183.241.108.130/tcp/34950",
+        "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+        "err": "Put \"http://peer/objects/probe-33554432-1793095284402827228\": stream closed"
+      }
+    }
+  },
+  "controlled_perf_runs": [
+    {
+      "label": "perf-a-direct-1",
+      "host": "28425.et.net",
+      "policy": "direct",
+      "rounds": 8,
+      "payload_bytes": 33554432,
+      "public_only": true,
+      "exit": 1,
+      "wrapper_timeout": false,
+      "wall_seconds_not_throughput_window": 34.87293314933777,
+      "completed_at_utc": "2026-10-27T10:06:07Z",
+      "phases": [
+        {
+          "phase": "connect",
+          "policy": "direct",
+          "path": "",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "n": 0,
+          "bytes": 0,
+          "wire_bytes": 0,
+          "min_ms": 0,
+          "med_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0,
+          "mbps": 0,
+          "err": "perf phase \"connect\" op \"dial\" round 1 (path=\"\" fallback_attempted=false): peertransport: direct connect to 12D3KooWMivpt1xS4EG8RPqYPLgAGfFDpUotE5YPeSRKbxNCa9xb: failed to dial: context deadline exceeded"
+        }
+      ],
+      "phases_not_reached": [
+        "request",
+        "up",
+        "down"
+      ],
+      "phase_connect_successes": 0,
+      "phase_connect_failures": 8,
+      "raw_log_hash": {
+        "bytes": 1667,
+        "sha256": "725a1ff0ee84fcdd8e79c8ecf9878466da10eb1647acf983e1a5719042ce963d"
+      }
+    },
+    {
+      "label": "perf-a-fallback-1",
+      "host": "28425.et.net",
+      "policy": "direct-then-relay",
+      "rounds": 1,
+      "payload_bytes": 33554432,
+      "public_only": true,
+      "exit": 1,
+      "wrapper_timeout": false,
+      "wall_seconds_not_throughput_window": 147.44923210144043,
+      "completed_at_utc": "2026-10-27T10:24:42Z",
+      "phases": [
+        {
+          "phase": "connect",
+          "policy": "direct-then-relay",
+          "path": "circuit",
+          "fallback_attempted": true,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+          "n": 1,
+          "bytes": 0,
+          "wire_bytes": 0,
+          "min_ms": 5314.643,
+          "med_ms": 5314.643,
+          "p95_ms": 5314.643,
+          "max_ms": 5314.643,
+          "mbps": 0
+        },
+        {
+          "phase": "request",
+          "policy": "direct-then-relay",
+          "path": "circuit",
+          "fallback_attempted": true,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+          "n": 1,
+          "bytes": 1024,
+          "wire_bytes": 1290,
+          "min_ms": 403.997,
+          "med_ms": 403.997,
+          "p95_ms": 403.997,
+          "max_ms": 403.997,
+          "mbps": 0
+        },
+        {
+          "phase": "up",
+          "policy": "direct-then-relay",
+          "path": "direct",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/161.142.118.111/tcp/1099",
+          "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+          "n": 0,
+          "bytes": 0,
+          "wire_bytes": 7737344,
+          "min_ms": 0,
+          "med_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0,
+          "mbps": 0,
+          "err": "perf phase \"up\" op \"put\" round 1 (path=\"direct\" fallback_attempted=false): HTTP 400: {\"error\":\"read body: i/o deadline reached\"}"
+        }
+      ],
+      "phases_not_reached": [
+        "down"
+      ],
+      "phase_connect_successes": 1,
+      "phase_connect_failures": 0,
+      "raw_log_hash": {
+        "bytes": 3237,
+        "sha256": "00ea921bc0564dd2a16b0eb519c4d58858ba2733b81dde9b457a66e589488f3b"
+      }
+    },
+    {
+      "label": "perf-a-relay-1",
+      "host": "28425.et.net",
+      "policy": "forced-relay",
+      "rounds": 8,
+      "payload_bytes": 33554432,
+      "public_only": true,
+      "exit": 1,
+      "wrapper_timeout": false,
+      "wall_seconds_not_throughput_window": 61.32007384300232,
+      "completed_at_utc": "2026-10-27T10:07:10Z",
+      "phases": [
+        {
+          "phase": "connect",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+          "n": 8,
+          "bytes": 0,
+          "wire_bytes": 0,
+          "min_ms": 765.565,
+          "med_ms": 1348.079,
+          "p95_ms": 1827.999,
+          "max_ms": 1827.999,
+          "mbps": 0
+        },
+        {
+          "phase": "request",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+          "n": 8,
+          "bytes": 8192,
+          "wire_bytes": 10320,
+          "min_ms": 92.546,
+          "med_ms": 93.586,
+          "p95_ms": 1092.551,
+          "max_ms": 1092.551,
+          "mbps": 0
+        },
+        {
+          "phase": "up",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+          "n": 0,
+          "bytes": 0,
+          "wire_bytes": 8916992,
+          "min_ms": 0,
+          "med_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0,
+          "mbps": 0,
+          "err": "perf phase \"up\" op \"put\" round 1 (path=\"circuit\" fallback_attempted=false): Put \"http://peer/objects/perf-bw-1793095592578633237\": stream reset: stream reset: connection closed: connection write timeout"
+        }
+      ],
+      "phases_not_reached": [
+        "down"
+      ],
+      "phase_connect_successes": 8,
+      "phase_connect_failures": 0,
+      "raw_log_hash": {
+        "bytes": 2609,
+        "sha256": "ae2dd26dd2300d62da65df19f09eed80ecc2dbef58fa2718984d98d1bdadacde"
+      }
+    },
+    {
+      "label": "perf-a-relay-small-1",
+      "host": "28425.et.net",
+      "policy": "forced-relay",
+      "rounds": 8,
+      "payload_bytes": 65536,
+      "public_only": true,
+      "exit": 0,
+      "wrapper_timeout": false,
+      "wall_seconds_not_throughput_window": 18.472410917282104,
+      "completed_at_utc": "2026-10-27T10:10:26Z",
+      "phases": [
+        {
+          "phase": "connect",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+          "n": 8,
+          "bytes": 0,
+          "wire_bytes": 0,
+          "min_ms": 881.771,
+          "med_ms": 1354.583,
+          "p95_ms": 4597.58,
+          "max_ms": 4597.58,
+          "mbps": 0
+        },
+        {
+          "phase": "request",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+          "n": 8,
+          "bytes": 8192,
+          "wire_bytes": 10320,
+          "min_ms": 91.864,
+          "med_ms": 93.146,
+          "p95_ms": 97.661,
+          "max_ms": 97.661,
+          "mbps": 0
+        },
+        {
+          "phase": "up",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+          "n": 1,
+          "bytes": 65536,
+          "wire_bytes": 65802,
+          "min_ms": 712.786,
+          "med_ms": 712.786,
+          "p95_ms": 712.786,
+          "max_ms": 712.786,
+          "mbps": 0.08768399131737124,
+          "sha256": "f9a37ec2f50740f092e9f082d94ef69ba2c549b9527cd520c3e9aea321f088b0"
+        },
+        {
+          "phase": "down",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.1.4/tcp/44431",
+          "n": 1,
+          "bytes": 65536,
+          "wire_bytes": 65738,
+          "min_ms": 1195.245,
+          "med_ms": 1195.245,
+          "p95_ms": 1195.245,
+          "max_ms": 1195.245,
+          "mbps": 0.05229050806483366,
+          "sha256": "f9a37ec2f50740f092e9f082d94ef69ba2c549b9527cd520c3e9aea321f088b0"
+        }
+      ],
+      "phases_not_reached": [],
+      "phase_connect_successes": 8,
+      "phase_connect_failures": 0,
+      "raw_log_hash": {
+        "bytes": 2744,
+        "sha256": "fd15a9043ec9fffba2ae16f96e2d85a24e139a4ca83c01dc5c32c541b0131cfc"
+      }
+    },
+    {
+      "label": "perf-b-direct-1",
+      "host": "29663.et.net",
+      "policy": "direct",
+      "rounds": 8,
+      "payload_bytes": 33554432,
+      "public_only": true,
+      "exit": 1,
+      "wrapper_timeout": false,
+      "wall_seconds_not_throughput_window": 32.31088066101074,
+      "completed_at_utc": "2026-10-27T10:11:08Z",
+      "phases": [
+        {
+          "phase": "connect",
+          "policy": "direct",
+          "path": "",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "n": 0,
+          "bytes": 0,
+          "wire_bytes": 0,
+          "min_ms": 0,
+          "med_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0,
+          "mbps": 0,
+          "err": "perf phase \"connect\" op \"dial\" round 1 (path=\"\" fallback_attempted=false): peertransport: direct connect to 12D3KooWSUnVJs9ZoCy6umFF5Z5LwWX2Q8pomM3HH7Twy7DPscXJ: failed to dial: context deadline exceeded"
+        }
+      ],
+      "phases_not_reached": [
+        "request",
+        "up",
+        "down"
+      ],
+      "phase_connect_successes": 0,
+      "phase_connect_failures": 8,
+      "raw_log_hash": {
+        "bytes": 1671,
+        "sha256": "2561ac6858c1ffb6d6f3dbd972c087fc0763615e3166b03ff84bd7302a1ad1a6"
+      }
+    },
+    {
+      "label": "perf-b-fallback-1",
+      "host": "29663.et.net",
+      "policy": "direct-then-relay",
+      "rounds": 1,
+      "payload_bytes": 33554432,
+      "public_only": true,
+      "exit": 1,
+      "wrapper_timeout": false,
+      "wall_seconds_not_throughput_window": 126.36914277076721,
+      "completed_at_utc": "2026-10-27T10:22:06Z",
+      "phases": [
+        {
+          "phase": "connect",
+          "policy": "direct-then-relay",
+          "path": "circuit",
+          "fallback_attempted": true,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+          "n": 1,
+          "bytes": 0,
+          "wire_bytes": 0,
+          "min_ms": 4626.547,
+          "med_ms": 4626.547,
+          "p95_ms": 4626.547,
+          "max_ms": 4626.547,
+          "mbps": 0
+        },
+        {
+          "phase": "request",
+          "policy": "direct-then-relay",
+          "path": "direct",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/183.241.108.130/tcp/34950",
+          "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+          "n": 1,
+          "bytes": 1024,
+          "wire_bytes": 1290,
+          "min_ms": 109.235,
+          "med_ms": 109.235,
+          "p95_ms": 109.235,
+          "max_ms": 109.235,
+          "mbps": 0
+        },
+        {
+          "phase": "up",
+          "policy": "direct-then-relay",
+          "path": "direct",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/183.241.108.130/tcp/34950",
+          "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+          "n": 0,
+          "bytes": 0,
+          "wire_bytes": 6819840,
+          "min_ms": 0,
+          "med_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0,
+          "mbps": 0,
+          "err": "perf phase \"up\" op \"put\" round 1 (path=\"direct\" fallback_attempted=false): HTTP 400: {\"error\":\"read body: i/o deadline reached\"}"
+        }
+      ],
+      "phases_not_reached": [
+        "down"
+      ],
+      "phase_connect_successes": 1,
+      "phase_connect_failures": 0,
+      "raw_log_hash": {
+        "bytes": 2922,
+        "sha256": "6a4989b768ad575a49425d030bcbe7ca024aaf24dc97c33da7acf380fdf976c2"
+      }
+    },
+    {
+      "label": "perf-b-relay-1",
+      "host": "29663.et.net",
+      "policy": "forced-relay",
+      "rounds": 8,
+      "payload_bytes": 33554432,
+      "public_only": true,
+      "exit": 1,
+      "wrapper_timeout": false,
+      "wall_seconds_not_throughput_window": 40.65020561218262,
+      "completed_at_utc": "2026-10-27T10:11:54Z",
+      "phases": [
+        {
+          "phase": "connect",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+          "n": 8,
+          "bytes": 0,
+          "wire_bytes": 0,
+          "min_ms": 1036.871,
+          "med_ms": 1958.559,
+          "p95_ms": 4290.017,
+          "max_ms": 4290.017,
+          "mbps": 0
+        },
+        {
+          "phase": "request",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+          "n": 8,
+          "bytes": 8192,
+          "wire_bytes": 10320,
+          "min_ms": 93.372,
+          "med_ms": 350.676,
+          "p95_ms": 1195.034,
+          "max_ms": 1195.034,
+          "mbps": 0
+        },
+        {
+          "phase": "up",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+          "n": 0,
+          "bytes": 0,
+          "wire_bytes": 1572825,
+          "min_ms": 0,
+          "med_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0,
+          "mbps": 0,
+          "err": "perf phase \"up\" op \"put\" round 1 (path=\"circuit\" fallback_attempted=false): Put \"http://peer/objects/perf-bw-1793095897102292971\": stream reset: stream reset: connection closed: connection write timeout"
+        }
+      ],
+      "phases_not_reached": [
+        "down"
+      ],
+      "phase_connect_successes": 8,
+      "phase_connect_failures": 0,
+      "raw_log_hash": {
+        "bytes": 2618,
+        "sha256": "408d276c3f66ad5bc6e3c1206ae8ebc6bb730a9edc30ac5ae60e8c67a822ac14"
+      }
+    },
+    {
+      "label": "perf-b-relay-small-1",
+      "host": "29663.et.net",
+      "policy": "forced-relay",
+      "rounds": 8,
+      "payload_bytes": 65536,
+      "public_only": true,
+      "exit": 1,
+      "wrapper_timeout": false,
+      "wall_seconds_not_throughput_window": 20.761149644851685,
+      "completed_at_utc": "2026-10-27T10:12:19Z",
+      "phases": [
+        {
+          "phase": "connect",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+          "n": 7,
+          "bytes": 0,
+          "wire_bytes": 0,
+          "min_ms": 819.481,
+          "med_ms": 2017.776,
+          "p95_ms": 8811.755,
+          "max_ms": 8811.755,
+          "mbps": 0,
+          "err": "perf phase \"connect\" op \"dial\" round 2 (path=\"\" fallback_attempted=false): peertransport: expected limited circuit connection, got /ip4/183.241.108.130/tcp/34950 (limited=false)"
+        }
+      ],
+      "phases_not_reached": [
+        "request",
+        "up",
+        "down"
+      ],
+      "phase_connect_successes": 7,
+      "phase_connect_failures": 1,
+      "raw_log_hash": {
+        "bytes": 1712,
+        "sha256": "5f79920a23baa09571e5d78ac6c1fcb161db3b5f2be1a463e3eb1f351a13fffc"
+      }
+    },
+    {
+      "label": "perf-b-relay-small-2",
+      "host": "29663.et.net",
+      "policy": "forced-relay",
+      "rounds": 8,
+      "payload_bytes": 65536,
+      "public_only": true,
+      "exit": 1,
+      "wrapper_timeout": false,
+      "wall_seconds_not_throughput_window": 11.356693744659424,
+      "completed_at_utc": "2026-10-27T10:19:56Z",
+      "phases": [
+        {
+          "phase": "connect",
+          "policy": "forced-relay",
+          "path": "circuit",
+          "fallback_attempted": false,
+          "fallback_upgraded": false,
+          "endpoint": "/ip4/193.134.209.37/tcp/4001/p2p/12D3KooWBnW2mek5RxN5Yq6jsEbK9VHVbui5uZ6cCBwVLxs9uPbE/p2p-circuit",
+          "local_multiaddr": "/ip4/192.168.3.85/tcp/44431",
+          "n": 7,
+          "bytes": 0,
+          "wire_bytes": 0,
+          "min_ms": 854.185,
+          "med_ms": 1173.647,
+          "p95_ms": 2398.588,
+          "max_ms": 2398.588,
+          "mbps": 0,
+          "err": "perf phase \"connect\" op \"dial\" round 2 (path=\"\" fallback_attempted=false): peertransport: expected limited circuit connection, got /ip4/183.241.108.130/tcp/34950 (limited=false)"
+        }
+      ],
+      "phases_not_reached": [
+        "request",
+        "up",
+        "down"
+      ],
+      "phase_connect_successes": 7,
+      "phase_connect_failures": 1,
+      "raw_log_hash": {
+        "bytes": 1712,
+        "sha256": "fcf43fb7bd22778df0137cc91ee56175c09875dff1760f1a5476a72697c383b0"
+      }
+    }
+  ],
+  "local_validation": {
+    "peer_prototype_race": "passed (30.815s)",
+    "wanrunner_race": "passed (3.665s)",
+    "peer_prototype_vet": "passed",
+    "root_tests": "not rerun: no production source modified",
+    "kernel_fuse_tests": "not run",
+    "statistics_and_log_hash_validation": "passed by build_evidence.py"
+  },
+  "cleanup": {
+    "status": "passed",
+    "owned_directories": {
+      "26666.et.net": {
+        "removed": "/root/.atoll-wan-direct-d3ecf815af94",
+        "owner": {
+          "run_id": "wan-direct-d3ecf815af94",
+          "uid": 0,
+          "path": "/root/.atoll-wan-direct-d3ecf815af94"
+        },
+        "files_removed": 8,
+        "bytes_removed": 34921604,
+        "processes": [
+          {
+            "pid": 2789897,
+            "role": "relay",
+            "owned_live": false
+          },
+          {
+            "pid": 2789952,
+            "role": "control",
+            "owned_live": false
+          }
+        ],
+        "log_hashes_before_removal": {
+          "relay.relay.log": {
+            "bytes": 794,
+            "sha256": "ef1764bf0e31aad6efb28aba0c86fb5e0dad42ea8c71b33d266870f5b06acb93"
+          },
+          "control.control.log": {
+            "bytes": 2873,
+            "sha256": "d70dfd8838dd13efeb00b328447ea5fd01da38c29f65b8eb5a93e70440baaed8"
+          }
+        },
+        "verified_absent": true,
+        "time_utc": "2026-10-27T10:30:30Z"
+      },
+      "29663.et.net": {
+        "removed": "/volume1/homes/jimo/.atoll-wan-direct-d3ecf815af94",
+        "owner": {
+          "run_id": "wan-direct-d3ecf815af94",
+          "uid": 1026,
+          "path": "/volume1/homes/jimo/.atoll-wan-direct-d3ecf815af94"
+        },
+        "files_removed": 748,
+        "bytes_removed": 10698148347,
+        "processes": [
+          {
+            "pid": 6303,
+            "role": "peer",
+            "owned_live": false
+          },
+          {
+            "pid": 16892,
+            "role": "peer",
+            "owned_live": false
+          },
+          {
+            "pid": 21443,
+            "role": "perf",
+            "owned_live": false
+          },
+          {
+            "pid": 22052,
+            "role": "perf",
+            "owned_live": false
+          },
+          {
+            "pid": 22821,
+            "role": "perf",
+            "owned_live": false
+          },
+          {
+            "pid": 29217,
+            "role": "perf",
+            "owned_live": false
+          },
+          {
+            "pid": 29538,
+            "role": "perf",
+            "owned_live": false
+          },
+          {
+            "pid": 31344,
+            "role": "peer",
+            "owned_live": false
+          }
+        ],
+        "log_hashes_before_removal": {
+          "peer-b.peer.log": {
+            "bytes": 1070488,
+            "sha256": "7bd53fa6c4499d633dc8c8414169b04cbbea296c1b8c50faaa23a4edfb1136b0"
+          },
+          "idle-b-1.log": {
+            "bytes": 3375,
+            "sha256": "8303d45c03ab9b28009bb381b4d1ab9741eabb1de87b1f4e0d67a2dd2c139730"
+          },
+          "perf-b-direct-1.log": {
+            "bytes": 1671,
+            "sha256": "2561ac6858c1ffb6d6f3dbd972c087fc0763615e3166b03ff84bd7302a1ad1a6"
+          },
+          "perf-b-relay-1.log": {
+            "bytes": 2618,
+            "sha256": "408d276c3f66ad5bc6e3c1206ae8ebc6bb730a9edc30ac5ae60e8c67a822ac14"
+          },
+          "perf-b-relay-small-1.log": {
+            "bytes": 1712,
+            "sha256": "5f79920a23baa09571e5d78ac6c1fcb161db3b5f2be1a463e3eb1f351a13fffc"
+          },
+          "perf-b-relay-small-2.log": {
+            "bytes": 1712,
+            "sha256": "fcf43fb7bd22778df0137cc91ee56175c09875dff1760f1a5476a72697c383b0"
+          },
+          "perf-b-fallback-1.log": {
+            "bytes": 2922,
+            "sha256": "6a4989b768ad575a49425d030bcbe7ca024aaf24dc97c33da7acf380fdf976c2"
+          },
+          "idle-b-2.log": {
+            "bytes": 3481,
+            "sha256": "ea89a2ff9fdf4a69f221400d2e728be5aaaba873f589a1940037adaca2906eb4"
+          }
+        },
+        "verified_absent": true,
+        "time_utc": "2026-10-27T10:30:31Z"
+      },
+      "28425.et.net": {
+        "removed": "/volume2/homes/jimo/.atoll-wan-direct-d3ecf815af94",
+        "owner": {
+          "run_id": "wan-direct-d3ecf815af94",
+          "uid": 1026,
+          "path": "/volume2/homes/jimo/.atoll-wan-direct-d3ecf815af94"
+        },
+        "files_removed": 748,
+        "bytes_removed": 8622575316,
+        "processes": [
+          {
+            "pid": 461,
+            "role": "peer",
+            "owned_live": false
+          },
+          {
+            "pid": 20617,
+            "role": "perf",
+            "owned_live": false
+          },
+          {
+            "pid": 21734,
+            "role": "perf",
+            "owned_live": false
+          },
+          {
+            "pid": 28788,
+            "role": "perf",
+            "owned_live": false
+          },
+          {
+            "pid": 29489,
+            "role": "peer",
+            "owned_live": false
+          },
+          {
+            "pid": 18897,
+            "role": "perf",
+            "owned_live": false
+          }
+        ],
+        "log_hashes_before_removal": {
+          "peer-a.peer.log": {
+            "bytes": 904301,
+            "sha256": "e2c979796aa1b4c999f5f74adb49c368acb45fb354962b55769ad56e032d5719"
+          },
+          "perf-a-direct-1.log": {
+            "bytes": 1667,
+            "sha256": "725a1ff0ee84fcdd8e79c8ecf9878466da10eb1647acf983e1a5719042ce963d"
+          },
+          "perf-a-relay-1.log": {
+            "bytes": 2609,
+            "sha256": "ae2dd26dd2300d62da65df19f09eed80ecc2dbef58fa2718984d98d1bdadacde"
+          },
+          "perf-a-relay-small-1.log": {
+            "bytes": 2744,
+            "sha256": "fd15a9043ec9fffba2ae16f96e2d85a24e139a4ca83c01dc5c32c541b0131cfc"
+          },
+          "idle-a-1.log": {
+            "bytes": 4737,
+            "sha256": "4abe8e2460ca1c79107b2eb379f4c726da19f0db53fa01cf15116b84ac06d095"
+          },
+          "perf-a-fallback-1.log": {
+            "bytes": 3237,
+            "sha256": "00ea921bc0564dd2a16b0eb519c4d58858ba2733b81dde9b457a66e589488f3b"
+          }
+        },
+        "verified_absent": true,
+        "time_utc": "2026-10-27T10:30:38Z"
+      }
+    },
+    "temporary_firewall": {
+      "time_utc": "2026-10-27T10:30:48Z",
+      "ports": {
+        "4000/tcp": {
+          "before": "yes",
+          "removal": {
+            "exit": 0,
+            "stdout": "success"
+          },
+          "runtime": "no",
+          "permanent": "no"
+        },
+        "4000/udp": {
+          "before": "yes",
+          "removal": {
+            "exit": 0,
+            "stdout": "success"
+          },
+          "runtime": "no",
+          "permanent": "no"
+        },
+        "4001/tcp": {
+          "before": "yes",
+          "removal": {
+            "exit": 0,
+            "stdout": "success"
+          },
+          "runtime": "no",
+          "permanent": "no"
+        },
+        "4001/udp": {
+          "before": "yes",
+          "removal": {
+            "exit": 0,
+            "stdout": "success"
+          },
+          "runtime": "no",
+          "permanent": "no"
+        }
+      },
+      "permanent_modified": false
+    },
+    "test_added_ssh_known_hosts_entry_restored": {
+      "restored": true,
+      "path": "/root/.ssh/known_hosts",
+      "removed_only_test_appended_entry_for": "29663.et.net",
+      "before_line_count": 11,
+      "after_line_count": 10,
+      "before_sha256": "5a651bc127c3cccf7f111269646906ac794019126b6ca0a83c4d644b3fbfb5f7",
+      "after_sha256": "64a56ade5996aea0cb269e4b273b27deeae984751cdcc8cbe7cafd2781bb887c",
+      "previous_entries_byte_identical": true,
+      "mode_preserved": true,
+      "query_after_exit": 1,
+      "time_utc": "2026-10-27T10:45:06Z"
+    },
+    "formal_health_before": {
+      "28425.et.net": {
+        "time_utc": "2026-10-27T10:29:57Z",
+        "host": "28425.et.net",
+        "formal_port": 9421,
+        "overlay_processes": [
+          {
+            "pid": 21674,
+            "comm": "tailscaled",
+            "start_time": "10544"
+          },
+          {
+            "pid": 22284,
+            "comm": "easytier-core",
+            "start_time": "11770"
+          },
+          {
+            "pid": 25140,
+            "comm": "easytier-core",
+            "start_time": "14008"
+          }
+        ],
+        "resolved_ip": "10.126.126.6",
+        "formal_health_status": 200
+      },
+      "26666.et.net": {
+        "time_utc": "2026-10-27T10:29:58Z",
+        "host": "26666.et.net",
+        "formal_port": 9420,
+        "overlay_processes": [
+          {
+            "pid": 710,
+            "comm": "easytier-core",
+            "start_time": "777"
+          },
+          {
+            "pid": 714,
+            "comm": "easytier-web-em",
+            "start_time": "778"
+          }
+        ],
+        "resolved_ip": "10.126.126.126",
+        "formal_health_status": 200
+      },
+      "29663.et.net": {
+        "time_utc": "2026-10-27T10:29:59Z",
+        "host": "29663.et.net",
+        "formal_port": 9421,
+        "overlay_processes": [
+          {
+            "pid": 15960,
+            "comm": "tailscaled",
+            "start_time": "8952"
+          },
+          {
+            "pid": 17132,
+            "comm": "easytier-core",
+            "start_time": "9382"
+          },
+          {
+            "pid": 20895,
+            "comm": "easytier-core",
+            "start_time": "12782"
+          }
+        ],
+        "resolved_ip": "13.248.169.48",
+        "formal_health_error": "<urlopen error timed out>"
+      }
+    },
+    "formal_health_after": {
+      "28425.et.net": {
+        "time_utc": "2026-10-27T10:30:49Z",
+        "host": "28425.et.net",
+        "formal_port": 9421,
+        "overlay_processes": [
+          {
+            "pid": 21674,
+            "comm": "tailscaled",
+            "start_time": "10544"
+          },
+          {
+            "pid": 22284,
+            "comm": "easytier-core",
+            "start_time": "11770"
+          },
+          {
+            "pid": 25140,
+            "comm": "easytier-core",
+            "start_time": "14008"
+          }
+        ],
+        "resolved_ip": "10.126.126.6",
+        "formal_health_status": 200
+      },
+      "26666.et.net": {
+        "time_utc": "2026-10-27T10:30:50Z",
+        "host": "26666.et.net",
+        "formal_port": 9420,
+        "overlay_processes": [
+          {
+            "pid": 710,
+            "comm": "easytier-core",
+            "start_time": "777"
+          },
+          {
+            "pid": 714,
+            "comm": "easytier-web-em",
+            "start_time": "778"
+          }
+        ],
+        "resolved_ip": "10.126.126.126",
+        "formal_health_status": 200
+      },
+      "29663.et.net": {
+        "time_utc": "2026-10-27T10:30:50Z",
+        "host": "29663.et.net",
+        "formal_port": 9421,
+        "overlay_processes": [
+          {
+            "pid": 15960,
+            "comm": "tailscaled",
+            "start_time": "8952"
+          },
+          {
+            "pid": 17132,
+            "comm": "easytier-core",
+            "start_time": "9382"
+          },
+          {
+            "pid": 20895,
+            "comm": "easytier-core",
+            "start_time": "12782"
+          }
+        ],
+        "resolved_ip": "13.248.169.48",
+        "formal_health_error": "<urlopen error timed out>"
+      }
+    },
+    "easytier_restarted": false,
+    "formal_services_replaced": false,
+    "formal_dns_or_permanent_firewall_modified": false,
+    "extra_discovery_and_29663_port_check": {
+      "collected_at_utc": "2026-10-27T10:34:16Z",
+      "center_dns": {
+        "27119.et.net": "13.248.169.48",
+        "29663.et.net": "10.126.126.9"
+      },
+      "easytier_cli_query_exit": 0,
+      "29663_online_row": "| 10.126.126.9/24   | 29663                        | p2p      | 47.78   | 7.0%  | 4.41 MB   | 3.43 MB   | udp          | PortRestricted   | 2.6.4-8428a89d |",
+      "27119_in_online_peer_table": false,
+      "29663_local_formal_port_check": {
+        "time_utc": "2026-10-27T10:34:23Z",
+        "formal_port": 9421,
+        "listening_port_entries": [],
+        "atoll_processes": [],
+        "loopback_health_error": "<urlopen error [Errno 111] Connection refused>"
+      }
+    }
+  },
+  "raw_local_evidence_hashes": {
+    "peer-logs-round1.json": {
+      "bytes": 6587,
+      "sha256": "ed93f5de4eb326cf8cd52a2856f04b76e3133a8ccbaafc74c2f88aaf05f27415"
+    },
+    "peer-logs-round2.json": {
+      "bytes": 6587,
+      "sha256": "ed93f5de4eb326cf8cd52a2856f04b76e3133a8ccbaafc74c2f88aaf05f27415"
+    },
+    "peer-logs-round3.json": {
+      "bytes": 65757,
+      "sha256": "0538e63495d7e415036304c1225138b75a28b71e58c73b3ef7baf6c17bb378a9"
+    },
+    "full-probe-logs.json": {
+      "bytes": 2228012,
+      "sha256": "63b3cee9e34f7b9a446a312d0b4a358ad2004e15f32136a599a9b381f9f757a2"
+    },
+    "final-remote-logs.json": {
+      "bytes": 2266649,
+      "sha256": "e12149adf0324c414cf4540a6fe32caa9a76550a801d1db9cb57934a0fed41c5"
+    },
+    "route-process-inspection.json": {
+      "bytes": 19051,
+      "sha256": "d020a19c3c5e3fd2497db2b50fd6bdc4881aae574ca2b4a5282bec500a76e11e"
+    },
+    "final-process-inspection.json": {
+      "bytes": 25185,
+      "sha256": "9c23c1ea3983bf35fc705d95d98790a85874ee65ffef628151fab898a00c3312"
+    },
+    "stopped-probes-1.json": {
+      "bytes": 300,
+      "sha256": "2f29861b9d0860cff765f73fb484ca2292b5c6cc530805905e36d6f8f7fb0718"
+    },
+    "stopped-center.json": {
+      "bytes": 279,
+      "sha256": "538954c5e322bf6fd8246bde223d626f682d907c41a6b29235ca157fe2fce69e"
+    },
+    "cleanup-owned.json": {
+      "bytes": 5100,
+      "sha256": "0a60a604b15b0f65abb42b08d233f3c95fe2e488e1caf1ff146f60066991f0ef"
+    },
+    "firewall-inspection-1.json": {
+      "bytes": 554,
+      "sha256": "d6f0c0cd317474e8982d35e85dd0e660cf769502ffba26070578ae9c19766d49"
+    },
+    "firewall-renewal.json": {
+      "bytes": 512,
+      "sha256": "820b4e8c08d0f79dc3ada09214c5edb062ea4826e68a705f46324607235930b2"
+    },
+    "firewall-cleanup.json": {
+      "bytes": 769,
+      "sha256": "57c55d9cb5448bee5dc4dd6a1f6903ac691ef01acdd0359c88e7362c5ad063cd"
+    },
+    "health-before-cleanup.json": {
+      "bytes": 1485,
+      "sha256": "d515947f0af91c0133928fd8d99f5ab9e5c33f691a226e28f7f27336e2480833"
+    },
+    "health-after-cleanup.json": {
+      "bytes": 1485,
+      "sha256": "f7691d21be0005c31b7999e29de82ba1337ea567e20df0b513404b2f7fd5f8c3"
+    },
+    "final-discovery-health.json": {
+      "bytes": 4280,
+      "sha256": "9fab018c8c7009ac26213fe8d875527de33585171eb6717a03c850d4e707f585"
+    },
+    "known-hosts-inspection.json": {
+      "bytes": 485,
+      "sha256": "3a24ac76b6481aab462b6873f4ce49e9da83932e1418b9f467ad51e3094bac79"
+    },
+    "known-hosts-restoration.json": {
+      "bytes": 475,
+      "sha256": "e20600ba7530ef15378eac209176fb6d54e2e2c454094c429dcb4608a4f9e01a"
+    }
+  },
+  "raw_evidence_policy": "Private local run directory only; credentials, SSH settings, test identity private keys and raw machine listings not committed.",
+  "remaining": {
+    "previous_27119_residue_cleaned": false,
+    "previous_27119_residue": "/volume1/@fake_home_link/jimo/.atoll-transfer-346fbb3b43fe-zowqlse0",
+    "main_merged": false,
+    "production_deployed": false,
+    "p2p_production_wiring_validated": false,
+    "all_nat_pairs_compatible": false,
+    "root_cause_of_cold_dial_and_large_transfer_failures_isolated": false
+  }
+}
