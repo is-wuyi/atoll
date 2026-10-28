@@ -29,6 +29,7 @@ import (
 
 	"atoll/pkg/access"
 	"atoll/pkg/peerhttp"
+	"atoll/pkg/types"
 )
 
 // errNotSecure：非 NewSecure 创建的客户端没有会话语义（旧构造函数保持兼容模式）。
@@ -274,12 +275,20 @@ const maxTicketWait = 30 * time.Second
 // fetchTicket 向 master 申请绑定本次请求属性的短期票据。PlanID 用户侧通常无需填写
 // （保护计划由 master 关联）；对象数据面 body 不绑定 hash（两端协议一致，master 裁决）。
 func (t *secureTransport) fetchTicket(req *http.Request, token string, spaceID uint64) (access.Ticket, error) {
+	// WriteEpoch / Resume 绑定本次请求的写入世代：世代化写入必须带世代，
+	// resume 表示零长度重确认。票据据此绑定，master 在核验时比对当前世代。
+	writeEpoch, resume, epochErr := clientWriteEpoch(req)
+	if epochErr != nil {
+		return access.Ticket{}, epochErr
+	}
 	tr := access.TicketRequest{
-		NodeAddr: req.URL.Host,
-		Method:   req.Method,
-		Path:     req.URL.Path,
-		Query:    req.URL.RawQuery,
-		BodyHash: nodeBodyHash(req),
+		NodeAddr:   req.URL.Host,
+		Method:     req.Method,
+		Path:       req.URL.Path,
+		Query:      req.URL.RawQuery,
+		BodyHash:   nodeBodyHash(req),
+		WriteEpoch: writeEpoch,
+		Resume:     resume,
 	}
 	b, err := json.Marshal(tr)
 	if err != nil {
@@ -329,6 +338,35 @@ func nodeBodyHash(req *http.Request) string {
 		return ""
 	}
 	return bindBodyHash(req)
+}
+
+// clientWriteEpoch 解析请求携带的写入世代与 resume 意图。格式非法一律报错，
+// 绝不降级为“无世代”：降级会让世代化请求绕过世代闸。
+func clientWriteEpoch(req *http.Request) (uint64, bool, error) {
+	if req == nil || req.Header == nil {
+		return 0, false, nil
+	}
+	epoch := uint64(0)
+	if raw := req.Header.Get(types.WriteEpochHeader); raw != "" {
+		v, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil || v == 0 {
+			return 0, false, fmt.Errorf("invalid write epoch header")
+		}
+		epoch = v
+	}
+	resume := false
+	if raw := req.Header.Get(types.WriteResumeHeader); raw != "" {
+		switch raw {
+		case "1", "true":
+			resume = true
+		default:
+			return 0, false, fmt.Errorf("invalid write resume header")
+		}
+	}
+	if resume && epoch == 0 {
+		return 0, false, fmt.Errorf("write resume requires a write epoch")
+	}
+	return epoch, resume, nil
 }
 
 // bindBodyHash 对小的内存 body（可回卷）计算 hex(sha256) 绑定进票据；其余返回空。

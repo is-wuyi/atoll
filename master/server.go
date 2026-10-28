@@ -132,6 +132,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /meta", s.handleLookup) // ?path=/a/b
 	mux.HandleFunc("POST /writes", s.handleBeginWrite)
 	mux.HandleFunc("POST /writes/chunks", s.handlePlanWriteChunk)
+	mux.HandleFunc("POST /writes/chunks/recover", s.handleRecoverWriteChunk)
 	mux.HandleFunc("GET /writes/transfer-nodes", s.handleWriteTransferNodes)
 	mux.HandleFunc("GET /writes/status", s.handleWriteStatus)
 	mux.HandleFunc("POST /nodes/transfer-observation", s.handleNodeTransferObservation)
@@ -152,6 +153,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /files/replicated/present", s.handlePresentReplica)
 	mux.HandleFunc("POST /files/objects/suspect", s.handlePhysicalSuspect)
 	mux.HandleFunc("POST /files/protection/progress", s.handleProtectionProgress) // 目标节点进度/失败反馈
+	mux.HandleFunc("POST /files/writes/progress", s.handleWriteProgress)
 	mux.HandleFunc("POST /files/chunks/suspect", s.handleChunkSuspect)
 	mux.HandleFunc("POST /files/suspect", s.handleReportSuspect) // 版本校验后标记整对象副本待修
 	mux.HandleFunc("POST /files/small", s.handleCreateSmall)     // 小文件单请求通道（v2-2a）

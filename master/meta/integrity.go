@@ -22,6 +22,7 @@ func describeInodeObject(in types.Inode, objectID uint64) (types.ObjectIntegrity
 			d.Chunked, d.ChunkIndex = true, ch.Index
 			d.Size, d.Checksum, d.ChecksumKnown = ch.Size, ch.Checksum, ch.ChecksumKnown || ch.Checksum != 0
 			d.IntegrityEpoch = ch.IntegrityEpoch
+			d.WriteEpoch = ch.WriteEpoch
 			d.Replicas, d.Done, d.Suspect = ch.Replicas, ch.Done, ch.Suspect
 			return d, true
 		}
@@ -70,6 +71,13 @@ func integrityTx(tx *bolt.Tx, id uint64) (types.ObjectIntegrity, error) {
 			if rec.Upload.State == types.WriteAborted || (rec.Upload.State == types.WritePending && !time.Now().Before(rec.Upload.ExpiresAt)) {
 				return types.ObjectIntegrity{}, ErrWriteExpired
 			}
+			if rec.Upload.State == types.WritePending {
+				for _, plan := range rec.Upload.Chunks {
+					if plan.Object.ID == id && plan.Recovery != nil && !time.Now().Before(plan.Recovery.HardUntil) {
+						return types.ObjectIntegrity{}, ErrWriteExpired
+					}
+				}
+			}
 		}
 	}
 	if in, err := getInodeTx(tx, owner); err == nil {
@@ -115,7 +123,7 @@ func (s *Store) ObjectIntegrity(id uint64) (types.ObjectIntegrity, error) {
 }
 
 func sameObjectContents(a, b types.ObjectIntegrity) bool {
-	if a.ObjectID != b.ObjectID || a.Size != b.Size || a.ChecksumKnown != b.ChecksumKnown || a.Checksum != b.Checksum || a.Chunked != b.Chunked {
+	if a.ObjectID != b.ObjectID || a.Size != b.Size || a.ChecksumKnown != b.ChecksumKnown || a.Checksum != b.Checksum || a.Chunked != b.Chunked || a.WriteEpoch != b.WriteEpoch {
 		return false
 	}
 	if a.Chunked && a.ChunkIndex != b.ChunkIndex {

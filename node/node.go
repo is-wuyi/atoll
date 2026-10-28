@@ -187,6 +187,19 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	writeEpoch, resume, epochErr := requestWriteEpoch(r)
+	if epochErr != nil {
+		httpError(w, http.StatusBadRequest, epochErr.Error())
+		return
+	}
+	// 世代与 resume 只对计划写入对象有意义。落到 legacy 路径时必须显式拒绝，
+	// 否则零长度 resume 会被当成一次空对象写入。
+	if resume || writeEpoch != 0 {
+		if !(n.nodeID.Load() > 0 && id >= types.StagingInodeBase<<8) {
+			httpError(w, http.StatusConflict, "write epoch is not applicable to this object")
+			return
+		}
+	}
 	expectedSize := int64(-1)
 	var flowBPS uint64
 	ctx := r.Context()
@@ -194,6 +207,16 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		plan, err := n.replicationPlan(r.Context(), id)
 		if err != nil {
 			httpError(w, http.StatusConflict, err.Error())
+			return
+		}
+		// 世代闸：请求必须携带 descriptor 当前世代。replan 前取到的 descriptor
+		// 与 replan 后的请求在此处被拒，in-flight 请求不会以旧布局发布。
+		if err := admitWriteEpoch(plan.Object, writeEpoch); err != nil {
+			httpError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if resume {
+			n.handleResumeObject(w, r, id, plan, writeEpoch)
 			return
 		}
 		if plan.WriteTransfer != nil {
@@ -215,6 +238,61 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		if plan.Object.ChecksumKnown {
 			checksum = &plan.Object.Checksum
 		}
+		// 捕获本次请求被授权的世代：回执必须用它，不能用之后重新取到的
+		// descriptor，否则旧世代请求会被“升级”成新世代而绕过世代闸。
+		captured := plan.Object
+		captured.WriteEpoch = writeEpoch
+		body, release, err := n.receiveWithBudget(ctx, r.Body, flowBPS)
+		if err != nil {
+			httpError(w, http.StatusServiceUnavailable, "transfer download budget unavailable")
+			return
+		}
+		defer release()
+		// payload 进度只在实际读到字节时前进；无世代的 legacy 写入不上报。
+		progress := newWriteProgressReporter(n, id, writeEpoch)
+		defer progress.Finish()
+		if progress != nil {
+			body = &progressCountingReader{src: body, counter: progress}
+		}
+		size, _, err := n.storeVerifiedObjectFenced(id, body, checksum, expectedSize, n.writeEpochFence(id, writeEpoch))
+		if err != nil {
+			log.Printf("put object %d: %v", id, err)
+			// 容量硬闸拒绝 ≠ 内部错误：507 让调用方能区分「节点满」与「节点坏」。
+			if errors.Is(err, errCapacityExceeded) {
+				httpError(w, http.StatusInsufficientStorage, err.Error())
+				return
+			}
+			if errors.Is(err, errObjectRetired) {
+				httpError(w, http.StatusConflict, err.Error())
+				return
+			}
+			if errors.Is(err, errWriteEpochSuperseded) {
+				httpError(w, http.StatusConflict, err.Error())
+				return
+			}
+			httpError(w, http.StatusInternalServerError, "write object failed")
+			return
+		}
+		// 回执同步发送且与客户端断连解耦：字节已落盘且通过校验，客户端断开
+		// 不应导致回执丢失；但回执被拒必须显式失败，不能当成成功。
+		receiptCtx, cancelReceipt := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancelReceipt()
+		if err := n.reportStored(receiptCtx, captured); err != nil {
+			// 回执被拒（世代过期/副本被改派/内容变化）不是成功：显式失败。
+			log.Printf("put object %d receipt: %v", id, err)
+			if errors.Is(err, errReceiptRejected) || errors.Is(err, errWriteEpochSuperseded) {
+				httpError(w, http.StatusConflict, err.Error())
+				return
+			}
+			httpError(w, http.StatusServiceUnavailable, "write receipt failed")
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]int64{"size": size})
+		// 客户端直写视为"我是主副本"：成功后异步推送到其余副本节点。
+		if n.nodeID.Load() != 0 {
+			go n.replicateToPeers(id)
+		}
+		return
 	}
 	body, release, err := n.receiveWithBudget(ctx, r.Body, flowBPS)
 	if err != nil {
@@ -246,6 +324,8 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 
 // replicateToPeers 把指定对象推送到 master 分配的其余副本节点（带重试）。
 // 目标列表实时从 master 获取，已完成的节点会被 master 过滤掉，因此重试天然幂等。
+// 回执使用本次取到的 descriptor 的世代：世代推进后旧回执会被 master 拒，
+// 此时不再重试（该世代已被取代），而不是把旧世代“升级”成新世代。
 func (n *Node) replicateToPeers(objectID uint64) {
 	for attempt := 1; attempt <= 3; attempt++ {
 		plan, err := n.replicationPlan(context.Background(), objectID)
@@ -268,6 +348,11 @@ func (n *Node) replicateToPeers(objectID uint64) {
 		if err == nil {
 			return
 		}
+		if errors.Is(err, errReceiptRejected) || errors.Is(err, errWriteEpochSuperseded) {
+			// 世代已被取代：重试只会重复被拒。
+			log.Printf("replicate %d superseded: %v", objectID, err)
+			return
+		}
 		log.Printf("replicate %d attempt %d: %v", objectID, attempt, err)
 		if attempt < 3 {
 			time.Sleep(time.Duration(attempt) * time.Second)
@@ -288,8 +373,19 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	writeEpoch, _, epochErr := requestWriteEpoch(r)
+	if epochErr != nil {
+		httpError(w, http.StatusBadRequest, epochErr.Error())
+		return
+	}
 	plan, err := n.replicationPlan(r.Context(), id)
 	if err != nil {
+		httpError(w, http.StatusConflict, err.Error())
+		return
+	}
+	// 世代闸：旧 relay 复制腿在 replan 之后必须被拒，不能按当前布局改派后
+	// 继续写同一对象。
+	if err := admitWriteEpoch(plan.Object, writeEpoch); err != nil {
 		httpError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -316,22 +412,38 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	progress := newWriteProgressReporter(n, id, writeEpoch)
+	defer progress.Finish()
+	if progress != nil {
+		body = &progressCountingReader{src: body, counter: progress}
+	}
 	var crc *uint32
 	if plan.Object.ChecksumKnown {
 		crc = &plan.Object.Checksum
 	}
-	size, _, err := n.storeVerifiedObject(id, body, crc, plan.Object.Size)
+	size, _, err := n.storeVerifiedObjectFenced(id, body, crc, plan.Object.Size, n.writeEpochFence(id, writeEpoch))
 	if err != nil {
 		log.Printf("replicate object %d: %v", id, err)
 		if errors.Is(err, errObjectRetired) {
 			httpError(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errors.Is(err, errWriteEpochSuperseded) {
+			httpError(w, http.StatusConflict, err.Error())
+			return
+		}
 		httpError(w, http.StatusUnprocessableEntity, "object does not match metadata or could not be stored")
 		return
 	}
-	if err := n.reportStored(ctx, plan.Object); err != nil {
-		httpError(w, http.StatusConflict, err.Error())
+	// 回执使用本次请求被授权的世代。
+	captured := plan.Object
+	captured.WriteEpoch = writeEpoch
+	if err := n.reportStored(ctx, captured); err != nil {
+		if errors.Is(err, errReceiptRejected) || errors.Is(err, errWriteEpochSuperseded) {
+			httpError(w, http.StatusConflict, err.Error())
+			return
+		}
+		httpError(w, http.StatusServiceUnavailable, "write receipt failed")
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]int64{"size": size})
@@ -792,6 +904,13 @@ func reservedSoFar(rr *reservingReader, fixed int64) int64 {
 }
 
 func (n *Node) storeVerifiedObject(id uint64, r io.Reader, expectCRC *uint32, expectSize int64) (written int64, checksum uint32, resultErr error) {
+	return n.storeVerifiedObjectFenced(id, r, expectCRC, expectSize, nil)
+}
+
+// storeVerifiedObjectFenced 是 storeVerifiedObject 的带世代闸变体。fence 非 nil
+// 时，在持有对象锁、原子改名之前重新校验该世代仍然有效；世代已推进（replan）
+// 或本节点已被移出新布局时拒绝发布，且不留下已改名的目标文件。
+func (n *Node) storeVerifiedObjectFenced(id uint64, r io.Reader, expectCRC *uint32, expectSize int64, fence publishFence) (written int64, checksum uint32, resultErr error) {
 	if expectSize < -1 || expectSize == int64(^uint64(0)>>1) {
 		return 0, 0, fmt.Errorf("invalid expected object size")
 	}
@@ -809,7 +928,7 @@ func (n *Node) storeVerifiedObject(id uint64, r io.Reader, expectCRC *uint32, ex
 	if expectSize >= 0 {
 		if err := n.reserveCapacity(expectSize); err != nil {
 			if expectCRC != nil && errors.Is(err, errCapacityExceeded) {
-				matched, replayErr := n.verifyStoredReplay(id, r, expectSize, *expectCRC)
+				matched, replayErr := n.verifyStoredReplay(id, r, expectSize, *expectCRC, fence)
 				if replayErr != nil {
 					return 0, 0, replayErr
 				}
@@ -898,6 +1017,14 @@ func (n *Node) storeVerifiedObject(id uint64, r io.Reader, expectCRC *uint32, ex
 	if err := n.checkObjectFence(id); err != nil {
 		lock.Unlock()
 		return 0, 0, err
+	}
+	// 世代闸在改名之前、持有对象锁时执行：此刻若 replan 已经推进世代（或
+	// 本节点已被移出新布局），本次写入不发布，临时文件由 defer 清理。
+	if fence != nil {
+		if err := fence(); err != nil {
+			lock.Unlock()
+			return 0, 0, err
+		}
 	}
 	var oldSize int64
 	if st, err := os.Stat(objPath); err == nil {

@@ -41,6 +41,7 @@ type Client struct {
 	writeEnabled        bool
 	writeChecked        time.Time
 	transferEnabled     bool
+	writeRecovery       bool
 	transferBudget      *types.TransferBudget
 	transferUpload      *transferbudget.Limiter
 	transferMu          sync.Mutex

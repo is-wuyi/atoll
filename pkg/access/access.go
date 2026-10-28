@@ -27,6 +27,12 @@ type TicketRequest struct {
 	PlanAttempt      uint32 `json:"plan_attempt,omitempty"`
 	PlanAttemptToken string `json:"plan_attempt_token,omitempty"`
 	BodyHash         string `json:"body_hash,omitempty"`
+	// WriteEpoch binds the ticket to one planned-write generation. Zero means
+	// a legacy (non-recovery) write, which keeps the original behavior.
+	WriteEpoch uint64 `json:"write_epoch,omitempty"`
+	// Resume marks a zero-length PUT that only re-confirms an already stored
+	// object under the current epoch. It never authorizes new payload bytes.
+	Resume bool `json:"resume,omitempty"`
 }
 
 type Ticket struct {
@@ -43,6 +49,11 @@ type CheckRequest struct {
 	PlanAttempt      uint32 `json:"plan_attempt,omitempty"`
 	PlanAttemptToken string `json:"plan_attempt_token,omitempty"`
 	BodyHash         string `json:"body_hash,omitempty"`
+	// WriteEpoch and Resume mirror the ticket fields: the node repeats what it
+	// received on the wire so the master can bind the check to the same
+	// generation and the same zero-length re-confirm intent.
+	WriteEpoch uint64 `json:"write_epoch,omitempty"`
+	Resume     bool   `json:"resume,omitempty"`
 }
 
 type CheckResult struct {

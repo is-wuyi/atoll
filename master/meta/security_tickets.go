@@ -74,6 +74,12 @@ func normalizeTicketRequest(req access.TicketRequest) (access.TicketRequest, err
 	if req.PlanID == "" || req.Method != http.MethodGet || !strings.HasPrefix(req.Path, "/objects/") {
 		req.PlanAttempt, req.PlanAttemptToken = 0, ""
 	}
+	if req.Resume && (req.WriteEpoch == 0 || req.Method != http.MethodPut || !strings.HasPrefix(req.Path, "/objects/") || req.Query != "" || req.PlanID != "") {
+		return req, ErrAccessTicket
+	}
+	if req.WriteEpoch > 0 && (req.Method != http.MethodPut || (!strings.HasPrefix(req.Path, "/objects/") && !strings.HasPrefix(req.Path, "/replicate/")) || req.Query != "" || req.PlanID != "") {
+		return req, ErrAccessTicket
+	}
 	req.Query = q.Encode()
 	if req.BodyHash != "" && len(req.BodyHash) != 64 {
 		return req, ErrAccessTicket
@@ -156,6 +162,9 @@ func validateUserTicketTx(tx *bolt.Tx, t accessTicketRecord, now time.Time) (typ
 		return types.ObjectIntegrity{}, ErrAccessTicket
 	}
 	if write {
+		if t.Request.WriteEpoch != d.WriteEpoch {
+			return types.ObjectIntegrity{}, ErrAccessTicket
+		}
 		if !in.Staging || !in.Chunked || !d.ChecksumKnown {
 			return types.ObjectIntegrity{}, ErrAccessTicket
 		}
@@ -198,6 +207,9 @@ func validateDeviceTicketTx(tx *bolt.Tx, t accessTicketRecord, now time.Time) (t
 			return types.ObjectIntegrity{}, ErrAccessTicket
 		}
 	case t.Request.Method == http.MethodPut && strings.HasPrefix(t.Request.Path, "/replicate/"):
+		if t.Request.WriteEpoch != d.WriteEpoch || t.Request.Resume {
+			return types.ObjectIntegrity{}, ErrAccessTicket
+		}
 		if t.Request.PlanID != "" || !types.ContainsUint64(d.Done, sender.NodeID) || types.ContainsUint64(d.Suspect, sender.NodeID) || !types.ContainsUint64(d.Replicas, t.AudienceNodeID) || !writeTransferAllowsTx(tx, id, sender.NodeID, t.AudienceNodeID, now) {
 			return types.ObjectIntegrity{}, ErrAccessTicket
 		}
@@ -317,7 +329,7 @@ func (s *Store) CheckAccessTicket(nodeSession string, req access.CheckRequest, n
 		if node.NodeID != ticket.AudienceNodeID || node.Identity != ticket.AudienceIdentity || node.Addr != ticket.Request.NodeAddr {
 			return ErrAccessTicket
 		}
-		normalized, err := normalizeTicketRequest(access.TicketRequest{NodeAddr: node.Addr, Method: req.Method, Path: req.Path, Query: req.Query, PlanID: req.PlanID, PlanAttempt: req.PlanAttempt, PlanAttemptToken: req.PlanAttemptToken, BodyHash: req.BodyHash})
+		normalized, err := normalizeTicketRequest(access.TicketRequest{NodeAddr: node.Addr, Method: req.Method, Path: req.Path, Query: req.Query, PlanID: req.PlanID, PlanAttempt: req.PlanAttempt, PlanAttemptToken: req.PlanAttemptToken, BodyHash: req.BodyHash, WriteEpoch: req.WriteEpoch, Resume: req.Resume})
 		if err != nil || normalized != ticket.Request {
 			return ErrAccessTicket
 		}

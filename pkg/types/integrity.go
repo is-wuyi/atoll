@@ -3,6 +3,7 @@ package types
 import "time"
 
 const IntegrityProtocol = "integrity-v1"
+const WriteIntegrityProtocol = "integrity-write-v2"
 
 // ObjectIntegrity binds a physical object to the metadata snapshot used to verify it.
 // ChecksumKnown distinguishes an explicit CRC of zero from legacy unrecorded checksums.
@@ -18,6 +19,7 @@ type ObjectIntegrity struct {
 	InodeID          uint64    `json:"inode_id"`
 	Generation       uint64    `json:"generation"`
 	IntegrityEpoch   uint64    `json:"integrity_epoch"`
+	WriteEpoch       uint64    `json:"write_epoch,omitempty"`
 	Chunked          bool      `json:"chunked"`
 	ChunkIndex       int       `json:"chunk_index"`
 	Size             int64     `json:"size"`

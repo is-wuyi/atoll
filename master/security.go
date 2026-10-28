@@ -602,7 +602,7 @@ func (s *Server) serveSpaceRequest(w http.ResponseWriter, r *http.Request, next 
 	r.URL = &copyURL
 	query := r.URL.Query()
 	switch key {
-	case "POST /writes", "POST /writes/chunks", "GET /writes/status", "GET /writes/transfer-nodes", "POST /writes/commit", "POST /writes/abort", "GET /protection", "POST /protection":
+	case "POST /writes", "POST /writes/chunks", "POST /writes/chunks/recover", "GET /writes/status", "GET /writes/transfer-nodes", "POST /writes/commit", "POST /writes/abort", "GET /protection", "POST /protection":
 		// These handlers bind actor and space inside the metadata transaction.
 	case "GET /meta", "GET /dirs/children", "DELETE /entry":
 		remote, err := spacePath(space.InternalPath, query.Get("path"))
@@ -822,7 +822,7 @@ func (s *Server) allowDeviceMetadata(w http.ResponseWriter, r *http.Request, dev
 	if key == "POST /nodes/transfer-observation" || key == "GET /nodes/transfer-peers" {
 		return true
 	}
-	if key != "POST /nodes/heartbeat" && key != "POST /files/replicated/verified" && key != "POST /files/replicated/present" && key != "POST /files/objects/suspect" && key != "POST /files/protection/progress" {
+	if key != "POST /nodes/heartbeat" && key != "POST /files/replicated/verified" && key != "POST /files/replicated/present" && key != "POST /files/objects/suspect" && key != "POST /files/protection/progress" && key != "POST /files/writes/progress" {
 		httpError(w, 403, "device operation denied")
 		return false
 	}

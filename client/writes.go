@@ -52,7 +52,7 @@ func (c *Client) WritePlanning(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, plannedError(err)
 	}
-	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature+","+types.WriteTransferFeature)
+	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature+","+types.WriteTransferFeature+","+types.WriteRecoveryFeature)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return false, plannedError(err)
@@ -90,6 +90,9 @@ func (c *Client) WritePlanning(ctx context.Context) (bool, error) {
 			if feature == types.WriteTransferFeature {
 				c.transferEnabled = true
 			}
+			if feature == types.WriteRecoveryFeature {
+				c.writeRecovery = true
+			}
 		}
 	}
 	c.writeChecked = time.Now()
@@ -125,7 +128,7 @@ func (c *Client) writeJSON(ctx context.Context, method, path string, body, out a
 	if err != nil {
 		return err
 	}
-	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature+","+types.WriteTransferFeature)
+	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature+","+types.WriteTransferFeature+","+types.WriteRecoveryFeature)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -279,6 +282,15 @@ func (c *Client) uploadPlannedChunkAEAD(ctx context.Context, u types.WriteUpload
 	}
 	if c.transferEnabled && out.Plan.Transfer == nil {
 		return errors.New("master omitted required write transfer plan")
+	}
+	if c.writeRecovery {
+		if out.Plan.Recovery == nil {
+			return errors.New("master omitted required write recovery state")
+		}
+		return c.uploadRecoverableChunk(ctx, u, request, out, upload)
+	}
+	if out.Plan.Recovery != nil {
+		return errors.New("master returned unnegotiated write recovery state")
 	}
 	addresses := map[uint64]string{}
 	for _, n := range out.Nodes {

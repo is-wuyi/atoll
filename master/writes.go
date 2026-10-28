@@ -87,7 +87,7 @@ func isLegacyWrite(r *http.Request) bool {
 
 func isWritePlanningRoute(p string) bool {
 	switch p {
-	case "/writes", "/writes/chunks", "/writes/status", "/writes/transfer-nodes", "/writes/commit", "/writes/abort", "/protection":
+	case "/writes", "/writes/chunks", "/writes/chunks/recover", "/writes/status", "/writes/transfer-nodes", "/writes/commit", "/writes/abort", "/protection":
 		return true
 	}
 	return false
@@ -111,7 +111,7 @@ func (s *Server) writePlanningGuard(next http.Handler) http.Handler {
 				httpError(w, http.StatusUpgradeRequired, "TLS required for security mode")
 				return
 			}
-			features := []string{types.ObjectIDFeature, types.WritePlanFeature}
+			features := []string{types.ObjectIDFeature, types.WritePlanFeature, types.WriteRecoveryFeature}
 			if transferEnabled {
 				features = append(features, types.WriteTransferFeature)
 			}
@@ -185,6 +185,8 @@ func decodeWriteJSON(w http.ResponseWriter, r *http.Request, value any) error {
 		required = []string{"path", "op_id", "size"}
 	case *types.PlanWriteChunkRequest:
 		required = []string{"upload_id", "plan_id", "revision", "index", "logical_size", "stored_size", "encoding", "checksum"}
+	case *types.RecoverWriteChunkRequest:
+		required = []string{"upload_id", "plan_id", "revision", "index", "expected_epoch", "op_id", "failed_nodes"}
 	case *types.CommitWriteRequest:
 		required = []string{"upload_id", "plan_id", "revision", "op_id", "size", "chunk_count"}
 	case *types.WriteBinding:
@@ -366,6 +368,12 @@ func (s *Server) handlePlanWriteChunk(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writePlanningError(w, http.StatusServiceUnavailable, "write_planner_unavailable", "unsupported write plan")
 		return
+	}
+	if supportsWriteRecovery(r) {
+		choice.Recovery = &types.WriteRecovery{Epoch: 1, HardUntil: now.Add(types.WriteRecoveryMaxTime)}
+		if choice.Transfer != nil {
+			choice.Transfer.ExpiresAt = choice.Recovery.HardUntil
+		}
 	}
 	plan, chunk, err := s.store.ReserveWriteChunk(actor, req, choice, snapshot.ProfileRevision, s.nodeMaxAge, time.Now())
 	if err != nil {

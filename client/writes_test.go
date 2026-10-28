@@ -35,6 +35,10 @@ type plannedCluster struct {
 }
 
 func newPlannedCluster(t *testing.T, count int) *plannedCluster {
+	return newPlannedClusterWithReplicas(t, count, 4)
+}
+
+func newPlannedClusterWithReplicas(t *testing.T, count, maxReplicas int) *plannedCluster {
 	t.Helper()
 	store, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
 	if err != nil {
@@ -42,7 +46,7 @@ func newPlannedCluster(t *testing.T, count int) *plannedCluster {
 	}
 	t.Cleanup(func() { store.Close() })
 	srv := master.NewServer(store, time.Hour)
-	if err = srv.EnableWritePlanning(master.WritePlanningConfig{MaxReplicas: 4}); err != nil {
+	if err = srv.EnableWritePlanning(master.WritePlanningConfig{MaxReplicas: maxReplicas}); err != nil {
 		t.Fatal(err)
 	}
 	cl := &plannedCluster{store: store, paths: map[string]int{}}

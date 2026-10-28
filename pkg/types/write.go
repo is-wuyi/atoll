@@ -5,6 +5,11 @@ import "time"
 const (
 	WritePlanFeature     = "write-plan-v1"
 	WriteTransferFeature = "write-transfer-v1"
+	WriteRecoveryFeature = "write-recovery-v1"
+	WriteEpochHeader     = "X-Atoll-Write-Epoch"
+	WriteResumeHeader    = "X-Atoll-Write-Resume"
+	MaxWriteRecoveries   = 3
+	WriteRecoveryMaxTime = 30 * time.Minute
 	PlainEncoding        = "plain-v1"
 	WritePending         = "pending"
 	WriteCommitted       = "committed"
@@ -73,6 +78,16 @@ type WriteTransferPlan struct {
 	ExpiresAt     time.Time          `json:"expires_at"`
 }
 
+type WriteRecovery struct {
+	Epoch       uint64    `json:"epoch"`
+	Attempts    uint32    `json:"attempts"`
+	HardUntil   time.Time `json:"hard_until"`
+	Excluded    []uint64  `json:"excluded,omitempty"`
+	OperationID string    `json:"operation_id,omitempty"`
+	RequestHash string    `json:"request_hash,omitempty"`
+	FailedNodes []uint64  `json:"failed_nodes,omitempty"`
+}
+
 type WriteChunkPlan struct {
 	Index                 int                `json:"index"`
 	Object                ContentObject      `json:"object"`
@@ -81,6 +96,7 @@ type WriteChunkPlan struct {
 	RequiredConfirmations int                `json:"required_confirmations"`
 	Reasons               []string           `json:"reasons,omitempty"`
 	Transfer              *WriteTransferPlan `json:"transfer,omitempty"`
+	Recovery              *WriteRecovery     `json:"recovery,omitempty"`
 }
 
 type WriteUpload struct {
@@ -122,6 +138,30 @@ type PlanWriteChunkRequest struct {
 	Encoding    string                    `json:"encoding"`
 	Checksum    uint32                    `json:"checksum"`
 	Network     *WriteTransferObservation `json:"network,omitempty"`
+}
+
+type WriteProgress struct {
+	ObjectID uint64 `json:"object_id"`
+	NodeID   uint64 `json:"node_id"`
+	Epoch    uint64 `json:"epoch"`
+	Attempt  uint64 `json:"attempt"`
+	Bytes    int64  `json:"bytes"`
+}
+
+type WriteNodeProgress struct {
+	NodeID    uint64    `json:"node_id"`
+	Attempt   uint64    `json:"attempt"`
+	Bytes     int64     `json:"bytes"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type RecoverWriteChunkRequest struct {
+	WriteBinding
+	Index         int                       `json:"index"`
+	ExpectedEpoch uint64                    `json:"expected_epoch"`
+	OpID          string                    `json:"op_id"`
+	FailedNodes   []uint64                  `json:"failed_nodes"`
+	Network       *WriteTransferObservation `json:"network,omitempty"`
 }
 
 type PlanWriteChunkResponse struct {

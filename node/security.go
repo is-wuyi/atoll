@@ -669,6 +669,10 @@ func (s *nodeSecurity) authorizePeer(req *http.Request) error {
 	if err != nil {
 		return fmt.Errorf("node security: control body hash: %w", err)
 	}
+	writeEpoch, resume, epochErr := requestWriteEpoch(req)
+	if epochErr != nil {
+		return fmt.Errorf("node security: %w", epochErr)
+	}
 	ticketReq := access.TicketRequest{
 		NodeAddr:         req.URL.Host,
 		Method:           req.Method,
@@ -678,6 +682,8 @@ func (s *nodeSecurity) authorizePeer(req *http.Request) error {
 		PlanAttempt:      planAttempt,
 		PlanAttemptToken: planAttemptToken,
 		BodyHash:         bodyHash,
+		WriteEpoch:       writeEpoch,
+		Resume:           resume,
 	}
 	var tk access.Ticket
 	sent, _ := s.snapshot()
@@ -852,6 +858,14 @@ func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 				}
 			}
 		}
+		// WriteEpoch binds the request to one planned-write generation; Resume
+		// marks a zero-length re-confirm that never carries new payload bytes.
+		// Both are echoed to the master so the ticket binds them.
+		writeEpoch, resume, epochErr := requestWriteEpoch(r)
+		if epochErr != nil {
+			httpError(w, http.StatusBadRequest, epochErr.Error())
+			return
+		}
 		bodyHash := ""
 		_, retirement := types.RetirementPathID(r.URL.Path)
 		if r.Method == http.MethodPost && (r.URL.Path == "/pull" || retirement) {
@@ -884,6 +898,8 @@ func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 			PlanAttempt:      planAttempt,
 			PlanAttemptToken: planAttemptToken,
 			BodyHash:         bodyHash,
+			WriteEpoch:       writeEpoch,
+			Resume:           resume,
 		})
 		if err != nil {
 			if errors.Is(err, errCheckDenied) {

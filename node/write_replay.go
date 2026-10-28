@@ -10,7 +10,10 @@ import (
 
 // An identical immutable retry can re-confirm existing bytes without allocating another full object.
 // This path still validates both the stored object and the complete incoming body.
-func (n *Node) verifyStoredReplay(id uint64, body io.Reader, size int64, checksum uint32) (bool, error) {
+// fence, when non-nil, re-checks the planned-write generation immediately before
+// the replay is accepted, so a retry admitted under a superseded layout cannot
+// re-confirm the object under the old generation.
+func (n *Node) verifyStoredReplay(id uint64, body io.Reader, size int64, checksum uint32, fence publishFence) (bool, error) {
 	path := n.objectPath(id)
 	st, err := os.Lstat(path)
 	if err != nil || !st.Mode().IsRegular() || st.Size() != size {
@@ -46,6 +49,12 @@ func (n *Node) verifyStoredReplay(id uint64, body io.Reader, size int64, checksu
 	defer lock.Unlock()
 	if err := n.checkObjectFence(id); err != nil {
 		return false, err
+	}
+	// 世代闸在重放被接受之前执行：世代已推进时，既有字节不再被旧世代确认。
+	if fence != nil {
+		if err := fence(); err != nil {
+			return false, err
+		}
 	}
 	current, err := os.Lstat(path)
 	if err != nil || !current.Mode().IsRegular() || !os.SameFile(opened, current) || current.Size() != size {

@@ -110,6 +110,7 @@ type ChunkInfo struct {
 	// Suspect 不能由存在性探测解除，必须重新校验内容后确认。
 	Suspect        []uint64 `json:"suspect,omitempty"`
 	IntegrityEpoch uint64   `json:"integrity_epoch,omitempty"`
+	WriteEpoch     uint64   `json:"write_epoch,omitempty"`
 	// ChecksumKnown distinguishes a recorded zero CRC from old metadata without a checksum.
 	ChecksumKnown bool `json:"checksum_known,omitempty"`
 	// Checksum 块内容的 CRC32C（0 = 未记录，旧数据向后兼容跳过校验）。

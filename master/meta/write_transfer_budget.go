@@ -156,6 +156,25 @@ func validateWriteTransferBudgetTx(tx *bolt.Tx, choice types.WriteChunkPlan, now
 		to.Downloads++
 		loads[leg.ToNodeID] = to
 	}
+	return validateTransferLoadsTx(tx, loads)
+}
+
+func validateCurrentWriteTransferBudgetTx(tx *bolt.Tx, now time.Time) error {
+	loads, err := writeTransferLoadsTx(tx, now)
+	if err != nil {
+		return err
+	}
+	protection, _, err := protectionLeaseLoadTx(tx, now)
+	if err != nil {
+		return err
+	}
+	if err := mergeTransferLoads(loads, protection); err != nil {
+		return err
+	}
+	return validateTransferLoadsTx(tx, loads)
+}
+
+func validateTransferLoadsTx(tx *bolt.Tx, loads map[uint64]TransferLoad) error {
 	for id, load := range loads {
 		var profile NodePlacementProfile
 		if err := readAutonomy(tx, "profile", fmt.Sprint(id), &profile); err != nil {

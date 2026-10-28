@@ -407,7 +407,7 @@ func (s *Store) ClaimRetirement(objectID, nodeID uint64, now time.Time, retryAft
 		if err := liveWriteNodeTx(w.tx, nodeID, nodeMaxAge, now); err != nil {
 			return err
 		}
-		ok, err := retirementUnreferencedTx(w.tx, objectID)
+		ok, err := retirementDetachedReplicaTx(w.tx, rec)
 		if err != nil {
 			return err
 		}
@@ -469,7 +469,7 @@ func (s *Store) ConfirmRetirement(receipt types.ObjectRetirementReceipt, now tim
 		if err := liveWriteNodeTx(w.tx, rec.NodeID, nodeMaxAge, now); err != nil {
 			return err
 		}
-		ok, err := retirementUnreferencedTx(w.tx, rec.ObjectID)
+		ok, err := retirementDetachedReplicaTx(w.tx, rec)
 		if err != nil {
 			return err
 		}
@@ -519,7 +519,7 @@ func retirementRequestAllowedTx(tx *bolt.Tx, objectID, nodeID uint64, fence, bod
 	if err != nil || BodySHA256(raw) != bodyHash {
 		return false
 	}
-	ok, err := retirementUnreferencedTx(tx, objectID)
+	ok, err := retirementDetachedReplicaTx(tx, rec)
 	return err == nil && ok
 }
 

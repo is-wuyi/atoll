@@ -19,7 +19,12 @@ func (s *Store) PlannedWriteStatus(actor WriteActor, binding types.WriteBinding,
 		}
 		if rec.Upload.State == types.WriteCommitted {
 			for _, plan := range rec.Upload.Chunks {
-				out.Chunks = append(out.Chunks, types.WriteChunkStatus{Index: plan.Index, Ready: true})
+				status := types.WriteChunkStatus{Index: plan.Index, Ready: true}
+				if plan.Recovery != nil {
+					status.Epoch = plan.Recovery.Epoch
+					status.Done = append([]uint64(nil), plan.Confirmations...)
+				}
+				out.Chunks = append(out.Chunks, status)
 			}
 			return nil
 		}
@@ -28,10 +33,25 @@ func (s *Store) PlannedWriteStatus(actor WriteActor, binding types.WriteBinding,
 			return err
 		}
 		for _, plan := range rec.Upload.Chunks {
+			status := types.WriteChunkStatus{Index: plan.Index}
+			if plan.Recovery != nil {
+				status.Epoch = plan.Recovery.Epoch
+				status.Progress, err = writeNodeProgressTx(tx, plan)
+				if err != nil {
+					return err
+				}
+			}
 			ready := false
 			for _, chunk := range in.Chunks {
 				if !chunkMatchesPlan(chunk, plan) {
 					continue
+				}
+				if plan.Recovery != nil {
+					for _, id := range chunk.Done {
+						if !types.ContainsUint64(chunk.Suspect, id) && liveWriteNodeTx(tx, id, nodeMaxAge, now) == nil {
+							status.Done = append(status.Done, id)
+						}
+					}
 				}
 				ready = true
 				for _, id := range plan.Confirmations {
@@ -42,7 +62,8 @@ func (s *Store) PlannedWriteStatus(actor WriteActor, binding types.WriteBinding,
 				}
 				break
 			}
-			out.Chunks = append(out.Chunks, types.WriteChunkStatus{Index: plan.Index, Ready: ready})
+			status.Ready = ready
+			out.Chunks = append(out.Chunks, status)
 		}
 		return nil
 	})

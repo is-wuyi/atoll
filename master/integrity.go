@@ -50,6 +50,9 @@ func (s *Server) handleReplicationPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := types.ReplicationPlan{Protocol: types.IntegrityProtocol, Object: d}
+	if d.WriteEpoch > 0 {
+		out.Protocol = types.WriteIntegrityProtocol
+	}
 	if r.URL.Query().Get("plan_id") == "" {
 		out.WriteTransfer, err = s.store.WriteTransferForObject(id)
 		if err != nil {

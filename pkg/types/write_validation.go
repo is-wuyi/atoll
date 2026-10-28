@@ -19,8 +19,41 @@ func ValidateWriteChunkPlan(req PlanWriteChunkRequest, plan WriteChunkPlan) erro
 	if plan.Index != req.Index || o.ID != ChunkID(req.UploadID, req.Index) || o.Version != 1 || o.LogicalSize != req.LogicalSize || o.StoredSize != req.StoredSize || o.Encoding != req.Encoding || !o.ChecksumKnown || o.Checksum != req.Checksum {
 		return errors.New("write object differs from requested content")
 	}
-	if plan.Layout.ObjectID != o.ID || plan.Layout.Epoch != 1 || plan.Layout.Scheme != "replicate" || len(plan.Layout.Nodes) == 0 || len(plan.Layout.Nodes) > 32 {
+	if plan.Layout.ObjectID != o.ID || plan.Layout.Epoch == 0 || plan.Layout.Scheme != "replicate" || len(plan.Layout.Nodes) == 0 || len(plan.Layout.Nodes) > 32 {
 		return errors.New("unsupported write layout")
+	}
+	if plan.Recovery == nil {
+		if plan.Layout.Epoch != 1 {
+			return errors.New("write recovery state required")
+		}
+	} else {
+		r := plan.Recovery
+		if r.Epoch != plan.Layout.Epoch || r.Attempts > MaxWriteRecoveries || r.Epoch != uint64(r.Attempts)+1 || r.HardUntil.IsZero() || len(r.Excluded) > 32*MaxWriteRecoveries {
+			return errors.New("invalid write recovery state")
+		}
+		if r.Attempts == 0 && (r.OperationID != "" || r.RequestHash != "" || len(r.Excluded) > 0 || len(r.FailedNodes) > 0) {
+			return errors.New("unexpected initial write recovery operation")
+		}
+		if r.Attempts > 0 && (r.OperationID == "" || len(r.OperationID) > 128 || strings.ContainsAny(r.OperationID, " \t\r\n") || len(r.RequestHash) != 64 || len(r.FailedNodes) == 0 || len(r.FailedNodes) > 32) {
+			return errors.New("invalid write recovery operation")
+		}
+		failed := map[uint64]bool{}
+		for _, id := range r.FailedNodes {
+			if failed[id] || !ContainsUint64(r.Excluded, id) {
+				return errors.New("invalid recovery failure nodes")
+			}
+			failed[id] = true
+		}
+		excluded := map[uint64]bool{}
+		for _, id := range r.Excluded {
+			if id == 0 || excluded[id] || ContainsUint64(plan.Layout.Nodes, id) {
+				return errors.New("invalid excluded write node")
+			}
+			excluded[id] = true
+		}
+		if plan.Transfer != nil && plan.Transfer.ExpiresAt.After(r.HardUntil) {
+			return errors.New("write transfer exceeds recovery deadline")
+		}
 	}
 	targets := make(map[uint64]bool, len(plan.Layout.Nodes))
 	for _, id := range plan.Layout.Nodes {

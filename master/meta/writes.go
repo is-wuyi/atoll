@@ -79,7 +79,7 @@ func writePlanningEnabledTx(tx *bolt.Tx) (bool, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return false, err
 	}
-	if cfg.Version != 1 || cfg.EnabledAt.IsZero() || !bytes.Equal(marker, []byte{1}) {
+	if (cfg.Version != 1 && cfg.Version != 2) || cfg.EnabledAt.IsZero() || !bytes.Equal(marker, []byte{1}) {
 		return false, errors.New("invalid write planning configuration")
 	}
 	return true, nil
@@ -321,6 +321,9 @@ func (s *Store) SetProtection(actor WriteActor, inodeID uint64, tier types.Prote
 	return out, err
 }
 
+func validRecoveryOp(op string) bool {
+	return len(op) > 0 && len(op) <= 128 && !strings.ContainsAny(op, " \t\r\n\x00")
+}
 func validWriteOp(op string) bool {
 	return len(op) > 0 && len(op) <= 256 && !strings.ContainsAny(op, " \t\r\n\x00")
 }
@@ -510,6 +513,14 @@ func (s *Store) ReserveWriteChunk(actor WriteActor, req types.PlanWriteChunkRequ
 		if profileRevision != profileRevisionTx(w.tx) {
 			return ErrWritePlanConflict
 		}
+		if choice.Recovery != nil {
+			if !now.Before(choice.Recovery.HardUntil) || choice.Recovery.HardUntil.After(now.Add(types.WriteRecoveryMaxTime)) || choice.Recovery.Epoch != 1 || choice.Recovery.Attempts != 0 {
+				return ErrWriteExpired
+			}
+			if err := enableWriteRecoveryTx(w); err != nil {
+				return err
+			}
+		}
 		if rec.Upload.Size >= 0 {
 			offset := int64(req.Index) * types.ChunkSize
 			if offset >= rec.Upload.Size || req.LogicalSize != min(types.ChunkSize, rec.Upload.Size-offset) {
@@ -536,6 +547,9 @@ func (s *Store) ReserveWriteChunk(actor WriteActor, req types.PlanWriteChunkRequ
 			}
 		}
 		chunk = types.ChunkInfo{ID: choice.Object.ID, Index: req.Index, Size: req.StoredSize, LogicalSize: req.LogicalSize, Encoding: req.Encoding, Checksum: req.Checksum, ChecksumKnown: true, Replicas: append([]uint64(nil), choice.Layout.Nodes...)}
+		if choice.Recovery != nil {
+			chunk.WriteEpoch = choice.Recovery.Epoch
+		}
 		in.Chunks = append(in.Chunks, chunk)
 		sort.Slice(in.Chunks, func(i, j int) bool { return in.Chunks[i].Index < in.Chunks[j].Index })
 		rec.Upload.Chunks = append(rec.Upload.Chunks, choice)
@@ -556,7 +570,11 @@ func (s *Store) ReserveWriteChunk(actor WriteActor, req types.PlanWriteChunkRequ
 }
 
 func chunkMatchesPlan(c types.ChunkInfo, p types.WriteChunkPlan) bool {
-	return c.ID == p.Object.ID && c.Index == p.Index && c.Size == p.Object.StoredSize && c.LogicalSize == p.Object.LogicalSize && ChunkInfoEncodes(c, p.Object.Encoding) && c.ChecksumKnown && c.Checksum == p.Object.Checksum && reflect.DeepEqual(c.Replicas, p.Layout.Nodes)
+	var writeEpoch uint64
+	if p.Recovery != nil {
+		writeEpoch = p.Recovery.Epoch
+	}
+	return c.WriteEpoch == writeEpoch && c.ID == p.Object.ID && c.Index == p.Index && c.Size == p.Object.StoredSize && c.LogicalSize == p.Object.LogicalSize && ChunkInfoEncodes(c, p.Object.Encoding) && c.ChecksumKnown && c.Checksum == p.Object.Checksum && reflect.DeepEqual(c.Replicas, p.Layout.Nodes)
 }
 
 // ChunkInfoEncodes 判断块表编码与 manifest 编码是否同一语义：空编码等价 plain-v1

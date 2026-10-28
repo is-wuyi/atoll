@@ -21,6 +21,21 @@ import (
 
 var errIntegrityMismatch = errors.New("object integrity mismatch")
 
+// errWriteEpochSuperseded marks a request that was admitted under an older
+// planned-write generation than the one now current. The bytes may still be
+// valid, but this request is no longer authorized to publish or confirm.
+var errWriteEpochSuperseded = errors.New("write epoch superseded by a newer layout")
+
+// errReceiptRejected marks a receipt master refused (stale generation,
+// reassigned replica, changed content). It is not retryable: the request was
+// superseded, so the caller must stop instead of hammering master.
+var errReceiptRejected = errors.New("integrity receipt rejected")
+
+// publishFence re-validates, immediately before the atomic rename, that the
+// object may still be published under the generation the request was admitted
+// under. A nil fence means the legacy path (no planned-write generation).
+type publishFence func() error
+
 // aeadChunkObjectLimit 是 aead 块对象的物理上限：密文比明文多 33B/64KiB 记录，
 // 末块明文 ≤64MiB-1 时密文 ≤ ChunkSize + 528B；再留余量防奇数几何。
 // plain 块仍以 ChunkSize 为限。
@@ -105,10 +120,22 @@ func (n *Node) replicationPlan(ctx context.Context, objectID uint64, planID ...s
 	} else if d.PlanID != "" {
 		return plan, fmt.Errorf("unexpected plan context in replication metadata for object %d", objectID)
 	}
-	if plan.Protocol != types.IntegrityProtocol || d.ObjectID != objectID || d.Size < 0 || d.Size == int64(^uint64(0)>>1) ||
+	if d.ObjectID != objectID || d.Size < 0 || d.Size == int64(^uint64(0)>>1) ||
 		!types.ContainsUint64(d.Replicas, uint64(n.nodeID.Load())) ||
 		(d.Chunked && (d.Size <= 0 || d.Size > aeadChunkObjectLimit() || d.ChunkIndex < 0)) {
 		return plan, fmt.Errorf("invalid or unsupported replication metadata")
+	}
+	// The protocol string and the generation are one unit: a planned-write
+	// generation is only ever carried by integrity-write-v2, and that protocol
+	// is only accepted with a non-zero generation. A master that mixes the two
+	// (or an old master answering a new node) is refused instead of silently
+	// downgrading a generation-scoped plan to an unscoped one.
+	if d.WriteEpoch > 0 {
+		if plan.Protocol != types.WriteIntegrityProtocol {
+			return plan, fmt.Errorf("write epoch %d requires protocol %s", d.WriteEpoch, types.WriteIntegrityProtocol)
+		}
+	} else if plan.Protocol != types.IntegrityProtocol {
+		return plan, fmt.Errorf("unsupported replication protocol %q", plan.Protocol)
 	}
 	if plan.Transfer != nil {
 		t := plan.Transfer
@@ -127,6 +154,91 @@ func (n *Node) replicationPlan(ctx context.Context, objectID uint64, planID ...s
 	return plan, nil
 }
 
+// requestWriteEpoch parses the planned-write generation and the resume intent
+// carried by an inbound or outbound object request. Both are deliberately
+// strict: a malformed or partial epoch header is an error, never silently
+// downgraded to "no epoch", because a downgraded request would lose the
+// generation fence and could be accepted under a newer layout.
+func requestWriteEpoch(req *http.Request) (uint64, bool, error) {
+	if req == nil || req.Header == nil {
+		return 0, false, nil
+	}
+	epoch := uint64(0)
+	if raw := req.Header.Get(types.WriteEpochHeader); raw != "" {
+		v, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil || v == 0 {
+			return 0, false, fmt.Errorf("invalid write epoch header")
+		}
+		epoch = v
+	}
+	resume := false
+	if raw := req.Header.Get(types.WriteResumeHeader); raw != "" {
+		switch raw {
+		case "1", "true":
+			resume = true
+		default:
+			return 0, false, fmt.Errorf("invalid write resume header")
+		}
+	}
+	if resume && epoch == 0 {
+		// A resume re-confirms an existing object under a specific generation;
+		// without that generation there is nothing to re-confirm against.
+		return 0, false, fmt.Errorf("write resume requires a write epoch")
+	}
+	return epoch, resume, nil
+}
+
+// admitWriteEpoch binds an inbound object request to the generation the
+// current master descriptor carries.
+//
+//   - descriptor has no generation (legacy write): the request must not claim
+//     one, and the legacy path is preserved unchanged.
+//   - descriptor has a generation: the request must carry exactly that
+//     generation. A missing, stale or newer header is refused, so an in-flight
+//     request admitted before a re-plan cannot publish under the new layout.
+//
+// The returned generation is what the receipt must be built from; it is never
+// re-read from master after the payload has been received.
+func admitWriteEpoch(d types.ObjectIntegrity, epoch uint64) error {
+	if d.WriteEpoch == 0 {
+		if epoch != 0 {
+			return fmt.Errorf("%w: object %d has no write epoch", errWriteEpochSuperseded, d.ObjectID)
+		}
+		return nil
+	}
+	if epoch != d.WriteEpoch {
+		return fmt.Errorf("%w: object %d expects epoch %d, request carried %d", errWriteEpochSuperseded, d.ObjectID, d.WriteEpoch, epoch)
+	}
+	return nil
+}
+
+// writeEpochFence builds the pre-publish re-check for a generation-scoped
+// write. It re-reads the descriptor from master and refuses the publish when
+// the generation moved on or this node was dropped from the layout. The check
+// runs while the object lock is held, immediately before the rename, so a
+// re-plan that lands during payload transfer blocks the publication.
+func (n *Node) writeEpochFence(objectID uint64, epoch uint64) publishFence {
+	if epoch == 0 {
+		return nil
+	}
+	return func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), verifyTimeout)
+		defer cancel()
+		plan, err := n.replicationPlan(ctx, objectID)
+		if err != nil {
+			return fmt.Errorf("%w: re-plan check for object %d failed: %v", errWriteEpochSuperseded, objectID, err)
+		}
+		if plan.Object.WriteEpoch != epoch {
+			return fmt.Errorf("%w: object %d moved from epoch %d to %d", errWriteEpochSuperseded, objectID, epoch, plan.Object.WriteEpoch)
+		}
+		if !types.ContainsUint64(plan.Object.Replicas, uint64(n.nodeID.Load())) {
+			return fmt.Errorf("%w: node %d is no longer a replica of object %d", errWriteEpochSuperseded, n.nodeID.Load(), objectID)
+		}
+		return nil
+	}
+}
+
+// reportIntegrityFor 向 master 上报回执。
 func (n *Node) reportIntegrity(ctx context.Context, path string, d types.ObjectIntegrity) error {
 	return n.reportIntegrityFor(ctx, path, d, uint64(n.nodeID.Load()))
 }
@@ -160,7 +272,11 @@ func (n *Node) reportIntegrityFor(ctx context.Context, path string, d types.Obje
 			}
 			last = fmt.Errorf("integrity receipt: status %d", resp.StatusCode)
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				return last
+				// A 4xx means master refused this receipt: the generation moved
+				// on, the replica was reassigned, or the content changed. The
+				// request is superseded — it must not be reported as success,
+				// and it must not be retried either.
+				return fmt.Errorf("%w: %s", errReceiptRejected, last.Error())
 			}
 		} else {
 			last = err
@@ -283,6 +399,9 @@ func (n *Node) pushWithPlan(ctx context.Context, peerAddr string, plan types.Rep
 	if plan.Object.ChecksumKnown {
 		req.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", plan.Object.Checksum))
 	}
+	if plan.Object.WriteEpoch > 0 {
+		req.Header.Set(types.WriteEpochHeader, strconv.FormatUint(plan.Object.WriteEpoch, 10))
+	}
 	resp, err := n.bulkClient.Do(req)
 	if err != nil {
 		return err
@@ -364,4 +483,64 @@ func (n *Node) handleVerifyObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, plan)
+}
+
+// handleResumeObject 处理零长度的 resume 请求：客户端已经拥有该对象的完整
+// 密文，只需要让本节点在当前世代重新确认既有字节并推动剩余复制腿，而不重新
+// 上传 payload。
+//
+// 语义边界：
+//   - 必须带世代（由 handlePut 的 admitWriteEpoch 校验），且 descriptor 的
+//     世代必须与请求一致；世代不匹配一律 409。
+//   - 本地没有该对象 → 404，客户端应改走真实 PUT（不静默跳过确认）。
+//   - 本地字节长度或 CRC 与 master 权威元数据不符 → 409 并按 suspect 上报，
+//     绝不把坏字节“确认”为已落盘。
+//   - 确认成功后只启动 master 授权的剩余复制腿（plan.Targets），不回写数据。
+func (n *Node) handleResumeObject(w http.ResponseWriter, r *http.Request, id uint64, plan types.ReplicationPlan, epoch uint64) {
+	// Resume 不得携带 payload：有 body 说明调用方误用了这条路径。分块编码
+	// （ContentLength = -1）同样拒绝，避免把未知长度的 body 当成空请求。
+	if r.ContentLength != 0 {
+		httpError(w, http.StatusBadRequest, "resume request must not carry a payload")
+		return
+	}
+	d := plan.Object
+	if d.WriteEpoch == 0 || d.WriteEpoch != epoch {
+		httpError(w, http.StatusConflict, "resume epoch does not match the current layout")
+		return
+	}
+	if !d.ChecksumKnown {
+		httpError(w, http.StatusConflict, "resume requires a recorded checksum")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), verifyTimeout)
+	defer cancel()
+	// verifiedSource 按 master 的权威 size/checksum 校验本地字节；不符时它
+	// 自己会上报 suspect 并返回错误。
+	f, err := n.verifiedSource(ctx, d)
+	if err != nil {
+		if os.IsNotExist(err) {
+			httpError(w, http.StatusNotFound, "object not stored on this node")
+			return
+		}
+		httpError(w, http.StatusConflict, err.Error())
+		return
+	}
+	f.Close()
+	// 确认必须使用本次请求捕获的世代，而不是之后重新取到的 descriptor。
+	captured := d
+	captured.WriteEpoch = epoch
+	if err := n.reportStored(ctx, captured); err != nil {
+		if errors.Is(err, errReceiptRejected) || errors.Is(err, errWriteEpochSuperseded) {
+			httpError(w, http.StatusConflict, err.Error())
+			return
+		}
+		httpError(w, http.StatusServiceUnavailable, "write receipt failed")
+		return
+	}
+	// 只启动 master 授权的剩余复制腿：plan.Targets 已由 master 按当前布局与
+	// 传输计划算出，不在本节点自行选择目标。
+	if len(plan.Targets) > 0 {
+		go n.replicateToPeers(id)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"size": d.Size, "resumed": true})
 }
