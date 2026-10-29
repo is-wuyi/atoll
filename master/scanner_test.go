@@ -8,9 +8,9 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,13 +30,63 @@ func newTestScanner(t *testing.T, nodeMaxAge time.Duration) (*Scanner, *meta.Sto
 	return s, store
 }
 
-// captureLogs 捕获 log 输出到 buffer。
-func captureLogs(t *testing.T) *bytes.Buffer {
+type capturedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *capturedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *capturedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *capturedLogBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+func (b *capturedLogBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+}
+
+// 后台节点日志可能在测试断言读取缓冲区时继续写入。
+func captureLogs(t *testing.T) *capturedLogBuffer {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf capturedLogBuffer
+	previous := log.Writer()
 	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	t.Cleanup(func() { log.SetOutput(previous) })
 	return &buf
+}
+
+func TestCapturedLogBufferConcurrentAccess(t *testing.T) {
+	var buf capturedLogBuffer
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				if _, err := buf.Write([]byte("background log\n")); err != nil {
+					t.Error(err)
+				}
+				_ = buf.String()
+				_ = buf.Len()
+				buf.Reset()
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // TestDeathMonitorNewDeath 测试 alive→dead 转换记日志。

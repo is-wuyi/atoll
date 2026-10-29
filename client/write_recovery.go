@@ -175,7 +175,20 @@ func (c *Client) currentRecoveryStatus(ctx context.Context, upload types.WriteUp
 	q.Set("plan_id", upload.PlanID)
 	q.Set("revision", strconv.FormatUint(upload.Revision, 10))
 	var status types.WriteStatus
-	if err := c.writeJSON(ctx, http.MethodGet, "/writes/status?"+q.Encode(), nil, &status); err != nil {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		status = types.WriteStatus{}
+		err = c.writeJSON(ctx, http.MethodGet, "/writes/status?"+q.Encode(), nil, &status)
+		if err == nil || !retryWriteMetadata(err) || ctx.Err() != nil {
+			break
+		}
+		if attempt < 2 {
+			if waitErr := waitWriteRetry(ctx, time.Duration(attempt+1)*100*time.Millisecond); waitErr != nil {
+				return types.WriteChunkStatus{}, waitErr
+			}
+		}
+	}
+	if err != nil {
 		return types.WriteChunkStatus{}, err
 	}
 	if status.UploadID != upload.ID {

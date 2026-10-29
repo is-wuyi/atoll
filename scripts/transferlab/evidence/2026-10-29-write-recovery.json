@@ -1,0 +1,3152 @@
+{
+  "schema_version": 1,
+  "date_local": "2026-10-29",
+  "core_baseline_commit": "155f82ce18b4008b875e6ff1a99096ac15ac29bf",
+  "scope": "Isolated real NAS WAN storage-write recovery acceptance. Plain contents and shared test Bearer token over existing EasyTier network. Not public P2P, secure-session, AEAD, FUSE-kernel, deployment or main-merge acceptance.",
+  "topology": {
+    "master": "26666.et.net",
+    "nodes": {
+      "A": {
+        "host": "28425.et.net",
+        "node_id": 3
+      },
+      "B": {
+        "host": "27472.et.net",
+        "node_id": 2
+      },
+      "C": {
+        "host": "29663.et.net",
+        "node_id": 4
+      }
+    },
+    "ports": {
+      "master": 29570,
+      "node": 29571
+    },
+    "node_budget_bps": 8388608,
+    "node_transfer_concurrency": 2,
+    "write_max_replicas": 2,
+    "write_max_replicas_is_only_an_upper_bound": true
+  },
+  "build": {
+    "core_components_changed": false,
+    "overlay_replaced_files": [
+      "cmd/transferlab/lab.go"
+    ],
+    "lab_extensions": [
+      "Read-only retirement view",
+      "WriteEpoch and RequestID event recording",
+      "Active PUT count",
+      "Authenticated lab artifact distribution",
+      "Slow receive wrapper reading the original Body directly inside the real node handler"
+    ],
+    "source_refs": [
+      {
+        "name": "driver.go",
+        "bytes": 10587,
+        "sha256": "fbe7478a3d48ac25b3ff212586d2a139e5f97b2e91112d8a1f1e9ccbbdd4732e"
+      },
+      {
+        "name": "lab-overlay.go",
+        "bytes": 17161,
+        "sha256": "3d2d5bfab35cf878f0e79870f799153cdc4002d5607f0aa268fd39e5611bc553"
+      }
+    ],
+    "binary_sha256": {
+      "transferlab-linux": "90bff0c55d6d9afd7f13ea321fe5bb20fb65c8d2d688f9f25069909b36fd0c78",
+      "transferlab-recovery-lab": "15bd9c395157c5cf6d56238ff779b0710aa87cbbcec20db87b81ec87c99856a6",
+      "transferlab-observed2": "9cef528dab0762bfe53919a7e4475c104b5e4b160ea0ad7dc81b9cb24628b03e",
+      "recovery-driver": "944dd943f33314424c15d3d33424a986672f0b8faf4710d015a0599b06bae411"
+    }
+  },
+  "scenarios": [
+    {
+      "name": "baseline-clean",
+      "classification": "Natural WAN multi-block observation, followed by intentional interruption of the isolated A node during the pending second block; not a pure no-fault baseline.",
+      "status": "passed",
+      "started_at": "2026-10-29T14:17:40.34344107Z",
+      "finished_at": "2026-10-29T14:27:03.169372978Z",
+      "elapsed_seconds": 562.825930406,
+      "upload_id": 4294967297,
+      "read_bytes": 134218752,
+      "expected_sha256": "f36399a5c7cf7c93d6d728087c8409774b09c98dd2869f5c2909fef6185e16f4",
+      "read_sha256": "f36399a5c7cf7c93d6d728087c8409774b09c98dd2869f5c2909fef6185e16f4",
+      "recovery_requests": 1,
+      "plans": [
+        {
+          "index": 0,
+          "object": {
+            "id": 1099511628032,
+            "version": 1,
+            "logical_size": 67108864,
+            "stored_size": 67108864,
+            "encoding": "plain-v1",
+            "checksum": 202817844,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T22:47:43.958881153+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T22:47:43.958881153+08:00"
+          }
+        },
+        {
+          "index": 1,
+          "object": {
+            "id": 1099511628033,
+            "version": 1,
+            "logical_size": 67108864,
+            "stored_size": 67108864,
+            "encoding": "plain-v1",
+            "checksum": 3352642282,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            3
+          ],
+          "confirmations": [
+            2,
+            3
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T22:48:17.573369346+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              3
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 3,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T22:48:17.573369346+08:00"
+          }
+        },
+        {
+          "index": 1,
+          "object": {
+            "id": 1099511628033,
+            "version": 1,
+            "logical_size": 67108864,
+            "stored_size": 67108864,
+            "encoding": "plain-v1",
+            "checksum": 3352642282,
+            "checksum_known": true
+          },
+          "epoch": 2,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T22:48:17.573369346+08:00",
+          "recovery_attempts": 1,
+          "excluded": [
+            3
+          ],
+          "failed_nodes": [
+            3
+          ],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T22:48:17.573369346+08:00"
+          }
+        },
+        {
+          "index": 2,
+          "object": {
+            "id": 1099511628034,
+            "version": 1,
+            "logical_size": 1024,
+            "stored_size": 1024,
+            "encoding": "plain-v1",
+            "checksum": 3053030905,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T22:56:32.751363741+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T22:56:32.751363741+08:00"
+          }
+        }
+      ],
+      "chunks": [
+        {
+          "index": 0,
+          "object_id": 1099511628032,
+          "stored_size": 67108864,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            4,
+            2
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:17:43.963094283Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628032",
+              "request_id": "5e29a5a457bb6646b5a6deb3687fd0ac",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:17:43.963394401Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628032",
+              "request_id": "e43b2329c965b50758ffdf18ed5fc17b",
+              "resume": "",
+              "size": 67108864
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:18:04.593923775Z",
+              "elapsed_ms": 20630,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628032",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:18:15.995299406Z",
+              "elapsed_ms": 32032,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628032",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:17:43.987408977Z",
+              "end_utc": "2026-10-29T14:18:15.978755882Z",
+              "duration_ms": 31991,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628032",
+              "write_epoch": "1",
+              "request_id": "5e29a5a457bb6646b5a6deb3687fd0ac"
+            },
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:26:33.620564778Z",
+              "end_utc": "2026-10-29T14:26:47.564545697Z",
+              "duration_ms": 13943,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "GET",
+              "path": "/objects/1099511628032"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:17:43.98663309Z",
+              "end_utc": "2026-10-29T14:18:04.569304584Z",
+              "duration_ms": 20582,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628032",
+              "write_epoch": "1",
+              "request_id": "e43b2329c965b50758ffdf18ed5fc17b"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "e43b2329c965b50758ffdf18ed5fc17b",
+              "increasing_samples": 2,
+              "first": {
+                "sample_at": "2026-10-29T14:17:59.964834675Z",
+                "bytes": 50854752,
+                "master_updated_at": "2026-10-29T22:17:59.11001221+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:18:04.964431643Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:18:04.545382886+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 5.43537
+            },
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "5e29a5a457bb6646b5a6deb3687fd0ac",
+              "increasing_samples": 2,
+              "first": {
+                "sample_at": "2026-10-29T14:18:03.964294066Z",
+                "bytes": 38957744,
+                "master_updated_at": "2026-10-29T22:18:03.008085417+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:18:15.964687825Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:18:15.953226232+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 12.945141
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "object_id": 1099511628033,
+          "stored_size": 67108864,
+          "final_epoch": 2,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            2,
+            4
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:18:17.577790245Z",
+              "epoch": "1",
+              "host": "28425.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628033",
+              "request_id": "48ae5fc6401a859577acddbef369dbad",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:18:17.577810592Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628033",
+              "request_id": "57160da9e5903b2383f6c55ca394de46",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:22:13.680478226Z",
+              "epoch": "1",
+              "host": "28425.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628033",
+              "request_id": "dd4fc1bab07ba2654a87383062628cc9",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:25:47.782198247Z",
+              "epoch": "1",
+              "host": "28425.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628033",
+              "request_id": "562ec66211c8b0d57efb72cd9ed59dc0",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:26:12.697277273Z",
+              "epoch": "2",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628033",
+              "request_id": "54bf5bd91d4dd27894d4fae957ab0b58",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:26:12.697286099Z",
+              "epoch": "2",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628033",
+              "request_id": "",
+              "resume": "true",
+              "size": 0
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:18:46.425547739Z",
+              "elapsed_ms": 28847,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628033",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:22:13.579736654Z",
+              "elapsed_ms": 236001,
+              "error": "planned write made no payload progress",
+              "host": "28425.et.net:29571",
+              "kind": "request_error",
+              "path": "/objects/1099511628033"
+            },
+            {
+              "at": "2026-10-29T14:25:47.681542718Z",
+              "elapsed_ms": 214001,
+              "error": "planned write made no payload progress",
+              "host": "28425.et.net:29571",
+              "kind": "request_error",
+              "path": "/objects/1099511628033"
+            },
+            {
+              "at": "2026-10-29T14:26:09.68558084Z",
+              "elapsed_ms": 21903,
+              "error": "readfrom tcp 10.126.126.126:22320->10.126.126.6:29571: write tcp 10.126.126.126:22320->10.126.126.6:29571: use of closed network connection",
+              "host": "28425.et.net:29571",
+              "kind": "request_error",
+              "path": "/objects/1099511628033"
+            },
+            {
+              "at": "2026-10-29T14:26:12.854233565Z",
+              "elapsed_ms": 156,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628033",
+              "status": 200
+            },
+            {
+              "at": "2026-10-29T14:26:31.832652546Z",
+              "elapsed_ms": 19135,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628033",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:18:17.602214059Z",
+              "end_utc": "2026-10-29T14:18:46.409234311Z",
+              "duration_ms": 28807,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628033",
+              "write_epoch": "1",
+              "request_id": "57160da9e5903b2383f6c55ca394de46"
+            },
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:26:12.722157574Z",
+              "end_utc": "2026-10-29T14:26:12.837793556Z",
+              "duration_ms": 115,
+              "body_bytes": 0,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628033",
+              "write_epoch": "2"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:26:12.760575242Z",
+              "end_utc": "2026-10-29T14:26:31.808154278Z",
+              "duration_ms": 19047,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628033",
+              "write_epoch": "2",
+              "request_id": "54bf5bd91d4dd27894d4fae957ab0b58"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:26:48.00575204Z",
+              "end_utc": "2026-10-29T14:27:02.1355546Z",
+              "duration_ms": 14129,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "GET",
+              "path": "/objects/1099511628033"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "57160da9e5903b2383f6c55ca394de46",
+              "increasing_samples": 2,
+              "first": {
+                "sample_at": "2026-10-29T14:18:33.580033311Z",
+                "bytes": 37402532,
+                "master_updated_at": "2026-10-29T22:18:32.702948867+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:18:46.578913856Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:18:46.384003698+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 13.681055
+            },
+            {
+              "node_id": 3,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "48ae5fc6401a859577acddbef369dbad",
+              "increasing_samples": 6,
+              "first": {
+                "sample_at": "2026-10-29T14:18:55.579335461Z",
+                "bytes": 540204,
+                "master_updated_at": "2026-10-29T22:18:55.311512929+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:21:13.578807079Z",
+                "bytes": 591216,
+                "master_updated_at": "2026-10-29T22:21:12.624019452+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 40.900316
+            },
+            {
+              "node_id": 3,
+              "epoch": 1,
+              "attempt": 2,
+              "request_id": "dd4fc1bab07ba2654a87383062628cc9",
+              "increasing_samples": 5,
+              "first": {
+                "sample_at": "2026-10-29T14:22:31.682076813Z",
+                "bytes": 36624,
+                "master_updated_at": "2026-10-29T22:22:31.228428354+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:24:47.681736414Z",
+                "bytes": 54936,
+                "master_updated_at": "2026-10-29T22:24:47.230742246+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 44.950768
+            },
+            {
+              "node_id": 4,
+              "epoch": 2,
+              "attempt": 1,
+              "request_id": "54bf5bd91d4dd27894d4fae957ab0b58",
+              "increasing_samples": 2,
+              "first": {
+                "sample_at": "2026-10-29T14:26:28.699161707Z",
+                "bytes": 57117724,
+                "master_updated_at": "2026-10-29T22:26:27.99282204+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:26:31.833513379Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:26:31.784002437+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 3.79118
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "object_id": 1099511628034,
+          "stored_size": 1024,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            2,
+            4
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:26:32.755895095Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628034",
+              "request_id": "e1ade44329acfade78dfcb8a948bc81c",
+              "resume": "",
+              "size": 1024
+            },
+            {
+              "at": "2026-10-29T14:26:32.755916099Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628034",
+              "request_id": "c6ae104d5a3a95af7f9458c546cf6576",
+              "resume": "",
+              "size": 1024
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:26:33.441348648Z",
+              "elapsed_ms": 685,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628034",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:26:33.590252667Z",
+              "elapsed_ms": 834,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628034",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:26:32.780408918Z",
+              "end_utc": "2026-10-29T14:26:33.425142333Z",
+              "duration_ms": 644,
+              "body_bytes": 1024,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628034",
+              "write_epoch": "1",
+              "request_id": "c6ae104d5a3a95af7f9458c546cf6576"
+            },
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:27:02.602968548Z",
+              "end_utc": "2026-10-29T14:27:02.60529902Z",
+              "duration_ms": 2,
+              "body_bytes": 1024,
+              "node_id": 2,
+              "label": "B",
+              "method": "GET",
+              "path": "/objects/1099511628034"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:26:32.780803038Z",
+              "end_utc": "2026-10-29T14:26:33.56541944Z",
+              "duration_ms": 784,
+              "body_bytes": 1024,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628034",
+              "write_epoch": "1",
+              "request_id": "e1ade44329acfade78dfcb8a948bc81c"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "c6ae104d5a3a95af7f9458c546cf6576",
+              "increasing_samples": 1,
+              "first": {
+                "sample_at": "2026-10-29T14:26:33.591557967Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:26:33.39933391+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:26:33.591557967Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:26:33.39933391+08:00"
+              },
+              "largest_observed_increase_gap_seconds": null
+            },
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "e1ade44329acfade78dfcb8a948bc81c",
+              "increasing_samples": 1,
+              "first": {
+                "sample_at": "2026-10-29T14:26:33.591557967Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:26:33.537129161+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:26:33.591557967Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:26:33.537129161+08:00"
+              },
+              "largest_observed_increase_gap_seconds": null
+            }
+          ]
+        }
+      ],
+      "archive_refs": [
+        {
+          "name": "final-baseline-clean-result.json",
+          "bytes": 5927,
+          "sha256": "412ccadea5d9dc0b36912e95968d798d6828747da81a139a83305c673d030b9c"
+        },
+        {
+          "name": "final-baseline-clean-events.ndjson",
+          "bytes": 496264,
+          "sha256": "42234c3795a5b10593db409d89f739873b95280ff69e94beb0d244bdae7f7212"
+        }
+      ]
+    },
+    {
+      "name": "slow",
+      "classification": "Injected sustained slow receive on first block; natural WAN on later block followed by intentional A-node interruption. Combined scenario.",
+      "status": "passed",
+      "started_at": "2026-10-29T14:28:50.451756742Z",
+      "finished_at": "2026-10-29T14:38:42.855672437Z",
+      "elapsed_seconds": 592.403855292,
+      "upload_id": 4294967298,
+      "read_bytes": 134218752,
+      "expected_sha256": "f36399a5c7cf7c93d6d728087c8409774b09c98dd2869f5c2909fef6185e16f4",
+      "read_sha256": "f36399a5c7cf7c93d6d728087c8409774b09c98dd2869f5c2909fef6185e16f4",
+      "recovery_requests": 1,
+      "plans": [
+        {
+          "index": 0,
+          "object": {
+            "id": 1099511628288,
+            "version": 1,
+            "logical_size": 67108864,
+            "stored_size": 67108864,
+            "encoding": "plain-v1",
+            "checksum": 202817844,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T22:58:51.417421648+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T22:58:51.417421648+08:00"
+          }
+        },
+        {
+          "index": 1,
+          "object": {
+            "id": 1099511628289,
+            "version": 1,
+            "logical_size": 67108864,
+            "stored_size": 67108864,
+            "encoding": "plain-v1",
+            "checksum": 3352642282,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            3
+          ],
+          "confirmations": [
+            2,
+            3
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T23:02:45.078735413+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              3
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 3,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T23:02:45.078735413+08:00"
+          }
+        },
+        {
+          "index": 1,
+          "object": {
+            "id": 1099511628289,
+            "version": 1,
+            "logical_size": 67108864,
+            "stored_size": 67108864,
+            "encoding": "plain-v1",
+            "checksum": 3352642282,
+            "checksum_known": true
+          },
+          "epoch": 2,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T23:02:45.078735413+08:00",
+          "recovery_attempts": 1,
+          "excluded": [
+            3
+          ],
+          "failed_nodes": [
+            3
+          ],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T23:02:45.078735413+08:00"
+          }
+        },
+        {
+          "index": 2,
+          "object": {
+            "id": 1099511628290,
+            "version": 1,
+            "logical_size": 1024,
+            "stored_size": 1024,
+            "encoding": "plain-v1",
+            "checksum": 3053030905,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T23:08:24.074139979+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T23:08:24.074139979+08:00"
+          }
+        }
+      ],
+      "chunks": [
+        {
+          "index": 0,
+          "object_id": 1099511628288,
+          "stored_size": 67108864,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            4,
+            2
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:28:51.606461999Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628288",
+              "request_id": "8c1ca537c974fb5cd70163f753f0671e",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:28:51.606462553Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628288",
+              "request_id": "a308b7b4f9b110e7b87790020793e3d0",
+              "resume": "",
+              "size": 67108864
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:32:22.428565604Z",
+              "elapsed_ms": 210822,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628288",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:32:43.932502097Z",
+              "elapsed_ms": 232326,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628288",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:28:51.631280647Z",
+              "end_utc": "2026-10-29T14:32:43.916088457Z",
+              "duration_ms": 232284,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628288",
+              "fault": "write_slow",
+              "write_epoch": "1",
+              "request_id": "a308b7b4f9b110e7b87790020793e3d0"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:28:51.629559678Z",
+              "end_utc": "2026-10-29T14:32:22.404033729Z",
+              "duration_ms": 210774,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628288",
+              "fault": "write_slow",
+              "write_epoch": "1",
+              "request_id": "8c1ca537c974fb5cd70163f753f0671e"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:38:25.038290591Z",
+              "end_utc": "2026-10-29T14:38:33.249332109Z",
+              "duration_ms": 8211,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "GET",
+              "path": "/objects/1099511628288",
+              "fault": "write_slow"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "a308b7b4f9b110e7b87790020793e3d0",
+              "increasing_samples": 16,
+              "first": {
+                "sample_at": "2026-10-29T14:29:07.608090359Z",
+                "bytes": 4546192,
+                "master_updated_at": "2026-10-29T22:29:06.732593101+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:32:43.933902024Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:32:43.887268077+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 15.000686
+            },
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "8c1ca537c974fb5cd70163f753f0671e",
+              "increasing_samples": 14,
+              "first": {
+                "sample_at": "2026-10-29T14:29:07.608090359Z",
+                "bytes": 4311296,
+                "master_updated_at": "2026-10-29T22:29:06.751628304+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:32:22.607969904Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:32:21.751905344+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 15.000737
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "object_id": 1099511628289,
+          "stored_size": 67108864,
+          "final_epoch": 2,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            2,
+            4
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:32:45.085190729Z",
+              "epoch": "1",
+              "host": "28425.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628289",
+              "request_id": "7d139138746bb5375a627a86df75c45c",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:32:45.085188508Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628289",
+              "request_id": "dd9cb55d21e393d35fc2479eb047c39e",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:34:33.186949645Z",
+              "epoch": "1",
+              "host": "28425.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628289",
+              "request_id": "206351844d6c64e7b0eb902bcd99e729",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:38:00.968768053Z",
+              "epoch": "1",
+              "host": "28425.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628289",
+              "request_id": "b0a864208723734773bbb1f193d4157a",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:38:02.153326846Z",
+              "epoch": "2",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628289",
+              "request_id": "0dfbccc7aa88071b9c642d5e86862125",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:38:02.153327425Z",
+              "epoch": "2",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628289",
+              "request_id": "",
+              "resume": "true",
+              "size": 0
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:34:16.78279719Z",
+              "elapsed_ms": 91697,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628289",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:34:33.086446801Z",
+              "elapsed_ms": 108001,
+              "error": "planned write made no payload progress",
+              "host": "28425.et.net:29571",
+              "kind": "request_error",
+              "path": "/objects/1099511628289"
+            },
+            {
+              "at": "2026-10-29T14:38:00.868097891Z",
+              "elapsed_ms": 207681,
+              "error": "readfrom tcp 10.126.126.126:34382->10.126.126.6:29571: write tcp 10.126.126.126:34382->10.126.126.6:29571: use of closed network connection",
+              "host": "28425.et.net:29571",
+              "kind": "request_error",
+              "path": "/objects/1099511628289"
+            },
+            {
+              "at": "2026-10-29T14:38:01.01853283Z",
+              "elapsed_ms": 49,
+              "error": "dial tcp 10.126.126.6:29571: connect: connection refused",
+              "host": "28425.et.net:29571",
+              "kind": "request_error",
+              "path": "/objects/1099511628289"
+            },
+            {
+              "at": "2026-10-29T14:38:02.310052872Z",
+              "elapsed_ms": 156,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628289",
+              "status": 200
+            },
+            {
+              "at": "2026-10-29T14:38:21.00525515Z",
+              "elapsed_ms": 18851,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628289",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:32:45.110001628Z",
+              "end_utc": "2026-10-29T14:34:16.76649721Z",
+              "duration_ms": 91656,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628289",
+              "write_epoch": "1",
+              "request_id": "dd9cb55d21e393d35fc2479eb047c39e"
+            },
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:38:02.177938908Z",
+              "end_utc": "2026-10-29T14:38:02.293727424Z",
+              "duration_ms": 115,
+              "body_bytes": 0,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628289",
+              "write_epoch": "2"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:38:02.179088466Z",
+              "end_utc": "2026-10-29T14:38:20.979766781Z",
+              "duration_ms": 18800,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628289",
+              "write_epoch": "2",
+              "request_id": "0dfbccc7aa88071b9c642d5e86862125"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:38:33.515901781Z",
+              "end_utc": "2026-10-29T14:38:41.53608367Z",
+              "duration_ms": 8020,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "GET",
+              "path": "/objects/1099511628289"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "dd9cb55d21e393d35fc2479eb047c39e",
+              "increasing_samples": 7,
+              "first": {
+                "sample_at": "2026-10-29T14:33:01.086119159Z",
+                "bytes": 7858464,
+                "master_updated_at": "2026-10-29T22:33:00.458464942+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:34:17.086704913Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:34:16.74121635+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 15.000394
+            },
+            {
+              "node_id": 3,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "7d139138746bb5375a627a86df75c45c",
+              "increasing_samples": 2,
+              "first": {
+                "sample_at": "2026-10-29T14:33:03.087153546Z",
+                "bytes": 158268,
+                "master_updated_at": "2026-10-29T22:33:02.328491438+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:33:33.086764751Z",
+                "bytes": 162192,
+                "master_updated_at": "2026-10-29T22:33:32.329008475+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 30.000517
+            },
+            {
+              "node_id": 3,
+              "epoch": 1,
+              "attempt": 2,
+              "request_id": "206351844d6c64e7b0eb902bcd99e729",
+              "increasing_samples": 8,
+              "first": {
+                "sample_at": "2026-10-29T14:35:02.188336077Z",
+                "bytes": 27468,
+                "master_updated_at": "2026-10-29T22:35:01.592603873+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:37:33.188275162Z",
+                "bytes": 461724,
+                "master_updated_at": "2026-10-29T22:37:32.358145585+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 44.999602
+            },
+            {
+              "node_id": 4,
+              "epoch": 2,
+              "attempt": 1,
+              "request_id": "0dfbccc7aa88071b9c642d5e86862125",
+              "increasing_samples": 2,
+              "first": {
+                "sample_at": "2026-10-29T14:38:18.155807468Z",
+                "bytes": 60239288,
+                "master_updated_at": "2026-10-29T22:38:17.307175652+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:38:21.006473038Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:38:20.947772292+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 3.640597
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "object_id": 1099511628290,
+          "stored_size": 1024,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            4,
+            2
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:38:24.089574099Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628290",
+              "request_id": "fdab04a8e22a2629e74b7071e68da5b1",
+              "resume": "",
+              "size": 1024
+            },
+            {
+              "at": "2026-10-29T14:38:24.089697108Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628290",
+              "request_id": "8e743f22fc5586aef78bbad7880730de",
+              "resume": "",
+              "size": 1024
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:38:24.92905834Z",
+              "elapsed_ms": 839,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628290",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:38:25.009333484Z",
+              "elapsed_ms": 919,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628290",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:38:24.114194221Z",
+              "end_utc": "2026-10-29T14:38:24.993070198Z",
+              "duration_ms": 878,
+              "body_bytes": 1024,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628290",
+              "write_epoch": "1",
+              "request_id": "8e743f22fc5586aef78bbad7880730de"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:38:24.126272484Z",
+              "end_utc": "2026-10-29T14:38:24.904297972Z",
+              "duration_ms": 778,
+              "body_bytes": 1024,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628290",
+              "write_epoch": "1",
+              "request_id": "fdab04a8e22a2629e74b7071e68da5b1"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:38:42.281183411Z",
+              "end_utc": "2026-10-29T14:38:42.283368989Z",
+              "duration_ms": 2,
+              "body_bytes": 1024,
+              "node_id": 4,
+              "label": "C",
+              "method": "GET",
+              "path": "/objects/1099511628290"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "8e743f22fc5586aef78bbad7880730de",
+              "increasing_samples": 1,
+              "first": {
+                "sample_at": "2026-10-29T14:38:25.010471445Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:38:24.967244487+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:38:25.010471445Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:38:24.967244487+08:00"
+              },
+              "largest_observed_increase_gap_seconds": null
+            },
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "fdab04a8e22a2629e74b7071e68da5b1",
+              "increasing_samples": 1,
+              "first": {
+                "sample_at": "2026-10-29T14:38:25.010471445Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:38:24.877336732+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:38:25.010471445Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:38:24.877336732+08:00"
+              },
+              "largest_observed_increase_gap_seconds": null
+            }
+          ]
+        }
+      ],
+      "archive_refs": [
+        {
+          "name": "final-slow-result.json",
+          "bytes": 5917,
+          "sha256": "2746a60d8263d39b4ac2e1bec9cf48cb9ebd462062b365ce348344e7cc199904"
+        },
+        {
+          "name": "final-slow-events.ndjson",
+          "bytes": 610610,
+          "sha256": "07b0732f5a5da298a397d09987be67c1a6f61c15184632b4e709973a3e06bb36"
+        }
+      ]
+    },
+    {
+      "name": "slow-single",
+      "classification": "Independent complete upload with injected real node-body read delays. No recovery or target switch.",
+      "status": "passed",
+      "started_at": "2026-10-29T14:40:47.740427801Z",
+      "finished_at": "2026-10-29T14:45:18.045315919Z",
+      "elapsed_seconds": 270.304887168,
+      "upload_id": 4294967299,
+      "read_bytes": 67109888,
+      "expected_sha256": "5e47be74217b4e63f67a2aac4952e3524307bd25a3e7d74f39f1c3c6c0efcfe1",
+      "read_sha256": "5e47be74217b4e63f67a2aac4952e3524307bd25a3e7d74f39f1c3c6c0efcfe1",
+      "recovery_requests": 0,
+      "plans": [
+        {
+          "index": 0,
+          "object": {
+            "id": 1099511628544,
+            "version": 1,
+            "logical_size": 67108864,
+            "stored_size": 67108864,
+            "encoding": "plain-v1",
+            "checksum": 202817844,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T23:10:48.577777203+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T23:10:48.577777203+08:00"
+          }
+        },
+        {
+          "index": 1,
+          "object": {
+            "id": 1099511628545,
+            "version": 1,
+            "logical_size": 1024,
+            "stored_size": 1024,
+            "encoding": "plain-v1",
+            "checksum": 66994871,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T23:15:07.592853455+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T23:15:07.592853455+08:00"
+          }
+        }
+      ],
+      "chunks": [
+        {
+          "index": 0,
+          "object_id": 1099511628544,
+          "stored_size": 67108864,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            4,
+            2
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:40:48.858511358Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628544",
+              "request_id": "e608b98958879784fa86e6645852c3f9",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:40:48.85853238Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628544",
+              "request_id": "ab78ae585ba601b9dde4a8c034076b3a",
+              "resume": "",
+              "size": 67108864
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:44:18.052212704Z",
+              "elapsed_ms": 209193,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628544",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:45:07.515193332Z",
+              "elapsed_ms": 258656,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628544",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:40:48.883263694Z",
+              "end_utc": "2026-10-29T14:45:07.498715438Z",
+              "duration_ms": 258615,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628544",
+              "fault": "write_slow",
+              "write_epoch": "1",
+              "request_id": "ab78ae585ba601b9dde4a8c034076b3a"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:40:48.9314914Z",
+              "end_utc": "2026-10-29T14:44:18.027239593Z",
+              "duration_ms": 209095,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628544",
+              "fault": "write_slow",
+              "write_epoch": "1",
+              "request_id": "e608b98958879784fa86e6645852c3f9"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:45:08.68350211Z",
+              "end_utc": "2026-10-29T14:45:16.894375448Z",
+              "duration_ms": 8210,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "GET",
+              "path": "/objects/1099511628544",
+              "fault": "write_slow"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "ab78ae585ba601b9dde4a8c034076b3a",
+              "increasing_samples": 18,
+              "first": {
+                "sample_at": "2026-10-29T14:41:04.859788476Z",
+                "bytes": 4583232,
+                "master_updated_at": "2026-10-29T22:41:04.008450728+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:45:07.516146235Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:45:07.472856279+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 16.0021
+            },
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "e608b98958879784fa86e6645852c3f9",
+              "increasing_samples": 14,
+              "first": {
+                "sample_at": "2026-10-29T14:41:04.859788476Z",
+                "bytes": 4837048,
+                "master_updated_at": "2026-10-29T22:41:04.0888447+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:44:18.860221168Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:44:18.001370617+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 15.000517
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "object_id": 1099511628545,
+          "stored_size": 1024,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            2,
+            4
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:45:07.598532021Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628545",
+              "request_id": "2605e6828a3c1ea7ae40f8b4c51f6760",
+              "resume": "",
+              "size": 1024
+            },
+            {
+              "at": "2026-10-29T14:45:07.598994802Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628545",
+              "request_id": "13aecd7c7a1e6e0f8316829181255403",
+              "resume": "",
+              "size": 1024
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:45:08.189996445Z",
+              "elapsed_ms": 591,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628545",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:45:08.654281041Z",
+              "elapsed_ms": 1055,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628545",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:45:07.623479502Z",
+              "end_utc": "2026-10-29T14:45:08.173767665Z",
+              "duration_ms": 550,
+              "body_bytes": 1024,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628545",
+              "write_epoch": "1",
+              "request_id": "13aecd7c7a1e6e0f8316829181255403"
+            },
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:45:17.429015403Z",
+              "end_utc": "2026-10-29T14:45:17.4313789Z",
+              "duration_ms": 2,
+              "body_bytes": 1024,
+              "node_id": 2,
+              "label": "B",
+              "method": "GET",
+              "path": "/objects/1099511628545"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:45:07.624407154Z",
+              "end_utc": "2026-10-29T14:45:08.629381219Z",
+              "duration_ms": 1004,
+              "body_bytes": 1024,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628545",
+              "write_epoch": "1",
+              "request_id": "2605e6828a3c1ea7ae40f8b4c51f6760"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "13aecd7c7a1e6e0f8316829181255403",
+              "increasing_samples": 1,
+              "first": {
+                "sample_at": "2026-10-29T14:45:08.600671345Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:45:08.147879622+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:45:08.600671345Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:45:08.147879622+08:00"
+              },
+              "largest_observed_increase_gap_seconds": null
+            },
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "2605e6828a3c1ea7ae40f8b4c51f6760",
+              "increasing_samples": 1,
+              "first": {
+                "sample_at": "2026-10-29T14:45:08.655754173Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:45:08.604676694+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:45:08.655754173Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:45:08.604676694+08:00"
+              },
+              "largest_observed_increase_gap_seconds": null
+            }
+          ]
+        }
+      ],
+      "archive_refs": [
+        {
+          "name": "final-slow-single-result.json",
+          "bytes": 3537,
+          "sha256": "ebb9ce07f553e0643ccd69c61a1c189b2e59466d37ba854adec4f1c19bdf5c0e"
+        },
+        {
+          "name": "final-slow-single-events.ndjson",
+          "bytes": 247257,
+          "sha256": "c47f498898229d350b3be324fd36850adf08ef4ff08725495bdcab79b62098dc"
+        }
+      ]
+    },
+    {
+      "name": "restart-gap",
+      "classification": "Same isolated Master database and configuration restarted during a block-complete barrier; original upload then continued.",
+      "status": "passed",
+      "started_at": "2026-10-29T14:46:42.107647783Z",
+      "finished_at": "2026-10-29T14:50:16.049549739Z",
+      "elapsed_seconds": 213.941900611,
+      "upload_id": 4294967300,
+      "read_bytes": 134218752,
+      "expected_sha256": "f36399a5c7cf7c93d6d728087c8409774b09c98dd2869f5c2909fef6185e16f4",
+      "read_sha256": "f36399a5c7cf7c93d6d728087c8409774b09c98dd2869f5c2909fef6185e16f4",
+      "recovery_requests": 0,
+      "plans": [
+        {
+          "index": 0,
+          "object": {
+            "id": 1099511628800,
+            "version": 1,
+            "logical_size": 67108864,
+            "stored_size": 67108864,
+            "encoding": "plain-v1",
+            "checksum": 202817844,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T23:16:42.987329422+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T23:16:42.987329422+08:00"
+          }
+        },
+        {
+          "index": 1,
+          "object": {
+            "id": 1099511628801,
+            "version": 1,
+            "logical_size": 67108864,
+            "stored_size": 67108864,
+            "encoding": "plain-v1",
+            "checksum": 3352642282,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T23:18:38.452461428+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T23:18:38.452461428+08:00"
+          }
+        },
+        {
+          "index": 2,
+          "object": {
+            "id": 1099511628802,
+            "version": 1,
+            "logical_size": 1024,
+            "stored_size": 1024,
+            "encoding": "plain-v1",
+            "checksum": 3053030905,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T23:19:48.35913425+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T23:19:48.35913425+08:00"
+          }
+        }
+      ],
+      "chunks": [
+        {
+          "index": 0,
+          "object_id": 1099511628800,
+          "stored_size": 67108864,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            4,
+            2
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:46:42.993954778Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628800",
+              "request_id": "168559d0a2e7e38a16126f12ce723cc5",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:46:42.994010811Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628800",
+              "request_id": "ef04311fddd7a8c3f64b41fc396ad595",
+              "resume": "",
+              "size": 67108864
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:47:02.085704101Z",
+              "elapsed_ms": 19091,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628800",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:47:21.503507907Z",
+              "elapsed_ms": 38509,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628800",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:46:43.086775732Z",
+              "end_utc": "2026-10-29T14:47:21.487310002Z",
+              "duration_ms": 38400,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628800",
+              "write_epoch": "1",
+              "request_id": "ef04311fddd7a8c3f64b41fc396ad595"
+            },
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:49:49.889350072Z",
+              "end_utc": "2026-10-29T14:50:02.490177149Z",
+              "duration_ms": 12600,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "GET",
+              "path": "/objects/1099511628800"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:46:43.017349943Z",
+              "end_utc": "2026-10-29T14:47:02.061249463Z",
+              "duration_ms": 19043,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628800",
+              "write_epoch": "1",
+              "request_id": "168559d0a2e7e38a16126f12ce723cc5"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "ef04311fddd7a8c3f64b41fc396ad595",
+              "increasing_samples": 3,
+              "first": {
+                "sample_at": "2026-10-29T14:46:58.996303676Z",
+                "bytes": 31894272,
+                "master_updated_at": "2026-10-29T22:46:58.188251577+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:47:20.996795255Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:47:20.967161623+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 14.998627
+            },
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "168559d0a2e7e38a16126f12ce723cc5",
+              "increasing_samples": 2,
+              "first": {
+                "sample_at": "2026-10-29T14:46:58.996303676Z",
+                "bytes": 61545464,
+                "master_updated_at": "2026-10-29T22:46:58.140011585+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:47:01.995463544Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:47:01.977251457+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 3.83724
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "object_id": 1099511628801,
+          "stored_size": 67108864,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            4,
+            2
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:48:38.460329295Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628801",
+              "request_id": "93379e490759c79d4de71c4c9869ba7b",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:48:38.460328816Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628801",
+              "request_id": "e849d3856184687b177d055c9aaef060",
+              "resume": "",
+              "size": 67108864
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:48:57.187748703Z",
+              "elapsed_ms": 18727,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628801",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:49:47.449824663Z",
+              "elapsed_ms": 68989,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628801",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:48:38.485142509Z",
+              "end_utc": "2026-10-29T14:49:47.433757183Z",
+              "duration_ms": 68948,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628801",
+              "write_epoch": "1",
+              "request_id": "93379e490759c79d4de71c4c9869ba7b"
+            },
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:50:02.777740082Z",
+              "end_utc": "2026-10-29T14:50:15.02454595Z",
+              "duration_ms": 12246,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "GET",
+              "path": "/objects/1099511628801"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:48:38.530202834Z",
+              "end_utc": "2026-10-29T14:48:57.163185245Z",
+              "duration_ms": 18632,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628801",
+              "write_epoch": "1",
+              "request_id": "e849d3856184687b177d055c9aaef060"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "93379e490759c79d4de71c4c9869ba7b",
+              "increasing_samples": 5,
+              "first": {
+                "sample_at": "2026-10-29T14:48:54.461544323Z",
+                "bytes": 13907964,
+                "master_updated_at": "2026-10-29T22:48:53.587078804+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:49:47.450869027Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:49:47.407751888+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 15.041361
+            },
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "e849d3856184687b177d055c9aaef060",
+              "increasing_samples": 2,
+              "first": {
+                "sample_at": "2026-10-29T14:48:54.461544323Z",
+                "bytes": 61234168,
+                "master_updated_at": "2026-10-29T22:48:53.684884422+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:48:57.462327923Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:48:57.128908709+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 3.444024
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "object_id": 1099511628802,
+          "stored_size": 1024,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            4,
+            2
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:49:48.367794163Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628802",
+              "request_id": "85cfe6db3103b229354f1c4442f84b74",
+              "resume": "",
+              "size": 1024
+            },
+            {
+              "at": "2026-10-29T14:49:48.367795841Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511628802",
+              "request_id": "e476f7fcf6b17ed2170dd1122062b425",
+              "resume": "",
+              "size": 1024
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:49:49.406340466Z",
+              "elapsed_ms": 1038,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628802",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:49:49.859214883Z",
+              "elapsed_ms": 1491,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511628802",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:49:48.392741173Z",
+              "end_utc": "2026-10-29T14:49:49.843218679Z",
+              "duration_ms": 1450,
+              "body_bytes": 1024,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511628802",
+              "write_epoch": "1",
+              "request_id": "85cfe6db3103b229354f1c4442f84b74"
+            },
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:50:15.409721929Z",
+              "end_utc": "2026-10-29T14:50:15.412061147Z",
+              "duration_ms": 2,
+              "body_bytes": 1024,
+              "node_id": 2,
+              "label": "B",
+              "method": "GET",
+              "path": "/objects/1099511628802"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:49:48.438446376Z",
+              "end_utc": "2026-10-29T14:49:49.381943334Z",
+              "duration_ms": 943,
+              "body_bytes": 1024,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511628802",
+              "write_epoch": "1",
+              "request_id": "e476f7fcf6b17ed2170dd1122062b425"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "e476f7fcf6b17ed2170dd1122062b425",
+              "increasing_samples": 1,
+              "first": {
+                "sample_at": "2026-10-29T14:49:49.369629745Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:49:49.350265959+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:49:49.369629745Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:49:49.350265959+08:00"
+              },
+              "largest_observed_increase_gap_seconds": null
+            },
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "85cfe6db3103b229354f1c4442f84b74",
+              "increasing_samples": 1,
+              "first": {
+                "sample_at": "2026-10-29T14:49:49.860322455Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:49:49.817598355+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:49:49.860322455Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:49:49.817598355+08:00"
+              },
+              "largest_observed_increase_gap_seconds": null
+            }
+          ]
+        }
+      ],
+      "archive_refs": [
+        {
+          "name": "final-restart-gap-result.json",
+          "bytes": 4931,
+          "sha256": "6d4781dfbc1763691514eae76f09f1fd9d6b65a4eac12fcf7697866f881a4078"
+        },
+        {
+          "name": "final-restart-gap-events.ndjson",
+          "bytes": 105040,
+          "sha256": "a6e286dcd4758e9771a8d1feca879df8c32480f80ec2c9326d8b323d90359c0f"
+        }
+      ]
+    },
+    {
+      "name": "restart-active-slow",
+      "classification": "Same isolated Master database and configuration restarted while both nodes were receiving payload under injected slow-read conditions.",
+      "status": "passed",
+      "started_at": "2026-10-29T14:51:49.335560034Z",
+      "finished_at": "2026-10-29T14:56:55.220979063Z",
+      "elapsed_seconds": 305.885417861,
+      "upload_id": 4294967301,
+      "read_bytes": 67109888,
+      "expected_sha256": "5e47be74217b4e63f67a2aac4952e3524307bd25a3e7d74f39f1c3c6c0efcfe1",
+      "read_sha256": "5e47be74217b4e63f67a2aac4952e3524307bd25a3e7d74f39f1c3c6c0efcfe1",
+      "recovery_requests": 0,
+      "plans": [
+        {
+          "index": 0,
+          "object": {
+            "id": 1099511629056,
+            "version": 1,
+            "logical_size": 67108864,
+            "stored_size": 67108864,
+            "encoding": "plain-v1",
+            "checksum": 202817844,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T23:21:50.078418282+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T23:21:50.078418282+08:00"
+          }
+        },
+        {
+          "index": 1,
+          "object": {
+            "id": 1099511629057,
+            "version": 1,
+            "logical_size": 1024,
+            "stored_size": 1024,
+            "encoding": "plain-v1",
+            "checksum": 66994871,
+            "checksum_known": true
+          },
+          "epoch": 1,
+          "layout_nodes": [
+            2,
+            4
+          ],
+          "confirmations": [
+            2,
+            4
+          ],
+          "required_confirmations": 2,
+          "hard_until": "2026-10-29T23:26:45.139845329+08:00",
+          "recovery_attempts": 0,
+          "excluded": [],
+          "failed_nodes": [],
+          "transfer": {
+            "upload_targets": [
+              2,
+              4
+            ],
+            "legs": [
+              {
+                "from_node_id": 0,
+                "to_node_id": 2,
+                "path": "http",
+                "bps": 4194304
+              },
+              {
+                "from_node_id": 0,
+                "to_node_id": 4,
+                "path": "http",
+                "bps": 4194304
+              }
+            ],
+            "expires_at": "2026-10-29T23:26:45.139845329+08:00"
+          }
+        }
+      ],
+      "chunks": [
+        {
+          "index": 0,
+          "object_id": 1099511629056,
+          "stored_size": 67108864,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            4,
+            2
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:51:50.331896642Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511629056",
+              "request_id": "4cb13f076dfc4b26458b4cb3ce321007",
+              "resume": "",
+              "size": 67108864
+            },
+            {
+              "at": "2026-10-29T14:51:50.331934492Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511629056",
+              "request_id": "063c913e96f617ade0dcc12d83b64cb3",
+              "resume": "",
+              "size": 67108864
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:55:18.589012296Z",
+              "elapsed_ms": 208257,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511629056",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:56:44.466447547Z",
+              "elapsed_ms": 294134,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511629056",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:51:50.356701166Z",
+              "end_utc": "2026-10-29T14:56:44.450426473Z",
+              "duration_ms": 294093,
+              "body_bytes": 67108864,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511629056",
+              "fault": "write_slow",
+              "write_epoch": "1",
+              "request_id": "063c913e96f617ade0dcc12d83b64cb3"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:51:50.39157928Z",
+              "end_utc": "2026-10-29T14:55:18.56462138Z",
+              "duration_ms": 208173,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511629056",
+              "fault": "write_slow",
+              "write_epoch": "1",
+              "request_id": "4cb13f076dfc4b26458b4cb3ce321007"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:56:46.353062691Z",
+              "end_utc": "2026-10-29T14:56:54.598395497Z",
+              "duration_ms": 8245,
+              "body_bytes": 67108864,
+              "node_id": 4,
+              "label": "C",
+              "method": "GET",
+              "path": "/objects/1099511629056",
+              "fault": "write_slow"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "063c913e96f617ade0dcc12d83b64cb3",
+              "increasing_samples": 19,
+              "first": {
+                "sample_at": "2026-10-29T14:52:06.33308225Z",
+                "bytes": 4731036,
+                "master_updated_at": "2026-10-29T22:52:05.457745764+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:56:44.46748151Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:56:44.424781602+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 30.00026
+            },
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "4cb13f076dfc4b26458b4cb3ce321007",
+              "increasing_samples": 13,
+              "first": {
+                "sample_at": "2026-10-29T14:52:06.33308225Z",
+                "bytes": 4849664,
+                "master_updated_at": "2026-10-29T22:52:05.662669582+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:55:19.333146865Z",
+                "bytes": 67108864,
+                "master_updated_at": "2026-10-29T22:55:18.540445299+08:00"
+              },
+              "largest_observed_increase_gap_seconds": 30.100178
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "object_id": 1099511629057,
+          "stored_size": 1024,
+          "final_epoch": 1,
+          "replicas": [
+            2,
+            4
+          ],
+          "done": [
+            4,
+            2
+          ],
+          "client_puts": [
+            {
+              "at": "2026-10-29T14:56:45.147014582Z",
+              "epoch": "1",
+              "host": "27472.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511629057",
+              "request_id": "bc4a9bd9b9a2013833f04dc29296ec25",
+              "resume": "",
+              "size": 1024
+            },
+            {
+              "at": "2026-10-29T14:56:45.147015983Z",
+              "epoch": "1",
+              "host": "29663.et.net:29571",
+              "kind": "put_start",
+              "path": "/objects/1099511629057",
+              "request_id": "89e3fe159947ce6f520b635ecd7b6bd2",
+              "resume": "",
+              "size": 1024
+            }
+          ],
+          "client_responses": [
+            {
+              "at": "2026-10-29T14:56:45.930914385Z",
+              "elapsed_ms": 783,
+              "host": "29663.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511629057",
+              "status": 201
+            },
+            {
+              "at": "2026-10-29T14:56:46.324545519Z",
+              "elapsed_ms": 1177,
+              "host": "27472.et.net:29571",
+              "kind": "put_response",
+              "path": "/objects/1099511629057",
+              "status": 201
+            }
+          ],
+          "node_events": [
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:56:45.171494111Z",
+              "end_utc": "2026-10-29T14:56:46.308564929Z",
+              "duration_ms": 1137,
+              "body_bytes": 1024,
+              "node_id": 2,
+              "label": "B",
+              "method": "PUT",
+              "path": "/objects/1099511629057",
+              "write_epoch": "1",
+              "request_id": "bc4a9bd9b9a2013833f04dc29296ec25"
+            },
+            {
+              "host": "27472.et.net",
+              "start_utc": "2026-10-29T14:56:54.916806882Z",
+              "end_utc": "2026-10-29T14:56:54.919138436Z",
+              "duration_ms": 2,
+              "body_bytes": 1024,
+              "node_id": 2,
+              "label": "B",
+              "method": "GET",
+              "path": "/objects/1099511629057"
+            },
+            {
+              "host": "29663.et.net",
+              "start_utc": "2026-10-29T14:56:45.170249727Z",
+              "end_utc": "2026-10-29T14:56:45.906416178Z",
+              "duration_ms": 736,
+              "body_bytes": 1024,
+              "node_id": 4,
+              "label": "C",
+              "method": "PUT",
+              "path": "/objects/1099511629057",
+              "write_epoch": "1",
+              "request_id": "89e3fe159947ce6f520b635ecd7b6bd2"
+            }
+          ],
+          "progress_attempt_summaries": [
+            {
+              "node_id": 4,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "89e3fe159947ce6f520b635ecd7b6bd2",
+              "increasing_samples": 1,
+              "first": {
+                "sample_at": "2026-10-29T14:56:46.149462931Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:56:45.882143714+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:56:46.149462931Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:56:45.882143714+08:00"
+              },
+              "largest_observed_increase_gap_seconds": null
+            },
+            {
+              "node_id": 2,
+              "epoch": 1,
+              "attempt": 1,
+              "request_id": "bc4a9bd9b9a2013833f04dc29296ec25",
+              "increasing_samples": 1,
+              "first": {
+                "sample_at": "2026-10-29T14:56:46.32550525Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:56:46.282143141+08:00"
+              },
+              "last": {
+                "sample_at": "2026-10-29T14:56:46.32550525Z",
+                "bytes": 1024,
+                "master_updated_at": "2026-10-29T22:56:46.282143141+08:00"
+              },
+              "largest_observed_increase_gap_seconds": null
+            }
+          ]
+        }
+      ],
+      "archive_refs": [
+        {
+          "name": "final-restart-active-slow-result.json",
+          "bytes": 3546,
+          "sha256": "2e482845ad8eba2946a0034a31f4c7190a3c67b965d8dee95c45d9dd57f32311"
+        },
+        {
+          "name": "final-restart-active-slow-events.ndjson",
+          "bytes": 254133,
+          "sha256": "aed202d2272622e68e4b3ff2801ee70bc9da4a0ff4109904ffecb05dfa8f65c7"
+        }
+      ]
+    }
+  ],
+  "natural_WAN_limit": "A was observed advancing past 150 seconds, then stalled/retried and was deliberately interrupted. No evidence of a complete naturally-slow (>150s) A replica; the successful full uploads required replacement. Injected slow-read success is separately recorded.",
+  "retirement": {
+    "before_first_fault_node_return": {
+      "node_id": 3,
+      "object_id": 1099511628033,
+      "state": "attempted",
+      "reserved_bytes": 67108864
+    },
+    "after_return": {
+      "node_id": 3,
+      "accounted_bytes": 0,
+      "reserved_bytes": 0,
+      "temporary_objects": []
+    },
+    "final_records": [
+      {
+        "object_id": 1099511627776,
+        "node_id": 2,
+        "state": "confirmed",
+        "reason": "aborted-write",
+        "created_at": "2026-10-29T22:11:58.988491727+08:00",
+        "confirmed_at": "2026-10-29T22:11:59.488575884+08:00",
+        "expected_size": 67108864,
+        "removed_bytes": 67108864,
+        "usage": {
+          "epoch": "32670b4e342bcfcccb7b87f93c2f4c2c",
+          "sequence": 9,
+          "used_bytes": 0
+        }
+      },
+      {
+        "object_id": 1099511627776,
+        "node_id": 3,
+        "state": "confirmed",
+        "reason": "write-reassigned",
+        "created_at": "2026-10-29T22:11:47.934412361+08:00",
+        "confirmed_at": "2026-10-29T22:13:15.235363419+08:00",
+        "expected_size": 67108864,
+        "removed_bytes": 0,
+        "usage": {
+          "epoch": "f9478aab4dc216c0d73066353119c90f",
+          "sequence": 227,
+          "used_bytes": 0
+        }
+      },
+      {
+        "object_id": 1099511627776,
+        "node_id": 4,
+        "state": "confirmed",
+        "reason": "aborted-write",
+        "created_at": "2026-10-29T22:11:58.988491727+08:00",
+        "confirmed_at": "2026-10-29T22:12:19.590303253+08:00",
+        "expected_size": 67108864,
+        "removed_bytes": 0,
+        "usage": {
+          "epoch": "6b220561916c2d3aa3d04eb17a0cd4d0",
+          "sequence": 3,
+          "used_bytes": 0
+        }
+      },
+      {
+        "object_id": 1099511628033,
+        "node_id": 3,
+        "state": "confirmed",
+        "reason": "write-reassigned",
+        "created_at": "2026-10-29T22:26:12.693475232+08:00",
+        "confirmed_at": "2026-10-29T22:31:09.709049505+08:00",
+        "expected_size": 67108864,
+        "removed_bytes": 0,
+        "usage": {
+          "epoch": "158869cc46c38d28ce5995603a248755",
+          "sequence": 1,
+          "used_bytes": 0
+        }
+      },
+      {
+        "object_id": 1099511628289,
+        "node_id": 3,
+        "state": "confirmed",
+        "reason": "write-reassigned",
+        "created_at": "2026-10-29T22:38:02.148007947+08:00",
+        "confirmed_at": "2026-10-29T22:59:56.594638394+08:00",
+        "expected_size": 67108864,
+        "removed_bytes": 0,
+        "usage": {
+          "epoch": "be8160657f7517346fff2d7d92f197b2",
+          "sequence": 1,
+          "used_bytes": 0
+        }
+      },
+      {
+        "object_id": 1099511629312,
+        "node_id": 2,
+        "state": "confirmed",
+        "reason": "aborted-write",
+        "created_at": "2026-10-29T23:16:52.433323589+08:00",
+        "confirmed_at": "2026-10-29T23:16:52.764954805+08:00",
+        "expected_size": 8,
+        "removed_bytes": 0,
+        "usage": {
+          "epoch": "32670b4e342bcfcccb7b87f93c2f4c2c",
+          "sequence": 816,
+          "used_bytes": 536876032
+        }
+      }
+    ],
+    "final_capacity": [
+      {
+        "node_id": 2,
+        "capacity_bytes": 8589934592,
+        "accounted_bytes": 536876032,
+        "reserved_bytes": 0,
+        "headroom_bytes": 0,
+        "free_bytes": 8053058560
+      },
+      {
+        "node_id": 3,
+        "capacity_bytes": 8589934592,
+        "accounted_bytes": 0,
+        "reserved_bytes": 0,
+        "headroom_bytes": 0,
+        "free_bytes": 8589934592
+      },
+      {
+        "node_id": 4,
+        "capacity_bytes": 8589934592,
+        "accounted_bytes": 536876032,
+        "reserved_bytes": 0,
+        "headroom_bytes": 0,
+        "free_bytes": 8053058560
+      }
+    ],
+    "archived_database_ref": {
+      "name": "remote-final-26666.et.net-master.db",
+      "bytes": 524288,
+      "sha256": "13ab390043bd4bd4325af1a77620beaf202b2d5e0fb9885d813008c5f53141a0"
+    }
+  },
+  "API_replays": {
+    "old_descriptor": {
+      "classification": "API replay of saved descriptor, not a naturally delayed network packet",
+      "object_id": 1099511628033,
+      "node_id": 3,
+      "response_status": 409
+    },
+    "registered_attempts": {
+      "classification": "controlled Master API reports in fresh isolated pending upload; no real payload was sent and no Done was forged",
+      "object_id": 1099511629312,
+      "node_id": 2,
+      "checks": {
+        "old_report_rejected": true,
+        "old_begin_rejected": true,
+        "new_sequence_advanced": true,
+        "token_changed": true,
+        "new_registration_not_progress": true,
+        "duplicate_not_renewed": true,
+        "new_attempt_can_start_with_fewer_bytes": true,
+        "hint_never_done": true
+      },
+      "old_report_status": 409,
+      "old_begin_status": 409,
+      "attempt_sequences": [
+        1,
+        2
+      ],
+      "aborted_after_probe": true
+    }
+  },
+  "master_restart": {
+    "gap_seconds": 12,
+    "active_receive_gap_seconds": 12,
+    "same_db_and_config": true,
+    "not_a_process_crash_or_full_center_loss_test": true
+  },
+  "first_run_interference": {
+    "status": "failed",
+    "error": "planned chunk 0: recover chunk 0: http 422: no feasible write layout",
+    "elapsed_seconds": 567.190989826,
+    "classification": "Excluded from functionality pass/fail: main-agent tool-switch command delayed until replacement C was receiving; it stopped the C lab process, not a production process. Original failure record retained.",
+    "archive_refs": [
+      {
+        "name": "first-run-baseline-result.json",
+        "bytes": 2508,
+        "sha256": "cb4d2145e936e03c0f62c5886558bde7550b4a39882b6ba2e5a15585b2914151"
+      },
+      {
+        "name": "first-run-baseline-events.ndjson",
+        "bytes": 348932,
+        "sha256": "924f8ba182054a280865310f514d30475f341ec8bbd9aa2bec86a856e24fc485"
+      }
+    ]
+  },
+  "node_event_limits": {
+    "28425.et.net": {
+      "final_record_count": 0,
+      "dropped": 0,
+      "restarts_reset_ring": true
+    },
+    "27472.et.net": {
+      "final_record_count": 23,
+      "dropped": 0,
+      "restarts_reset_ring": true
+    },
+    "29663.et.net": {
+      "final_record_count": 19,
+      "dropped": 0,
+      "restarts_reset_ring": true
+    }
+  },
+  "cleanup": {
+    "27472.et.net": {
+      "overlay_identity_unchanged": true,
+      "isolated_directory_removed": true,
+      "formal_health": 200,
+      "archived_log_hashes_match": true
+    },
+    "28425.et.net": {
+      "overlay_identity_unchanged": true,
+      "isolated_directory_removed": true,
+      "formal_health": 200,
+      "archived_log_hashes_match": true
+    },
+    "26666.et.net": {
+      "overlay_identity_unchanged": true,
+      "isolated_directory_removed": true,
+      "formal_health": 200,
+      "archived_log_hashes_match": true
+    },
+    "29663.et.net": {
+      "overlay_identity_unchanged": true,
+      "isolated_directory_removed": true,
+      "formal_health": "unavailable:URLError",
+      "archived_log_hashes_match": true
+    },
+    "firewall": {
+      "port": "29570/tcp",
+      "permanent_modified": false,
+      "before": "yes",
+      "runtime": "no",
+      "permanent": "no",
+      "time_utc": "2026-10-29T15:35:34Z"
+    },
+    "total_removed_bytes": 1231591175
+  },
+  "cleanup_archive_refs": [
+    {
+      "name": "final-removed-directories.json",
+      "bytes": 8690,
+      "sha256": "61d0739837d3284ae543668d1d124aedcf9752a15cef915353d5c6af31083478"
+    },
+    {
+      "name": "final-remote-archives.json",
+      "bytes": 9546,
+      "sha256": "a1befcc758a0bc910ce92dc546adce241b5bf3399da69f5488f54c48ef685a3d"
+    },
+    {
+      "name": "final-firewall-removed.json",
+      "bytes": 154,
+      "sha256": "6fbda883564c0cbfbc785adffbea0f7ddacf275cf867681be48fab02ae8a752c"
+    }
+  ],
+  "local_followup": {
+    "status_query_retry_core_patch_deployed_to_NAS": false,
+    "confirmed_gap": "One transient EOF or HTTP 503 after a successful replan could abort the upload; reproduced with an isolated local overlay.",
+    "patch": "Same-binding read-only status query: at most three transient retries, 100/200ms backoff; successful invalid identities/progress and permanent errors fail immediately. No progress/Done/epoch is created by errors.",
+    "other_regression_issue": "A full local race run caught unsynchronized bytes.Buffer log capture in master/scanner_test.go with late test-node heartbeat logs. Repaired the test helper with a mutex; production scanner/node not changed."
+  },
+  "not_tested": [
+    "Production P2P discovery/PeerID identity/resolver",
+    "Non-overlay public direct transport",
+    "Secure device/user session and AEAD in this real NAS run",
+    "Kernel FUSE mounts",
+    "Byte-range resumable writes",
+    "Master process crash/full center loss",
+    "Arbitrary long Master outage",
+    "True naturally delayed packet replay race",
+    "NAS overcommit and late-Done race under real concurrency; local deterministic tests cover these"
+  ]
+}
