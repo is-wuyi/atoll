@@ -79,7 +79,7 @@ func writePlanningEnabledTx(tx *bolt.Tx) (bool, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return false, err
 	}
-	if (cfg.Version != 1 && cfg.Version != 2) || cfg.EnabledAt.IsZero() || !bytes.Equal(marker, []byte{1}) {
+	if (cfg.Version < 1 || cfg.Version > 3) || cfg.EnabledAt.IsZero() || !bytes.Equal(marker, []byte{1}) {
 		return false, errors.New("invalid write planning configuration")
 	}
 	return true, nil

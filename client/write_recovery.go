@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"atoll/pkg/access"
 	"atoll/pkg/peerhttp"
 	"atoll/pkg/types"
 )
@@ -24,7 +25,7 @@ func (c *Client) recoveryIdleTimeout() time.Duration {
 	return time.Minute
 }
 
-func (c *Client) putRecoveryObject(ctx context.Context, addr string, plan types.WriteChunkPlan, data []byte, rate uint64) error {
+func (c *Client) putRecoveryObject(ctx context.Context, upload types.WriteUpload, nodeID uint64, addr string, plan types.WriteChunkPlan, data []byte, rate uint64) error {
 	if path, required := peerhttp.RequiredPath(ctx); required && (path == peerhttp.PathDirect || path == peerhttp.PathRelay) {
 		if c.secTransport == nil {
 			return errors.New("P2P write plan requires a configured secure peer transport")
@@ -50,6 +51,8 @@ func (c *Client) putRecoveryObject(ctx context.Context, addr string, plan types.
 			return context.DeadlineExceeded
 		}
 		putCtx, progress, cancel := newWriteProgressContext(ctx, remaining, c.recoveryIdleTimeout())
+		requestID := newOpID()
+		stopProgress := c.observeActiveWrite(putCtx, progress, upload, plan, nodeID, requestID)
 		var body io.Reader = bytes.NewReader(data)
 		if limiter != nil {
 			body = limiter.Reader(putCtx, body, rate)
@@ -60,6 +63,7 @@ func (c *Client) putRecoveryObject(ctx context.Context, addr string, plan types.
 			req.ContentLength = int64(len(data))
 			req.Header.Set(types.ChecksumHeader, fmt.Sprintf("%08x", plan.Object.Checksum))
 			req.Header.Set(types.WriteEpochHeader, strconv.FormatUint(plan.Recovery.Epoch, 10))
+			req.Header.Set(types.WriteAttemptHeader, requestID)
 			var resp *http.Response
 			resp, err = c.HTTP.Do(req)
 			if err == nil {
@@ -77,6 +81,7 @@ func (c *Client) putRecoveryObject(ctx context.Context, addr string, plan types.
 			}
 		}
 		cancel()
+		stopProgress()
 		if err == nil {
 			return nil
 		}
@@ -95,6 +100,43 @@ func (c *Client) putRecoveryObject(ctx context.Context, addr string, plan types.
 		}
 	}
 	return last
+}
+
+func (c *Client) observeActiveWrite(ctx context.Context, progress *writeProgress, upload types.WriteUpload, plan types.WriteChunkPlan, nodeID uint64, requestID string) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		interval := min(time.Second, max(time.Millisecond, c.recoveryIdleTimeout()/5))
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		var observedAttempt uint64
+		var observedBytes int64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			started := time.Now()
+			queryCtx, queryCancel := context.WithTimeout(peerhttp.ControlContext(ctx), metadataTimeout)
+			status, err := c.currentRecoveryStatus(queryCtx, upload, plan)
+			queryCancel()
+			if err != nil {
+				continue
+			}
+			for _, state := range status.Progress {
+				if state.NodeID != nodeID || state.RequestID != requestID || state.Attempt < observedAttempt || state.Bytes <= 0 {
+					continue
+				}
+				if state.Attempt > observedAttempt || state.Bytes > observedBytes {
+					observedAttempt, observedBytes = state.Attempt, state.Bytes
+					progress.progressedAt(started)
+				}
+			}
+		}
+	}()
+	return func() { cancel(); <-done }
 }
 
 func (c *Client) resumeRecoveryObject(ctx context.Context, addr string, plan types.WriteChunkPlan) error {
@@ -155,7 +197,7 @@ func (c *Client) currentRecoveryStatus(ctx context.Context, upload types.WriteUp
 		}
 		progressNodes := map[uint64]bool{}
 		for _, progress := range chunk.Progress {
-			if progressNodes[progress.NodeID] || progress.Attempt == 0 || !types.ContainsUint64(plan.Layout.Nodes, progress.NodeID) || progress.Bytes < 0 || progress.Bytes > plan.Object.StoredSize || progress.UpdatedAt.IsZero() {
+			if progressNodes[progress.NodeID] || progress.Attempt == 0 || progress.RequestID != "" && !access.ValidWriteAttemptID(progress.RequestID) || !types.ContainsUint64(plan.Layout.Nodes, progress.NodeID) || progress.Bytes < 0 || progress.Bytes > plan.Object.StoredSize || progress.UpdatedAt.IsZero() {
 				return chunk, errors.New("write status contains invalid progress")
 			}
 			progressNodes[progress.NodeID] = true
@@ -190,7 +232,7 @@ func (c *Client) waitRecoveryChunk(ctx context.Context, upload types.WriteUpload
 		}
 		now := time.Now()
 		for _, progress := range status.Progress {
-			if progress.Attempt != attempts[progress.NodeID] || progress.Bytes > bytesDone[progress.NodeID] {
+			if progress.Bytes > 0 && (progress.Attempt > attempts[progress.NodeID] || progress.Attempt == attempts[progress.NodeID] && progress.Bytes > bytesDone[progress.NodeID]) {
 				attempts[progress.NodeID] = progress.Attempt
 				bytesDone[progress.NodeID] = progress.Bytes
 				lastProgress[progress.NodeID] = now
@@ -211,7 +253,7 @@ func (c *Client) waitRecoveryChunk(ctx context.Context, upload types.WriteUpload
 	}
 }
 
-func (c *Client) uploadRecoveryTargets(ctx context.Context, out types.PlanWriteChunkResponse, data []byte) ([]uint64, error) {
+func (c *Client) uploadRecoveryTargets(ctx context.Context, upload types.WriteUpload, out types.PlanWriteChunkResponse, data []byte) ([]uint64, error) {
 	plan := out.Plan
 	addresses := map[uint64]string{}
 	for _, n := range out.Nodes {
@@ -255,10 +297,10 @@ func (c *Client) uploadRecoveryTargets(ctx context.Context, out types.PlanWriteC
 				err = c.resumeRecoveryObject(putCtx, addresses[id], plan)
 				var he *HTTPError
 				if errors.As(err, &he) && he.StatusCode == http.StatusNotFound {
-					err = c.putRecoveryObject(putCtx, addresses[id], plan, data, rate)
+					err = c.putRecoveryObject(putCtx, upload, id, addresses[id], plan, data, rate)
 				}
 			} else {
-				err = c.putRecoveryObject(putCtx, addresses[id], plan, data, rate)
+				err = c.putRecoveryObject(putCtx, upload, id, addresses[id], plan, data, rate)
 			}
 			if err != nil {
 				mu.Lock()
@@ -275,6 +317,23 @@ func (c *Client) uploadRecoveryTargets(ctx context.Context, out types.PlanWriteC
 	return failed, firstErr
 }
 
+func (c *Client) recoverWritePlan(ctx context.Context, req types.RecoverWriteChunkRequest, out *types.PlanWriteChunkResponse) error {
+	var err error
+	for retry := 0; retry < 3; retry++ {
+		err = c.writeJSONRetry(ctx, "/writes/chunks/recover", req, out)
+		var status *HTTPError
+		if !errors.As(err, &status) || status.StatusCode != http.StatusConflict || WriteCode(err) != types.WriteRecoveryRetry || ctx.Err() != nil {
+			return err
+		}
+		if retry < 2 {
+			if waitErr := waitWriteRetry(ctx, time.Duration(retry+1)*100*time.Millisecond); waitErr != nil {
+				return waitErr
+			}
+		}
+	}
+	return err
+}
+
 func (c *Client) uploadRecoverableChunk(ctx context.Context, upload types.WriteUpload, geometry types.PlanWriteChunkRequest, out types.PlanWriteChunkResponse, data []byte) error {
 	if out.Plan.Recovery == nil || !time.Now().Before(out.Plan.Recovery.HardUntil) {
 		return errors.New("write recovery deadline expired")
@@ -282,7 +341,7 @@ func (c *Client) uploadRecoverableChunk(ctx context.Context, upload types.WriteU
 	ctx, cancel := context.WithDeadline(ctx, out.Plan.Recovery.HardUntil)
 	defer cancel()
 	for {
-		failed, transferErr := c.uploadRecoveryTargets(ctx, out, data)
+		failed, transferErr := c.uploadRecoveryTargets(ctx, upload, out, data)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -326,7 +385,7 @@ func (c *Client) uploadRecoverableChunk(ctx context.Context, upload types.WriteU
 			req.Network = observation
 		}
 		var next types.PlanWriteChunkResponse
-		if err := c.writeJSONRetry(ctx, "/writes/chunks/recover", req, &next); err != nil {
+		if err := c.recoverWritePlan(ctx, req, &next); err != nil {
 			return fmt.Errorf("recover chunk %d: %w", req.Index, err)
 		}
 		if err := validatePlannedChunk(geometry, next); err != nil {

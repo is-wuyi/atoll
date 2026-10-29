@@ -31,23 +31,24 @@ import (
 
 // Node 是一个存储节点实例。
 type Node struct {
-	dataDir           string // 对象文件根目录
-	used              atomic.Int64
-	masterURL         string
-	advertise         string // 注册到 master 的直连地址 host:port
-	nodeID            atomic.Int64
-	totalBytes        int64
-	heartbeatInterval time.Duration
-	httpClient        *http.Client  // 与 master 交互（小请求，60s 全程超时）
-	bulkClient        *http.Client  // 对等节点大对象传输（push/pull，不设全程超时）
-	pulling           sync.Map      // object ID -> pullKey
-	token             auth.Token    // 集群认证；空 = 兼容模式
-	sec               *nodeSecurity // 独立身份+在线票据模式；nil = legacy 行为
-	uploadBudget      *transferbudget.Limiter
-	downloadBudget    *transferbudget.Limiter
-	observationMu     sync.Mutex
-	observedPeers     map[uint64]time.Time
-	observationBusy   atomic.Bool
+	dataDir               string // 对象文件根目录
+	used                  atomic.Int64
+	masterURL             string
+	advertise             string // 注册到 master 的直连地址 host:port
+	nodeID                atomic.Int64
+	totalBytes            int64
+	heartbeatInterval     time.Duration
+	writeProgressInterval time.Duration
+	httpClient            *http.Client  // 与 master 交互（小请求，60s 全程超时）
+	bulkClient            *http.Client  // 对等节点大对象传输（push/pull，不设全程超时）
+	pulling               sync.Map      // object ID -> pullKey
+	token                 auth.Token    // 集群认证；空 = 兼容模式
+	sec                   *nodeSecurity // 独立身份+在线票据模式；nil = legacy 行为
+	uploadBudget          *transferbudget.Limiter
+	downloadBudget        *transferbudget.Limiter
+	observationMu         sync.Mutex
+	observedPeers         map[uint64]time.Time
+	observationBusy       atomic.Bool
 
 	capMu              sync.Mutex // 容量闸：保护 inflight 与「used 结算 + 预留归还」的原子性
 	usageOnce          sync.Once
@@ -192,6 +193,11 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, epochErr.Error())
 		return
 	}
+	writeAttempt, epochErr := access.WriteAttemptID(r)
+	if epochErr != nil || writeAttempt != "" && (writeEpoch == 0 || resume) {
+		httpError(w, http.StatusBadRequest, "invalid write attempt id")
+		return
+	}
 	// 世代与 resume 只对计划写入对象有意义。落到 legacy 路径时必须显式拒绝，
 	// 否则零长度 resume 会被当成一次空对象写入。
 	if resume || writeEpoch != 0 {
@@ -215,10 +221,6 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 			httpError(w, http.StatusConflict, err.Error())
 			return
 		}
-		if resume {
-			n.handleResumeObject(w, r, id, plan, writeEpoch)
-			return
-		}
 		if plan.WriteTransfer != nil {
 			leg, err := n.writeTransferLeg(plan.WriteTransfer, 0, uint64(n.nodeID.Load()))
 			if err != nil {
@@ -233,6 +235,10 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			defer cancel()
+		}
+		if resume {
+			n.handleResumeObject(w, r, id, plan, writeEpoch)
+			return
 		}
 		expectedSize = plan.Object.Size
 		if plan.Object.ChecksumKnown {
@@ -249,7 +255,11 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		}
 		defer release()
 		// payload 进度只在实际读到字节时前进；无世代的 legacy 写入不上报。
-		progress := newWriteProgressReporter(n, id, writeEpoch)
+		progress, err := n.beginWriteProgress(ctx, plan, writeAttempt)
+		if err != nil {
+			httpError(w, http.StatusConflict, "write progress attempt could not be registered")
+			return
+		}
 		defer progress.Finish()
 		if progress != nil {
 			body = &progressCountingReader{src: body, counter: progress}
@@ -275,17 +285,18 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		}
 		// 回执同步发送且与客户端断连解耦：字节已落盘且通过校验，客户端断开
 		// 不应导致回执丢失；但回执被拒必须显式失败，不能当成成功。
-		receiptCtx, cancelReceipt := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancelReceipt()
-		if err := n.reportStored(receiptCtx, captured); err != nil {
-			// 回执被拒（世代过期/副本被改派/内容变化）不是成功：显式失败。
-			log.Printf("put object %d receipt: %v", id, err)
-			if errors.Is(err, errReceiptRejected) || errors.Is(err, errWriteEpochSuperseded) {
-				httpError(w, http.StatusConflict, err.Error())
+		if writeEpoch > 0 {
+			receiptCtx, cancelReceipt := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancelReceipt()
+			if err := n.reportStored(receiptCtx, captured); err != nil {
+				log.Printf("put object %d receipt: %v", id, err)
+				if errors.Is(err, errReceiptRejected) || errors.Is(err, errWriteEpochSuperseded) {
+					httpError(w, http.StatusConflict, err.Error())
+					return
+				}
+				httpError(w, http.StatusServiceUnavailable, "write receipt failed")
 				return
 			}
-			httpError(w, http.StatusServiceUnavailable, "write receipt failed")
-			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]int64{"size": size})
 		// 客户端直写视为"我是主副本"：成功后异步推送到其余副本节点。
@@ -373,9 +384,14 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeEpoch, _, epochErr := requestWriteEpoch(r)
-	if epochErr != nil {
-		httpError(w, http.StatusBadRequest, epochErr.Error())
+	writeEpoch, resume, epochErr := requestWriteEpoch(r)
+	if epochErr != nil || resume {
+		httpError(w, http.StatusBadRequest, "invalid replication write intent")
+		return
+	}
+	writeAttempt, epochErr := access.WriteAttemptID(r)
+	if epochErr != nil || writeAttempt != "" && writeEpoch == 0 {
+		httpError(w, http.StatusBadRequest, "invalid write attempt id")
 		return
 	}
 	plan, err := n.replicationPlan(r.Context(), id)
@@ -412,7 +428,11 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	progress := newWriteProgressReporter(n, id, writeEpoch)
+	progress, err := n.beginWriteProgress(ctx, plan, writeAttempt)
+	if err != nil {
+		httpError(w, http.StatusConflict, "write progress attempt could not be registered")
+		return
+	}
 	defer progress.Finish()
 	if progress != nil {
 		body = &progressCountingReader{src: body, counter: progress}

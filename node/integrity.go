@@ -126,7 +126,7 @@ func (n *Node) replicationPlan(ctx context.Context, objectID uint64, planID ...s
 		return plan, fmt.Errorf("invalid or unsupported replication metadata")
 	}
 	// The protocol string and the generation are one unit: a planned-write
-	// generation is only ever carried by integrity-write-v2, and that protocol
+	// generation is only ever carried by integrity-write-v3, and that protocol
 	// is only accepted with a non-zero generation. A master that mixes the two
 	// (or an old master answering a new node) is refused instead of silently
 	// downgrading a generation-scoped plan to an unscoped one.
@@ -136,6 +136,9 @@ func (n *Node) replicationPlan(ctx context.Context, objectID uint64, planID ...s
 		}
 	} else if plan.Protocol != types.IntegrityProtocol {
 		return plan, fmt.Errorf("unsupported replication protocol %q", plan.Protocol)
+	}
+	if plan.WriteProgress != nil && (d.WriteEpoch == 0 || plan.WriteProgress.HardUntil.IsZero() || !time.Now().Before(plan.WriteProgress.HardUntil)) {
+		return plan, errors.New("invalid write progress state")
 	}
 	if plan.Transfer != nil {
 		t := plan.Transfer
@@ -401,6 +404,7 @@ func (n *Node) pushWithPlan(ctx context.Context, peerAddr string, plan types.Rep
 	}
 	if plan.Object.WriteEpoch > 0 {
 		req.Header.Set(types.WriteEpochHeader, strconv.FormatUint(plan.Object.WriteEpoch, 10))
+		req.Header.Set(types.WriteAttemptHeader, newWriteRequestID())
 	}
 	resp, err := n.bulkClient.Do(req)
 	if err != nil {

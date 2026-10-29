@@ -5,9 +5,10 @@ import "time"
 const (
 	WritePlanFeature     = "write-plan-v1"
 	WriteTransferFeature = "write-transfer-v1"
-	WriteRecoveryFeature = "write-recovery-v1"
+	WriteRecoveryFeature = "write-recovery-v2"
 	WriteEpochHeader     = "X-Atoll-Write-Epoch"
 	WriteResumeHeader    = "X-Atoll-Write-Resume"
+	WriteAttemptHeader   = "X-Atoll-Write-Attempt-ID"
 	MaxWriteRecoveries   = 3
 	WriteRecoveryMaxTime = 30 * time.Minute
 	PlainEncoding        = "plain-v1"
@@ -140,17 +141,37 @@ type PlanWriteChunkRequest struct {
 	Network     *WriteTransferObservation `json:"network,omitempty"`
 }
 
+type BeginWriteProgressRequest struct {
+	ObjectID        uint64 `json:"object_id"`
+	NodeID          uint64 `json:"node_id"`
+	Epoch           uint64 `json:"epoch"`
+	ExpectedAttempt uint64 `json:"expected_attempt"`
+	RequestID       string `json:"request_id"`
+}
+
+type BeginWriteProgressResponse struct {
+	Attempt      uint64 `json:"attempt"`
+	AttemptToken string `json:"attempt_token"`
+}
+
+type WriteProgressState struct {
+	Attempt   uint64    `json:"attempt"`
+	HardUntil time.Time `json:"hard_until"`
+}
+
 type WriteProgress struct {
-	ObjectID uint64 `json:"object_id"`
-	NodeID   uint64 `json:"node_id"`
-	Epoch    uint64 `json:"epoch"`
-	Attempt  uint64 `json:"attempt"`
-	Bytes    int64  `json:"bytes"`
+	ObjectID     uint64 `json:"object_id"`
+	NodeID       uint64 `json:"node_id"`
+	Epoch        uint64 `json:"epoch"`
+	Attempt      uint64 `json:"attempt"`
+	AttemptToken string `json:"attempt_token,omitempty"`
+	Bytes        int64  `json:"bytes"`
 }
 
 type WriteNodeProgress struct {
 	NodeID    uint64    `json:"node_id"`
 	Attempt   uint64    `json:"attempt"`
+	RequestID string    `json:"request_id,omitempty"`
 	Bytes     int64     `json:"bytes"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -220,10 +241,11 @@ type WriteError struct {
 }
 
 const (
-	WritePlanRequired = "write_plan_required"
-	WriteNotReady     = "write_not_ready"
-	WritePlanConflict = "write_plan_conflict"
-	WriteNoFeasible   = "write_no_feasible"
-	WriteBudget       = "write_budget"
-	WriteExpired      = "write_expired"
+	WritePlanRequired  = "write_plan_required"
+	WriteNotReady      = "write_not_ready"
+	WritePlanConflict  = "write_plan_conflict"
+	WriteRecoveryRetry = "write_recovery_retry"
+	WriteNoFeasible    = "write_no_feasible"
+	WriteBudget        = "write_budget"
+	WriteExpired       = "write_expired"
 )

@@ -281,14 +281,19 @@ func (t *secureTransport) fetchTicket(req *http.Request, token string, spaceID u
 	if epochErr != nil {
 		return access.Ticket{}, epochErr
 	}
+	writeAttemptID, err := access.WriteAttemptID(req)
+	if err != nil {
+		return access.Ticket{}, err
+	}
 	tr := access.TicketRequest{
-		NodeAddr:   req.URL.Host,
-		Method:     req.Method,
-		Path:       req.URL.Path,
-		Query:      req.URL.RawQuery,
-		BodyHash:   nodeBodyHash(req),
-		WriteEpoch: writeEpoch,
-		Resume:     resume,
+		NodeAddr:       req.URL.Host,
+		Method:         req.Method,
+		Path:           req.URL.Path,
+		Query:          req.URL.RawQuery,
+		BodyHash:       nodeBodyHash(req),
+		WriteEpoch:     writeEpoch,
+		Resume:         resume,
+		WriteAttemptID: writeAttemptID,
 	}
 	b, err := json.Marshal(tr)
 	if err != nil {

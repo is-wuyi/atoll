@@ -158,6 +158,8 @@ func writePlanningMetaError(w http.ResponseWriter, err error) {
 		writePlanningError(w, http.StatusInsufficientStorage, types.WriteBudget, "insufficient reserved storage capacity")
 	case errors.Is(err, meta.ErrWriteNoFeasible):
 		writePlanningError(w, http.StatusUnprocessableEntity, types.WriteNoFeasible, "no feasible write layout")
+	case errors.Is(err, meta.ErrWriteRecoveryRetry):
+		writePlanningError(w, http.StatusConflict, types.WriteRecoveryRetry, "write recovery snapshot changed; retry the same operation")
 	case errors.Is(err, meta.ErrWritePlanConflict), errors.Is(err, meta.ErrObjectChanged), errors.Is(err, meta.ErrOpConflict), errors.Is(err, meta.ErrExist), errors.Is(err, meta.ErrNotStaging):
 		writePlanningError(w, http.StatusConflict, types.WritePlanConflict, "write plan or target changed")
 	case errors.Is(err, meta.ErrNotExist):

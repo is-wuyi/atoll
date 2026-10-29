@@ -3,7 +3,7 @@ package node
 // 计划写入世代（WriteEpoch）在 node 数据面的接入测试：
 //   - 入站世代闸：请求携带的世代必须等于 master 当前 descriptor 的世代；
 //     旧世代 in-flight 请求在 replan 后被拒，不落盘、无回执；
-//   - 协议↔世代耦合：integrity-write-v2 必须携带世代，integrity-v1 不得携带；
+//   - 协议↔世代耦合：integrity-write-v3 必须携带世代，integrity-v1 不得携带；
 //   - 发布前世代闸：payload 传输期间 replan 推进世代 → 拒绝发布，不留目标文件；
 //   - 回执被拒（世代过期）→ 显式失败（非 201），且不重试；
 //   - resume：零长度重确认，404 允许回退真实 PUT，坏 CRC 拒绝并上报 suspect；
@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"atoll/pkg/types"
 )
@@ -84,6 +85,13 @@ func (m *epochFakeMaster) handler() http.Handler {
 			m.suspects = append(m.suspects, req.Object)
 			m.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/files/writes/progress/begin":
+			var req types.BeginWriteProgressRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			json.NewEncoder(w).Encode(types.BeginWriteProgressResponse{Attempt: req.ExpectedAttempt + 1, AttemptToken: "wp1_fixture_attempt_token"})
 		case r.Method == http.MethodPost && r.URL.Path == "/files/writes/progress":
 			var req types.WriteProgress
 			json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req)
@@ -125,11 +133,12 @@ func recoveryChunkID(index int) uint64 {
 	return types.ChunkID(types.StagingInodeBase, index)
 }
 
-// recoveryPlan 构造一个带世代的计划写入 descriptor：integrity-write-v2 协议、
+// recoveryPlan 构造一个带世代的计划写入 descriptor：integrity-write-v3 协议、
 // 本节点（ID 2）在副本集合内、记录校验和。
 func recoveryPlan(objID uint64, data []byte, epoch uint64) types.ReplicationPlan {
 	return types.ReplicationPlan{
-		Protocol: types.WriteIntegrityProtocol,
+		Protocol:      types.WriteIntegrityProtocol,
+		WriteProgress: &types.WriteProgressState{HardUntil: time.Now().Add(time.Minute)},
 		Object: types.ObjectIntegrity{
 			ObjectID:      objID,
 			InodeID:       types.StagingInodeBase,
@@ -599,12 +608,13 @@ func TestWriteProgressOnlyReportsAdvance(t *testing.T) {
 // 进度上报器：零世代直接禁用；无字节时不产生请求。
 func TestWriteProgressReporterDisabledWithoutEpoch(t *testing.T) {
 	n, _ := newTestNode(t)
-	if r := newWriteProgressReporter(n, 1, 0); r != nil {
+	attachEpochMaster(t, n)
+	if r, err := n.beginWriteProgress(t.Context(), types.ReplicationPlan{}, ""); err != nil || r != nil {
 		t.Fatal("legacy write must not start a progress reporter")
 	}
-	r := newWriteProgressReporter(n, 2, 1)
-	if r == nil {
-		t.Fatal("generation write must start a progress reporter")
+	r, err := n.beginWriteProgress(t.Context(), recoveryPlan(2, []byte("data"), 1), "")
+	if err != nil || r == nil {
+		t.Fatalf("generation write must start a progress reporter: %v", err)
 	}
 	// 只做一次空读：无字节 → 不上报。
 	if _, err := io.CopyN(io.Discard, &progressCountingReader{src: bytes.NewReader(nil), counter: r}, 0); err != nil {

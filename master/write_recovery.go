@@ -66,7 +66,7 @@ func removedWriteNodes(old, next []uint64) []uint64 {
 
 func (s *Server) handleRecoverWriteChunk(w http.ResponseWriter, r *http.Request) {
 	if !supportsWriteRecovery(r) {
-		writePlanningError(w, http.StatusUpgradeRequired, types.WritePlanRequired, "write-recovery-v1 client feature required")
+		writePlanningError(w, http.StatusUpgradeRequired, types.WritePlanRequired, types.WriteRecoveryFeature+" client feature required")
 		return
 	}
 	var req types.RecoverWriteChunkRequest
@@ -98,13 +98,16 @@ func (s *Server) handleRecoverWriteChunk(w http.ResponseWriter, r *http.Request)
 		writePlanningMetaError(w, err)
 		return
 	}
-	for i := range snapshot.Capacity {
-		c := &snapshot.Capacity[i]
-		if types.ContainsUint64(old.Layout.Nodes, c.NodeID) {
-			credit := min(old.Object.StoredSize, c.Reserved)
-			c.Reserved -= credit
-			c.Free = min(c.Capacity, c.Free+credit)
+	done := make([]uint64, 0, len(current.Done))
+	for _, id := range current.Done {
+		if !types.ContainsUint64(current.Suspect, id) {
+			done = append(done, id)
 		}
+	}
+	snapshot.Capacity, err = s.store.RecoveryPlanningCapacity(snapshot.Capacity, old.Object.ID, old.Layout.Nodes, done, old.Object.StoredSize)
+	if err != nil {
+		writePlanningMetaError(w, err)
+		return
 	}
 	world, err := s.newWriteSnapshot(r.Context(), snapshot, now)
 	if err == nil && old.Transfer != nil {

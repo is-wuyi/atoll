@@ -72,12 +72,16 @@ func (w *writeProgress) Reader(src io.Reader) io.Reader {
 }
 
 func (w *writeProgress) progressed() {
+	w.progressedAt(time.Now())
+}
+
+func (w *writeProgress) progressedAt(at time.Time) {
 	w.mu.Lock()
-	if w.idleFired {
+	if w.idleFired || !at.After(w.last) {
 		w.mu.Unlock()
 		return
 	}
-	w.last = time.Now()
+	w.last = at
 	w.mu.Unlock()
 	select {
 	case w.wake <- struct{}{}:

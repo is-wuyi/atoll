@@ -673,6 +673,10 @@ func (s *nodeSecurity) authorizePeer(req *http.Request) error {
 	if epochErr != nil {
 		return fmt.Errorf("node security: %w", epochErr)
 	}
+	writeAttemptID, epochErr := access.WriteAttemptID(req)
+	if epochErr != nil {
+		return epochErr
+	}
 	ticketReq := access.TicketRequest{
 		NodeAddr:         req.URL.Host,
 		Method:           req.Method,
@@ -684,6 +688,7 @@ func (s *nodeSecurity) authorizePeer(req *http.Request) error {
 		BodyHash:         bodyHash,
 		WriteEpoch:       writeEpoch,
 		Resume:           resume,
+		WriteAttemptID:   writeAttemptID,
 	}
 	var tk access.Ticket
 	sent, _ := s.snapshot()
@@ -866,6 +871,11 @@ func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 			httpError(w, http.StatusBadRequest, epochErr.Error())
 			return
 		}
+		writeAttemptID, epochErr := access.WriteAttemptID(r)
+		if epochErr != nil {
+			httpError(w, http.StatusBadRequest, epochErr.Error())
+			return
+		}
 		bodyHash := ""
 		_, retirement := types.RetirementPathID(r.URL.Path)
 		if r.Method == http.MethodPost && (r.URL.Path == "/pull" || retirement) {
@@ -900,6 +910,7 @@ func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 			BodyHash:         bodyHash,
 			WriteEpoch:       writeEpoch,
 			Resume:           resume,
+			WriteAttemptID:   writeAttemptID,
 		})
 		if err != nil {
 			if errors.Is(err, errCheckDenied) {

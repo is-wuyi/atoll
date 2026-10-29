@@ -3,7 +3,7 @@ package types
 import "time"
 
 const IntegrityProtocol = "integrity-v1"
-const WriteIntegrityProtocol = "integrity-write-v2"
+const WriteIntegrityProtocol = "integrity-write-v3"
 
 // ObjectIntegrity binds a physical object to the metadata snapshot used to verify it.
 // ChecksumKnown distinguishes an explicit CRC of zero from legacy unrecorded checksums.
@@ -75,10 +75,11 @@ type ReplicaTransfer struct {
 }
 
 type ReplicationPlan struct {
-	Protocol      string             `json:"protocol"`
-	Object        ObjectIntegrity    `json:"object"`
-	Targets       []NodeInfo         `json:"targets"`
-	Sources       []NodeInfo         `json:"sources,omitempty"`
-	WriteTransfer *WriteTransferPlan `json:"write_transfer,omitempty"`
-	Transfer      *ReplicaTransfer   `json:"transfer,omitempty"`
+	Protocol      string              `json:"protocol"`
+	Object        ObjectIntegrity     `json:"object"`
+	Targets       []NodeInfo          `json:"targets"`
+	Sources       []NodeInfo          `json:"sources,omitempty"`
+	WriteTransfer *WriteTransferPlan  `json:"write_transfer,omitempty"`
+	Transfer      *ReplicaTransfer    `json:"transfer,omitempty"`
+	WriteProgress *WriteProgressState `json:"write_progress,omitempty"`
 }

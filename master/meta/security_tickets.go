@@ -80,6 +80,9 @@ func normalizeTicketRequest(req access.TicketRequest) (access.TicketRequest, err
 	if req.WriteEpoch > 0 && (req.Method != http.MethodPut || (!strings.HasPrefix(req.Path, "/objects/") && !strings.HasPrefix(req.Path, "/replicate/")) || req.Query != "" || req.PlanID != "") {
 		return req, ErrAccessTicket
 	}
+	if req.WriteAttemptID != "" && (!access.ValidWriteAttemptID(req.WriteAttemptID) || req.WriteEpoch == 0 || req.Resume) {
+		return req, ErrAccessTicket
+	}
 	req.Query = q.Encode()
 	if req.BodyHash != "" && len(req.BodyHash) != 64 {
 		return req, ErrAccessTicket
@@ -329,7 +332,7 @@ func (s *Store) CheckAccessTicket(nodeSession string, req access.CheckRequest, n
 		if node.NodeID != ticket.AudienceNodeID || node.Identity != ticket.AudienceIdentity || node.Addr != ticket.Request.NodeAddr {
 			return ErrAccessTicket
 		}
-		normalized, err := normalizeTicketRequest(access.TicketRequest{NodeAddr: node.Addr, Method: req.Method, Path: req.Path, Query: req.Query, PlanID: req.PlanID, PlanAttempt: req.PlanAttempt, PlanAttemptToken: req.PlanAttemptToken, BodyHash: req.BodyHash, WriteEpoch: req.WriteEpoch, Resume: req.Resume})
+		normalized, err := normalizeTicketRequest(access.TicketRequest{NodeAddr: node.Addr, Method: req.Method, Path: req.Path, Query: req.Query, PlanID: req.PlanID, PlanAttempt: req.PlanAttempt, PlanAttemptToken: req.PlanAttemptToken, BodyHash: req.BodyHash, WriteEpoch: req.WriteEpoch, Resume: req.Resume, WriteAttemptID: req.WriteAttemptID})
 		if err != nil || normalized != ticket.Request {
 			return ErrAccessTicket
 		}

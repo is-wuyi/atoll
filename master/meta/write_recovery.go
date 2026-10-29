@@ -11,18 +11,24 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// ErrWriteRecoveryRetry 表示恢复请求所依据的快照/完成状态在规划与事务提交之间
+// 发生变化（例如规划窗口内新完成的副本正被所选布局丢弃），需要以同一
+// epoch/op/failed 重新发起恢复以便重新规划。它与计划身份冲突（ErrWritePlanConflict）
+// 是两类错误：前者事务未落任何状态、重试即按新快照重新规划，后者是请求本身过期。
+var ErrWriteRecoveryRetry = errors.New("write recovery snapshot changed; re-plan required")
+
 func enableWriteRecoveryTx(w *txw) error {
 	var cfg writeConfig
 	if err := json.Unmarshal(w.tx.Bucket(bucketWrites).Get(keyWriteConfig), &cfg); err != nil {
 		return err
 	}
-	if cfg.Version == 2 {
+	if cfg.Version == 3 {
 		return nil
 	}
-	if cfg.Version != 1 {
+	if cfg.Version != 1 && cfg.Version != 2 {
 		return ErrWritePlanConflict
 	}
-	cfg.Version = 2
+	cfg.Version = 3
 	raw, err := json.Marshal(cfg)
 	if err != nil {
 		return err
@@ -186,19 +192,24 @@ func (s *Store) RecoverWriteChunk(actor WriteActor, req types.RecoverWriteChunkR
 		if (old.Transfer == nil) != (choice.Transfer == nil) || choice.Transfer != nil && !now.Before(choice.Transfer.ExpiresAt) {
 			return ErrWritePlanConflict
 		}
+		// 完成副本保护：被移出布局的已完成副本，只有客户端申报失败或此前已排除
+		// 时才允许丢弃。removed 节点虽然也会进入 Recovery.Excluded（累计排除与
+		// 回收语义），但不构成丢弃豁免——规划窗口内新完成的副本（late Done）必须
+		// 走重新规划，而不是静默丢弃并回收。
+		doneExempt := recoveryExcluded(old, req.FailedNodes)
 		for _, id := range chunk.Done {
-			if !types.ContainsUint64(chunk.Suspect, id) && !types.ContainsUint64(choice.Recovery.Excluded, id) && liveWriteNodeTx(w.tx, id, nodeMaxAge, now) == nil && !types.ContainsUint64(choice.Layout.Nodes, id) {
-				return ErrWritePlanConflict
+			if types.ContainsUint64(chunk.Suspect, id) || types.ContainsUint64(choice.Layout.Nodes, id) || types.ContainsUint64(doneExempt, id) {
+				continue
+			}
+			if liveWriteNodeTx(w.tx, id, nodeMaxAge, now) == nil {
+				return ErrWriteRecoveryRetry
 			}
 		}
 		capacity, err := capacitiesTx(w.tx)
 		if err != nil {
 			return err
 		}
-		free := map[uint64]int64{}
-		for _, item := range capacity {
-			free[item.NodeID] = item.Free
-		}
+		free, unclamped := recoveryFreeViews(capacity)
 		for _, id := range choice.Layout.Nodes {
 			if err := liveWriteNodeTx(w.tx, id, nodeMaxAge, now); err != nil {
 				return err
@@ -208,7 +219,20 @@ func (s *Store) RecoverWriteChunk(actor WriteActor, req types.RecoverWriteChunkR
 			} else if !errors.Is(err, ErrNotExist) {
 				return err
 			}
-			if !types.ContainsUint64(old.Layout.Nodes, id) && free[id] < choice.Object.StoredSize {
+			if !types.ContainsUint64(old.Layout.Nodes, id) {
+				// 新目标节点：必须以真实余量容纳完整副本。
+				if free[id] < choice.Object.StoredSize {
+					return ErrWriteBudget
+				}
+				continue
+			}
+			// 旧布局节点的 (object,node) 预留继续有效：保留/重选不产生新占用。
+			if types.ContainsUint64(chunk.Done, id) {
+				continue // 已完成副本：数据已在节点上，无需新写入空间。
+			}
+			if unclamped[id] < 0 {
+				// 未完成副本的预留必须有真实（未截断）余量支撑，
+				// 不得靠截断后的伪余量通过。
 				return ErrWriteBudget
 			}
 		}

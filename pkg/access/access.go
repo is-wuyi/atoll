@@ -1,10 +1,13 @@
 package access
 
 import (
+	"encoding/hex"
+	"errors"
 	"net/http"
 	"time"
 
 	"atoll/pkg/edgeidentity"
+	"atoll/pkg/types"
 )
 
 const (
@@ -32,7 +35,8 @@ type TicketRequest struct {
 	WriteEpoch uint64 `json:"write_epoch,omitempty"`
 	// Resume marks a zero-length PUT that only re-confirms an already stored
 	// object under the current epoch. It never authorizes new payload bytes.
-	Resume bool `json:"resume,omitempty"`
+	Resume         bool   `json:"resume,omitempty"`
+	WriteAttemptID string `json:"write_attempt_id,omitempty"`
 }
 
 type Ticket struct {
@@ -52,8 +56,9 @@ type CheckRequest struct {
 	// WriteEpoch and Resume mirror the ticket fields: the node repeats what it
 	// received on the wire so the master can bind the check to the same
 	// generation and the same zero-length re-confirm intent.
-	WriteEpoch uint64 `json:"write_epoch,omitempty"`
-	Resume     bool   `json:"resume,omitempty"`
+	WriteEpoch     uint64 `json:"write_epoch,omitempty"`
+	Resume         bool   `json:"resume,omitempty"`
+	WriteAttemptID string `json:"write_attempt_id,omitempty"`
 }
 
 type CheckResult struct {
@@ -82,6 +87,25 @@ type DeviceSession struct {
 	NodeID    uint64    `json:"node_id"`
 	Token     string    `json:"token"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func WriteAttemptID(req *http.Request) (string, error) {
+	values := req.Header.Values(types.WriteAttemptHeader)
+	if len(values) == 0 {
+		return "", nil
+	}
+	if len(values) != 1 || !ValidWriteAttemptID(values[0]) {
+		return "", errors.New("invalid write attempt id")
+	}
+	return values[0], nil
+}
+
+func ValidWriteAttemptID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
 }
 
 // Transport clones requests so credentials for one destination cannot mutate a caller's request.

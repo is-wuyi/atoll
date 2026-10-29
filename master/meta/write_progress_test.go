@@ -4,15 +4,14 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	"atoll/pkg/types"
 )
 
 func TestWriteProgressIsHintAndOldEpochCannotRenewIt(t *testing.T) {
 	s, nodes := writeTestStore(t)
 	u, plan := recoveryFixture(t, s, nodes)
 	now := time.Now()
-	first := types.WriteProgress{ObjectID: plan.Object.ID, NodeID: nodes[1], Epoch: 1, Attempt: 1, Bytes: 16}
+	first := startProgressForTest(t, s, plan.Object.ID, nodes[1], 1, 0, "initial", now)
+	first.Bytes = 16
 	if err := s.RecordWriteProgress(first, now); err != nil {
 		t.Fatal(err)
 	}
@@ -36,8 +35,8 @@ func TestWriteProgressIsHintAndOldEpochCannotRenewIt(t *testing.T) {
 	if err := s.RecordWriteProgress(first, time.Now()); !errors.Is(err, ErrWritePlanConflict) {
 		t.Fatalf("old epoch progress survived reassignment: %v", err)
 	}
-	fresh := first
-	fresh.NodeID, fresh.Epoch = nodes[2], 2
+	fresh := startProgressForTest(t, s, plan.Object.ID, nodes[2], 2, 0, "reassigned", time.Now())
+	fresh.Bytes = 32
 	if err := s.RecordWriteProgress(fresh, time.Now()); err != nil {
 		t.Fatal(err)
 	}

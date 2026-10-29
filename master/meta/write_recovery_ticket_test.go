@@ -41,19 +41,24 @@ func TestWriteRecoveryTicketBindsEpochAndResume(t *testing.T) {
 	}
 	path := fmt.Sprintf("/objects/%d", plan.Object.ID)
 	for _, tc := range []struct {
-		name   string
-		epoch  uint64
-		resume bool
-		ok     bool
+		name    string
+		epoch   uint64
+		resume  bool
+		attempt string
+		ok      bool
 	}{
-		{"missing", 0, false, false},
-		{"wrong", 2, false, false},
-		{"resume-missing", 0, true, false},
-		{"put", 1, false, true},
-		{"resume", 1, true, true},
+		{"missing", 0, false, "", false},
+		{"wrong", 2, false, "", false},
+		{"resume-missing", 0, true, "", false},
+		{"put", 1, false, "", true},
+		{"resume", 1, true, "", true},
+		{"put-attempt", 1, false, "00000000000000000000000000000001", true},
+		{"attempt-without-epoch", 0, false, "00000000000000000000000000000001", false},
+		{"attempt-with-resume", 1, true, "00000000000000000000000000000001", false},
+		{"malformed-attempt", 1, false, "invalid", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := access.TicketRequest{NodeAddr: "127.0.0.1:59888", Method: "PUT", Path: path, WriteEpoch: tc.epoch, Resume: tc.resume}
+			r := access.TicketRequest{NodeAddr: "127.0.0.1:59888", Method: "PUT", Path: path, WriteEpoch: tc.epoch, Resume: tc.resume, WriteAttemptID: tc.attempt}
 			ticket, err := s.IssueUserTicket(login.Token, bobSpace.ID, r, time.Now())
 			if !tc.ok {
 				if !errors.Is(err, ErrAccessTicket) {
@@ -64,10 +69,20 @@ func TestWriteRecoveryTicketBindsEpochAndResume(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			check := access.CheckRequest{Token: ticket.Token, Method: r.Method, Path: r.Path, WriteEpoch: r.WriteEpoch, Resume: r.Resume}
+			check := access.CheckRequest{Token: ticket.Token, Method: r.Method, Path: r.Path, WriteEpoch: r.WriteEpoch, Resume: r.Resume, WriteAttemptID: r.WriteAttemptID}
 			if _, err := s.CheckAccessTicket(dev.Token, check, time.Now()); err != nil {
 				t.Fatal(err)
 			}
+			for _, other := range []string{"", "00000000000000000000000000000001", "00000000000000000000000000000002"} {
+				if other == r.WriteAttemptID {
+					continue
+				}
+				check.WriteAttemptID = other
+				if _, err := s.CheckAccessTicket(dev.Token, check, time.Now()); !errors.Is(err, ErrAccessTicket) {
+					t.Fatalf("changed attempt id accepted: %v", err)
+				}
+			}
+			check.WriteAttemptID = r.WriteAttemptID
 			check.WriteEpoch++
 			if _, err := s.CheckAccessTicket(dev.Token, check, time.Now()); !errors.Is(err, ErrAccessTicket) {
 				t.Fatalf("changed checked epoch accepted: %v", err)

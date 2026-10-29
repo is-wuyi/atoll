@@ -7,6 +7,20 @@ import (
 	"atoll/pkg/types"
 )
 
+func (s *Server) handleBeginWriteProgress(w http.ResponseWriter, r *http.Request) {
+	var req types.BeginWriteProgressRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid write attempt")
+		return
+	}
+	result, err := s.store.BeginWriteProgress(req, time.Now())
+	if err != nil {
+		httpError(w, http.StatusConflict, "write attempt rejected")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (s *Server) handleWriteProgress(w http.ResponseWriter, r *http.Request) {
 	var report types.WriteProgress
 	if err := decodeJSON(w, r, &report); err != nil {

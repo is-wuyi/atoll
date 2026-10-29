@@ -128,7 +128,11 @@ func (c *Client) writeJSON(ctx context.Context, method, path string, body, out a
 	if err != nil {
 		return err
 	}
-	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature+","+types.WriteTransferFeature+","+types.WriteRecoveryFeature)
+	features := types.ObjectIDFeature + "," + types.WritePlanFeature + "," + types.WriteTransferFeature
+	if c.writeRecovery {
+		features += "," + types.WriteRecoveryFeature
+	}
+	req.Header.Set(types.FeaturesHeader, features)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

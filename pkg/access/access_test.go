@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"atoll/pkg/types"
 )
 
 type observedBody struct {
@@ -47,6 +49,18 @@ func TestAuthorizationFailureClosesBody(t *testing.T) {
 	if req.Header.Get("Authorization") != "Bearer original" {
 		t.Fatal("authorization mutated the caller's headers")
 	}
+}
+
+func TestWriteAttemptHeaderRejectsAmbiguity(t *testing.T) {
+	for _, values := range [][]string{{""}, {"bad"}, {"00000000000000000000000000000001", "00000000000000000000000000000002"}} {
+		req, _ := http.NewRequest(http.MethodPut, "https://node.test/objects/1", nil)
+		for _, value := range values { req.Header.Add(types.WriteAttemptHeader, value) }
+		if _, err := WriteAttemptID(req); err == nil { t.Fatalf("ambiguous attempt header accepted: %v", values) }
+	}
+	req, _ := http.NewRequest(http.MethodPut, "https://node.test/objects/1", nil)
+	if id, err := WriteAttemptID(req); err != nil || id != "" { t.Fatal("legacy request requires no attempt header") }
+	req.Header.Set(types.WriteAttemptHeader,"00000000000000000000000000000001")
+	if id, err := WriteAttemptID(req); err != nil || id != "00000000000000000000000000000001" { t.Fatalf("valid attempt rejected: %q %v",id,err) }
 }
 
 func TestAuthorizedRequestKeepsBodyAndHeadersIsolated(t *testing.T) {
