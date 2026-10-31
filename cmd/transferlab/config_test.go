@@ -179,9 +179,8 @@ func TestConfigDNSServerValidation(t *testing.T) {
 	}
 }
 
-// applyDNSOverride 后，本进程解析经 loopback 代理打到指定 dns_server：
-// TTL 内同 (name/type/flags) 只打上游一次（缓存命中且每次应答 ID rebind 正确，
-// 否则第二次解析会因 ID 不匹配失败）；过期后重打上游。cleanup 恢复原 resolver。
+// PreferGo 仍继承系统 trust-ad；带 AD 的查询按代理契约不缓存。
+// 同时验证真实 resolver 经本地代理解析、缓存/旁路及 cleanup 恢复。
 func TestApplyDNSOverrideProxyCache(t *testing.T) {
 	oldAttempts, oldTimeout := dnsUpstreamAttempts, dnsUpstreamTimeout
 	dnsUpstreamAttempts, dnsUpstreamTimeout = 1, 300*time.Millisecond
@@ -205,22 +204,32 @@ func TestApplyDNSOverrideProxyCache(t *testing.T) {
 	if up.count() != 1 {
 		t.Fatalf("首次解析应打上游 1 次，got %d", up.count())
 	}
-	// 缓存命中：上游仍 1 次；应答 ID 已按本次请求 rebind（ID 错则本解析必败）。
+	first := up.firstQuery()
+	if len(first) < 12 {
+		t.Fatal("上游未收到完整 DNS 查询")
+	}
+	flags := binary.BigEndian.Uint16(first[2:4])
+	if flags & ^uint16(0x0100|dnsFlagAD) != 0 {
+		t.Fatalf("resolver 发出未预期的查询 flags: %#04x", flags)
+	}
+	wantWithinTTL := 1
+	if flags&dnsFlagAD != 0 {
+		wantWithinTTL = 2
+	}
 	ips2, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", "node-a.et.net")
 	if err != nil || len(ips2) != 1 || ips2[0].String() != "10.1.2.3" {
-		t.Fatalf("缓存命中解析失败: %v %v", ips2, err)
+		t.Fatalf("第二次解析失败: %v %v", ips2, err)
 	}
-	if up.count() != 1 {
-		t.Fatalf("TTL 内不应再打上游，got %d；两次上游查询 hex=\n首 %x\n末 %x",
-			up.count(), up.firstQuery(), up.lastQuery())
+	if up.count() != wantWithinTTL {
+		t.Fatalf("flags=%#04x，TTL 内上游查询应为 %d 次，got %d；首 %x；末 %x",
+			flags, wantWithinTTL, up.count(), first, up.lastQuery())
 	}
-	// 过期后重新打上游（TTL 原值取用，不延长）。
 	time.Sleep(1300 * time.Millisecond)
 	if _, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", "node-a.et.net"); err != nil {
 		t.Fatalf("过期后解析失败: %v", err)
 	}
-	if up.count() != 2 {
-		t.Fatalf("过期后应重打上游，got %d", up.count())
+	if up.count() != wantWithinTTL+1 {
+		t.Fatalf("过期后应再打上游，want %d got %d", wantWithinTTL+1, up.count())
 	}
 	cleanup()
 	if net.DefaultResolver != before {
