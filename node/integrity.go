@@ -21,6 +21,12 @@ import (
 
 var errIntegrityMismatch = errors.New("object integrity mismatch")
 
+// errLegacyContentUncommitted 表示 master 对 legacy（非分块、小 ID）对象仍返回
+// 未提交状态（Size=0 且无校验和）。客户端直写先 PUT 后 commit，这是两者之间的
+// 预期状态，也是唯一允许有界等待自愈的错误类别（见 replicateToPeers）；其余
+// 错误不做该等待。sentinel 用 errors.Is 判定，绝不字符串匹配。
+var errLegacyContentUncommitted = errors.New("legacy content is not committed")
+
 // errWriteEpochSuperseded marks a request that was admitted under an older
 // planned-write generation than the one now current. The bytes may still be
 // valid, but this request is no longer authorized to publish or confirm.
@@ -98,7 +104,7 @@ func (n *Node) replicationPlan(ctx context.Context, objectID uint64, planID ...s
 	}
 	d := plan.Object
 	if !d.Chunked && d.ObjectID < types.StagingInodeBase<<8 && d.Size == 0 && !d.ChecksumKnown {
-		return plan, fmt.Errorf("legacy content is not committed")
+		return plan, errLegacyContentUncommitted
 	}
 	if wantPlan != "" {
 		// 计划取数必须拿到同一个计划；且回执只能是内容校验过的 verified，

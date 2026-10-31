@@ -136,6 +136,12 @@ func (s *Store) SweepSecurityState(now time.Time) (int, error) {
 	}
 	total += removed
 	corrupt += bad
+	removed, bad, err = s.sweepClientPeersLocked(now)
+	if err != nil {
+		return total, err
+	}
+	total += removed
+	corrupt += bad
 	if corrupt > 0 {
 		return total, fmt.Errorf("security sweep skipped %d corrupt record(s); retained for inspection", corrupt)
 	}

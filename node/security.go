@@ -45,7 +45,9 @@ import (
 	"atoll/pkg/auth"
 	"atoll/pkg/edgeidentity"
 	"atoll/pkg/metacrypto"
+	"atoll/pkg/peerauth"
 	"atoll/pkg/peerhttp"
+	"atoll/pkg/peertransport"
 	"atoll/pkg/types"
 )
 
@@ -108,6 +110,12 @@ type nodeSecurity struct {
 	hasSess  bool
 	invite   string // 首次注册用；首次成功后清空，续期/重注册不再携带
 	renewing atomic.Bool
+	// peerBinding 是 master 在设备会话响应中下发的 peer 绑定（同 key/ID，正
+	// revision）；p2p 发布用。写与读均经 mu。
+	peerBinding *peerauth.Binding
+	// peer 是 P2P 运行时的独立 peer identity（EnableP2P 设置，此后不变）。
+	// nil = 未启用 P2P，设备挑战保持旧四键常量 audience 语义。
+	peer peertransport.RuntimeAPI
 
 	opMu          sync.Mutex    // 串行化 challenge→sign→session 全流程
 	renewMargin   time.Duration // 测试可调小
@@ -380,9 +388,20 @@ func securityRequiredHandler(next http.Handler) http.Handler {
 // force 表示强制重建（master 报 unknown node 时的重注册路径）；否则已有未临期
 // 会话时为 no-op，避免多 goroutine 反复续期互相作废。401 条件重建走
 // renewAfterRejection（被拒 token 快照判断在 opMu 内做，不在此短路）。
+// 节点生命周期关停（CloseP2P）后拒绝建立任何新会话：关停前检查快速拒绝；opMu
+// 取得后再查一次，等锁进来的旧调用也不会在关停后进 establishLocked。
 func (s *nodeSecurity) establishSession(ctx context.Context, force bool) error {
+	if s.node.lifeIsClosed() {
+		return errNodeClosed
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+	if s.node.lifeIsClosed() {
+		return errNodeClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !force {
 		s.mu.Lock()
 		tok, exp, has := s.token, s.expires, s.hasSess
@@ -397,37 +416,66 @@ func (s *nodeSecurity) establishSession(ctx context.Context, force bool) error {
 // establishLocked 在已持 opMu 的前提下完成 challenge → 签名 → session 全流程；
 // establishSession（主动注册/续期）与 renewAfterRejection（401 条件重建）汇合于此。
 // first/invite 在此判定：仅首次注册携带 invite，续期与重注册一律不带。
+// P2P 启用时挑战附带独立 peer 身份（Extras 3 键）并附 peer 双签；audience 变为
+// canonical master HTTPS origin（旧常量仅保留给未启用 P2P 的设备）。
 func (s *nodeSecurity) establishLocked(ctx context.Context) error {
 	s.mu.Lock()
 	first, invite := !s.hasSess, ""
 	if !s.hasSess {
 		invite = s.invite
 	}
+	peer := s.peer
 	s.mu.Unlock()
 
 	addr := s.node.advertise
 	total := s.node.totalBytes
+	var enrollment *peerauth.Enrollment
+	wantAudience := deviceChallengeAudience
+	if peer != nil {
+		canonical, err := peerauth.CanonicalOrigin(s.node.masterURL)
+		if err != nil {
+			return fmt.Errorf("peer device challenge origin: %w", err)
+		}
+		wantAudience = canonical
+		expected := uint64(0)
+		if binding := s.peerBindingSnapshot(); binding != nil {
+			expected = binding.Revision
+		}
+		enrollment = &peerauth.Enrollment{
+			PeerID:           peer.PeerID(),
+			PublicKey:        append([]byte(nil), peer.PublicKey()...),
+			ExpectedRevision: expected,
+		}
+	}
 	var ch access.DeviceChallenge
-	if _, err := s.postJSON(ctx, s.authClient, "/security/devices/challenge",
-		access.DeviceChallengeRequest{
-			PublicKey:  s.identity.PublicKey(),
-			Addr:       addr,
-			TotalBytes: total,
-			Invite:     invite,
-		}, &ch); err != nil {
+	challengeReq := access.DeviceChallengeRequest{
+		PublicKey:  s.identity.PublicKey(),
+		Addr:       addr,
+		TotalBytes: total,
+		Invite:     invite,
+		Peer:       enrollment,
+	}
+	if _, err := s.postJSON(ctx, s.authClient, "/security/devices/challenge", challengeReq, &ch); err != nil {
 		return fmt.Errorf("device challenge: %w", err)
 	}
 	// 不盲签：先校验挑战确实绑定了本请求的全部字段。
-	if err := validateDeviceChallenge(ch.Challenge, ch.ID, string(s.identity.NodeID()), addr, total, time.Now()); err != nil {
+	if err := validateDeviceChallenge(ch.Challenge, ch.ID, string(s.identity.NodeID()), addr, total, time.Now(), wantAudience, enrollment); err != nil {
 		return fmt.Errorf("device challenge binding: %w", err)
 	}
 	sig, err := s.identity.Sign(ch.Challenge)
 	if err != nil {
 		return fmt.Errorf("sign device challenge: %w", err)
 	}
+	login := access.DeviceLoginRequest{ChallengeID: ch.ID, Signature: sig}
+	if peer != nil {
+		peerSig, err := peer.Sign(peerauth.EnrollmentProof(ch.Challenge))
+		if err != nil {
+			return fmt.Errorf("sign peer enrollment: %w", err)
+		}
+		login.PeerSignature = peerSig
+	}
 	var sess access.DeviceSession
-	if _, err := s.postJSON(ctx, s.authClient, "/security/devices/session",
-		access.DeviceLoginRequest{ChallengeID: ch.ID, Signature: sig}, &sess); err != nil {
+	if _, err := s.postJSON(ctx, s.authClient, "/security/devices/session", login, &sess); err != nil {
 		return fmt.Errorf("device session: %w", err)
 	}
 	if sess.Token == "" {
@@ -439,8 +487,25 @@ func (s *nodeSecurity) establishLocked(ctx context.Context) error {
 	if !time.Now().Before(sess.ExpiresAt) {
 		return errors.New("device session: zero or expired expiry")
 	}
+	if peer != nil {
+		if err := validatePeerSessionBinding(peer, sess.Peer, enrollment.ExpectedRevision); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
+	// 最终写入前拒绝关停：CloseP2P 之后在途完成的挑战流程不得再落新会话。
+	if s.node.lifeIsClosed() {
+		s.mu.Unlock()
+		return errNodeClosed
+	}
 	s.token, s.expires, s.hasSess = sess.Token, sess.ExpiresAt, true
+	if sess.Peer != nil {
+		s.peerBinding = &peerauth.Binding{
+			PeerID:    sess.Peer.PeerID,
+			PublicKey: append([]byte(nil), sess.Peer.PublicKey...),
+			Revision:  sess.Peer.Revision,
+		}
+	}
 	if first {
 		s.invite = "" // 只在首次注册使用一次
 	}
@@ -450,11 +515,38 @@ func (s *nodeSecurity) establishLocked(ctx context.Context) error {
 	return nil
 }
 
+// validatePeerSessionBinding 校验 master 在设备会话响应中下发的 peer 绑定与本
+// 节点 runtime peer identity 完全一致。CAS 权威在 master：
+//   - expected==0：本进程首次注册（内存无绑定）。持久身份可能已在先前会话重绑
+//     到 revision>1，重启后属合法 resume——任何正 current revision 都接受。
+//   - expected>0：本进程已知绑定 revision。同 key resume 必须返回不变 revision。
+//
+// 其余任何值 fail-closed。
+func validatePeerSessionBinding(peer peertransport.RuntimeAPI, binding *peerauth.Binding, expected uint64) error {
+	if binding == nil {
+		return errors.New("device session: peer binding missing")
+	}
+	if binding.PeerID != peer.PeerID() || !bytes.Equal(binding.PublicKey, peer.PublicKey()) {
+		return errors.New("device session: peer binding does not match this node identity")
+	}
+	if err := peerauth.ValidateIdentity(binding.PeerID, binding.PublicKey); err != nil {
+		return fmt.Errorf("device session: invalid peer binding: %w", err)
+	}
+	if binding.Revision == 0 {
+		return errors.New("device session: peer binding has zero revision")
+	}
+	if expected > 0 && binding.Revision != expected {
+		return fmt.Errorf("device session: peer binding revision %d does not match expected %d", binding.Revision, expected)
+	}
+	return nil
+}
+
 // validateDeviceChallenge 校验 master 签发挑战与本次请求的绑定：受众、用途、
 // Nonce 长度、时间窗（未过期且 ≤maxChallengeWindow、NotBefore 不过分超前）、
-// Extras 恰好等于预期四键（challenge_id/node_id/addr/total_bytes）。
-func validateDeviceChallenge(c edgeidentity.Challenge, challengeID, nodeID, addr string, totalBytes int64, now time.Time) error {
-	if c.Audience != deviceChallengeAudience {
+// Extras 恰好等于预期键集（未启用 P2P：四键 challenge_id/node_id/addr/total_bytes；
+// 启用 P2P：额外 peer_id/peer_public_key_sha256/peer_expected_revision 三键）。
+func validateDeviceChallenge(c edgeidentity.Challenge, challengeID, nodeID, addr string, totalBytes int64, now time.Time, wantAudience string, enrollment *peerauth.Enrollment) error {
+	if c.Audience != wantAudience {
 		return fmt.Errorf("audience %q mismatch", c.Audience)
 	}
 	if c.Purpose != deviceChallengePurpose {
@@ -478,6 +570,9 @@ func validateDeviceChallenge(c edgeidentity.Challenge, challengeID, nodeID, addr
 		"addr":         addr,
 		"total_bytes":  strconv.FormatInt(totalBytes, 10),
 	}
+	for k, v := range peerauth.EnrollmentExtras(enrollment) {
+		want[k] = v
+	}
 	if len(c.Extras) != len(want) {
 		return fmt.Errorf("challenge extras bind %d keys, want exactly %d", len(c.Extras), len(want))
 	}
@@ -491,6 +586,46 @@ func validateDeviceChallenge(c edgeidentity.Challenge, challengeID, nodeID, addr
 		}
 	}
 	return nil
+}
+
+// setPeerRuntime attaches the P2P runtime identity (EnableP2P). It is written
+// once before Register, so establishLocked sees a stable value.
+func (s *nodeSecurity) setPeerRuntime(runtime peertransport.RuntimeAPI) {
+	s.mu.Lock()
+	s.peer = runtime
+	s.mu.Unlock()
+}
+
+func (s *nodeSecurity) clearPeerRuntime() {
+	s.mu.Lock()
+	s.peer = nil
+	s.peerBinding = nil
+	s.mu.Unlock()
+}
+
+// peerBindingSnapshot returns a copy of the master-bound peer binding (nil when
+// P2P is not enabled or no session has completed yet).
+func (s *nodeSecurity) peerBindingSnapshot() *peerauth.Binding {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.peerBinding == nil {
+		return nil
+	}
+	return &peerauth.Binding{
+		PeerID:    s.peerBinding.PeerID,
+		PublicKey: append([]byte(nil), s.peerBinding.PublicKey...),
+		Revision:  s.peerBinding.Revision,
+	}
+}
+
+// peerRuntimeID returns the configured runtime peer id, or "" when P2P is off.
+func (s *nodeSecurity) peerRuntimeID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.peer == nil {
+		return ""
+	}
+	return s.peer.PeerID()
 }
 
 // snapshot 互斥读取当前设备会话（续期原子换新，旧 token 读到也只会 401 一次）。
@@ -509,7 +644,8 @@ func (s *nodeSecurity) hasSession() bool {
 
 // kickRenewFor 收到 master 401 时的异步续期（单飞：并发 401 只触发一次）。
 // rejected 是 master 实际拒绝的那个设备 token；是否重建由 renewAfterRejection
-// 按「被拒 token 是否仍是当前快照」裁决（见其注释）。
+// 按「被拒 token 是否仍是当前快照」裁决（见其注释）。goroutine 挂在节点生命周期
+// 上（goLife）：CloseP2P 取消并 join，关停后不再启动。
 func (s *nodeSecurity) kickRenewFor(rejected string) {
 	if rejected == "" {
 		return
@@ -517,14 +653,17 @@ func (s *nodeSecurity) kickRenewFor(rejected string) {
 	if !s.renewing.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	started := s.node.goLife(func(ctx context.Context) {
 		defer s.renewing.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
+		ctx, cancel := context.WithTimeout(ctx, controlTimeout)
 		defer cancel()
 		if err := s.renewAfterRejection(ctx, rejected); err != nil {
 			log.Printf("device session renew after rejection: %v", err)
 		}
-	}()
+	})
+	if !started {
+		s.renewing.Store(false)
+	}
 }
 
 // renewAfterRejection 是 401 三路径（deviceTransport 异步 / checkTicket、
@@ -541,8 +680,19 @@ func (s *nodeSecurity) renewAfterRejection(ctx context.Context, rejected string)
 	if rejected == "" {
 		return nil
 	}
+	// 节点已关停：不再重建会话（旧节点绝不踢新 session）。快速路径与 opMu 取得
+	// 后各查一次——等锁进来的旧调用同样不得在关停后进 establishLocked。
+	if s.node.lifeIsClosed() {
+		return nil
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+	if s.node.lifeIsClosed() {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	cur, has := s.token, s.hasSess
 	s.mu.Unlock()
@@ -552,20 +702,26 @@ func (s *nodeSecurity) renewAfterRejection(ctx context.Context, rejected string)
 	return s.establishLocked(ctx)
 }
 
-// renewLoop 到期前主动续期（Register 成功后启动）。
-func (s *nodeSecurity) renewLoop() {
+// renewLoop 到期前主动续期（Register 成功后启动）。生命周期 ctx 取消即退出
+// （CloseP2P join）；legacy 部署不调 CloseP2P，行为不变。
+func (s *nodeSecurity) renewLoop(ctx context.Context) {
 	t := time.NewTicker(renewCheckInterval)
 	defer t.Stop()
-	for range t.C {
-		tok, exp := s.snapshot()
-		if tok != "" && time.Now().Before(exp.Add(-s.renewMargin)) {
-			continue
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
-		err := s.establishSession(ctx, false)
-		cancel()
-		if err != nil {
-			log.Printf("device session renew: %v", err)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			tok, exp := s.snapshot()
+			if tok != "" && time.Now().Before(exp.Add(-s.renewMargin)) {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(ctx, controlTimeout)
+			err := s.establishSession(ctx, false)
+			cancel()
+			if err != nil {
+				log.Printf("device session renew: %v", err)
+			}
 		}
 	}
 }
@@ -689,6 +845,9 @@ func (s *nodeSecurity) authorizePeer(req *http.Request) error {
 		WriteEpoch:       writeEpoch,
 		Resume:           resume,
 		WriteAttemptID:   writeAttemptID,
+		// P2P: this node dials a peer through the runtime transport, so its own
+		// peer id is the source. Legacy ordinary-TCP requests leave it empty.
+		SourcePeerID: s.peerRuntimeID(),
 	}
 	var tk access.Ticket
 	sent, _ := s.snapshot()
@@ -899,6 +1058,8 @@ func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 		}
 		// /verify 无 body（BodyHash 空）；GET/DELETE /objects、/replicate 等
 		// payload 请求 BodyHash 一律空，由票据在 master 侧按成员关系核验。
+		// SourcePeerID comes only from the authenticated connection context set
+		// by the runtime ConnContext, never from an HTTP header.
 		res, err := s.checkTicket(r.Context(), access.CheckRequest{
 			Token:            tok,
 			Method:           r.Method,
@@ -911,6 +1072,7 @@ func (s *nodeSecurity) wrapHandler(next http.Handler) http.Handler {
 			WriteEpoch:       writeEpoch,
 			Resume:           resume,
 			WriteAttemptID:   writeAttemptID,
+			SourcePeerID:     peerauth.SourcePeerID(r.Context()),
 		})
 		if err != nil {
 			if errors.Is(err, errCheckDenied) {

@@ -5,6 +5,11 @@ import "time"
 const IntegrityProtocol = "integrity-v1"
 const WriteIntegrityProtocol = "integrity-write-v3"
 
+const (
+	ProtectionProgressInterval = 15 * time.Second
+	ProtectionProgressTimeout  = 10 * time.Second
+)
+
 // ObjectIntegrity binds a physical object to the metadata snapshot used to verify it.
 // ChecksumKnown distinguishes an explicit CRC of zero from legacy unrecorded checksums.
 // PlanAttempt identifies the protection claim attempt this descriptor/receipt

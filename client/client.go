@@ -37,6 +37,8 @@ type Client struct {
 	// secTransport 是 secure 模式的出站 transport，与 c.HTTP 的 Transport 是同一实例
 	// （FUSE 读句柄经 ObjectTransport() 共用，连接池/票据逻辑一处）。
 	secTransport        *secureTransport
+	p2pMu               sync.Mutex
+	p2p                 *clientP2P
 	writeMu             sync.Mutex
 	writeEnabled        bool
 	writeChecked        time.Time

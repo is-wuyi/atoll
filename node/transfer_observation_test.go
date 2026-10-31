@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -39,7 +40,7 @@ func TestTransferObservationsNeverDelayHeartbeat(t *testing.T) {
 	}
 	n.SetNodeIDForTest(1)
 	before := time.Now()
-	if err := n.heartbeatOnce(); err != nil {
+	if err := n.heartbeatOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if time.Since(before) > time.Second {
@@ -51,7 +52,7 @@ func TestTransferObservationsNeverDelayHeartbeat(t *testing.T) {
 		t.Fatal("observation did not start")
 	}
 	for i := 0; i < 10; i++ {
-		if err := n.heartbeatOnce(); err != nil {
+		if err := n.heartbeatOnce(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}

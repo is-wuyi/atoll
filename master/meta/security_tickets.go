@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"atoll/pkg/access"
+	"atoll/pkg/peerauth"
 	"atoll/pkg/types"
 	bolt "go.etcd.io/bbolt"
 )
@@ -20,17 +21,19 @@ var ErrAccessTicket = errors.New("access denied")
 const AccessTicketTTL = 2 * time.Minute
 
 type accessTicketRecord struct {
-	Request          access.TicketRequest  `json:"request"`
-	AudienceNodeID   uint64                `json:"audience_node_id"`
-	AudienceIdentity string                `json:"audience_identity"`
-	Issuer           string                `json:"issuer"`
-	UserID           uint64                `json:"user_id,omitempty"`
-	SpaceID          uint64                `json:"space_id,omitempty"`
-	SessionHash      []byte                `json:"session_hash,omitempty"`
-	DeviceIdentity   string                `json:"device_identity,omitempty"`
-	DeviceVersion    uint64                `json:"device_version,omitempty"`
-	ExpiresAt        time.Time             `json:"expires_at"`
-	Integrity        types.ObjectIntegrity `json:"integrity"`
+	Request            access.TicketRequest  `json:"request"`
+	AudienceNodeID     uint64                `json:"audience_node_id"`
+	AudienceIdentity   string                `json:"audience_identity"`
+	AudiencePeer       *peerauth.Binding     `json:"audience_peer,omitempty"`
+	SourcePeerRevision uint64                `json:"source_peer_revision,omitempty"`
+	Issuer             string                `json:"issuer"`
+	UserID             uint64                `json:"user_id,omitempty"`
+	SpaceID            uint64                `json:"space_id,omitempty"`
+	SessionHash        []byte                `json:"session_hash,omitempty"`
+	DeviceIdentity     string                `json:"device_identity,omitempty"`
+	DeviceVersion      uint64                `json:"device_version,omitempty"`
+	ExpiresAt          time.Time             `json:"expires_at"`
+	Integrity          types.ObjectIntegrity `json:"integrity"`
 }
 
 func ticketResourceID(path string) (uint64, bool) {
@@ -78,6 +81,9 @@ func normalizeTicketRequest(req access.TicketRequest) (access.TicketRequest, err
 		return req, ErrAccessTicket
 	}
 	if req.WriteEpoch > 0 && (req.Method != http.MethodPut || (!strings.HasPrefix(req.Path, "/objects/") && !strings.HasPrefix(req.Path, "/replicate/")) || req.Query != "" || req.PlanID != "") {
+		return req, ErrAccessTicket
+	}
+	if req.SourcePeerID != "" && !peerauth.ValidID(req.SourcePeerID) {
 		return req, ErrAccessTicket
 	}
 	if req.WriteAttemptID != "" && (!access.ValidWriteAttemptID(req.WriteAttemptID) || req.WriteEpoch == 0 || req.Resume) {
@@ -285,6 +291,31 @@ func (s *Store) issueTicket(record accessTicketRecord, now time.Time) (access.Ti
 		}
 		record.AudienceNodeID = target.NodeID
 		record.AudienceIdentity = target.Identity
+		if record.Request.SourcePeerID != "" {
+			if target.Peer == nil {
+				return ErrAccessTicket
+			}
+			binding := *target.Peer
+			binding.PublicKey = append([]byte(nil), target.Peer.PublicKey...)
+			record.AudiencePeer = &binding
+			switch record.Issuer {
+			case "user":
+				var source clientPeerRecord
+				if readSecurityData(tx, "client-peer", record.Request.SourcePeerID, &source) != nil {
+					return ErrAccessTicket
+				}
+				record.SourcePeerRevision = source.AuthorizationRevision
+			case "device":
+				var source DeviceRecord
+				if readSecurityData(tx, "device", record.DeviceIdentity, &source) != nil || source.Peer == nil {
+					return ErrAccessTicket
+				}
+				record.SourcePeerRevision = source.Peer.Revision
+			}
+		}
+		if err := sourcePeerAuthorizedTx(w.tx, record, now); err != nil {
+			return err
+		}
 		switch record.Issuer {
 		case "user":
 			record.Integrity, err = validateUserTicketTx(w.tx, record, now)
@@ -332,7 +363,13 @@ func (s *Store) CheckAccessTicket(nodeSession string, req access.CheckRequest, n
 		if node.NodeID != ticket.AudienceNodeID || node.Identity != ticket.AudienceIdentity || node.Addr != ticket.Request.NodeAddr {
 			return ErrAccessTicket
 		}
-		normalized, err := normalizeTicketRequest(access.TicketRequest{NodeAddr: node.Addr, Method: req.Method, Path: req.Path, Query: req.Query, PlanID: req.PlanID, PlanAttempt: req.PlanAttempt, PlanAttemptToken: req.PlanAttemptToken, BodyHash: req.BodyHash, WriteEpoch: req.WriteEpoch, Resume: req.Resume, WriteAttemptID: req.WriteAttemptID})
+		if ticket.AudiencePeer != nil && !peerauth.SameBinding(ticket.AudiencePeer, node.Peer) {
+			return ErrAccessTicket
+		}
+		if err := sourcePeerAuthorizedTx(tx, ticket, now); err != nil {
+			return err
+		}
+		normalized, err := normalizeTicketRequest(access.TicketRequest{NodeAddr: node.Addr, Method: req.Method, Path: req.Path, Query: req.Query, PlanID: req.PlanID, PlanAttempt: req.PlanAttempt, PlanAttemptToken: req.PlanAttemptToken, BodyHash: req.BodyHash, WriteEpoch: req.WriteEpoch, Resume: req.Resume, WriteAttemptID: req.WriteAttemptID, SourcePeerID: req.SourcePeerID})
 		if err != nil || normalized != ticket.Request {
 			return ErrAccessTicket
 		}

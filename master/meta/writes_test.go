@@ -281,7 +281,7 @@ func TestPlannedWriteConfigFailClosed(t *testing.T) {
 				case "marker":
 					return tx.Bucket(bucketMeta).Delete(keyWriteInitialized)
 				default:
-					return tx.Bucket(bucketWrites).Put(keyWriteConfig, []byte(`{"version":4,"enabled_at":"2026-10-17T00:00:00Z"}`))
+					return tx.Bucket(bucketWrites).Put(keyWriteConfig, []byte(`{"version":5,"enabled_at":"2026-10-17T00:00:00Z"}`))
 				}
 			}); err != nil {
 				t.Fatal(err)

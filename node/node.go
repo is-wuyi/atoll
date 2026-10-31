@@ -44,6 +44,8 @@ type Node struct {
 	pulling               sync.Map      // object ID -> pullKey
 	token                 auth.Token    // 集群认证；空 = 兼容模式
 	sec                   *nodeSecurity // 独立身份+在线票据模式；nil = legacy 行为
+	p2pMu                 sync.Mutex
+	p2p                   *nodeP2P
 	uploadBudget          *transferbudget.Limiter
 	downloadBudget        *transferbudget.Limiter
 	observationMu         sync.Mutex
@@ -57,7 +59,25 @@ type Node struct {
 	inflight           int64 // 在飞临时写已预留的字节（rename 前的 temp 占用）
 	objectLocks        [objectLockStripes]sync.Mutex
 	activeObjectWrites sync.Map // object ID -> count, guarded by its object lock
+
+	// Register 启动的后台循环生命周期：heartbeatLoop / 设备会话 renewLoop /
+	// 401 kickRenewFor 都挂在这条 ctx 上，CloseP2P 取消并 join。legacy 部署从不
+	// 调 CloseP2P，ctx 永不取消，行为与旧版完全一致。
+	lifeMu     sync.Mutex
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
+	lifeWG     sync.WaitGroup
+	lifeOn     bool // Register 已启动生命周期
+	lifeClosed bool // CloseP2P 已开始：拒绝新循环与新 Register
+
+	// legacyUncommittedWait 覆盖 legacy 直写「未提交」的有界等待预算（0 = 默认
+	// 30s）。仅测试注入短值加速，生产恒为 0。
+	legacyUncommittedWait time.Duration
 }
+
+// errNodeClosed 表示节点生命周期已关停（CloseP2P 之后）：拒绝 Register 与一切
+// 新的设备会话建立，旧节点绝不继续续期/踢新 session。
+var errNodeClosed = errors.New("node is closed")
 
 func New(dataDir, masterURL, advertise string, totalBytes int64) *Node {
 	bulkTransport := &http.Transport{
@@ -333,13 +353,42 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// errUncommittedBudgetExhausted 表示 precommit 等待预算耗尽（终局返回，不消耗
+// 也不受网络/内容/授权类错误原 3 次预算约束）。
+var errUncommittedBudgetExhausted = errors.New("legacy replication wait budget exhausted")
+
+// legacyUncommittedWaitDefault 是 legacy「未提交」sentinel 的元数据等待预算：
+// legacy 直写先 PUT 后 commit，主副本取复制计划可能先于 commit 到达。仅该
+// sentinel 状态等待；等待不消耗网络/内容/授权类错误的原 3 次预算，也不给
+// payload 推送套总超时（大块/WAN 不受影响）。预算自首次观察到 sentinel 起算、
+// 硬生效：其后取计划请求按剩余预算收窄 ctx，截止后不再发起新请求；拿到合法
+// committed plan 即终止等待阶段，其后普通错误只受原 3 次预算约束。
+const legacyUncommittedWaitDefault = 30 * time.Second
+
+// legacyUncommittedBackoffCap 是等待 commit 的退避上限：及时复查、预算到期即退出。
+const legacyUncommittedBackoffCap = 2 * time.Second
+
+// legacyUncommittedWaitBudget 返回未提交等待预算（0 = 默认）。
+func (n *Node) legacyUncommittedWaitBudget() time.Duration {
+	if n.legacyUncommittedWait > 0 {
+		return n.legacyUncommittedWait
+	}
+	return legacyUncommittedWaitDefault
+}
+
 // replicateToPeers 把指定对象推送到 master 分配的其余副本节点（带重试）。
 // 目标列表实时从 master 获取，已完成的节点会被 master 过滤掉，因此重试天然幂等。
 // 回执使用本次取到的 descriptor 的世代：世代推进后旧回执会被 master 拒，
 // 此时不再重试（该世代已被取代），而不是把旧世代“升级”成新世代。
 func (n *Node) replicateToPeers(objectID uint64) {
-	for attempt := 1; attempt <= 3; attempt++ {
-		plan, err := n.replicationPlan(context.Background(), objectID)
+	var uncommittedDeadline time.Time // 首次 sentinel 时设定；committed plan 后清零
+	waitLogged := false
+	attempts := 0 // 网络/内容/授权类错误的原 3 次预算；pre-commit 等待不计入
+	for {
+		plan, err := n.committedPlanOrWait(objectID, &uncommittedDeadline, &waitLogged)
+		if errors.Is(err, errUncommittedBudgetExhausted) {
+			return
+		}
 		if err == nil {
 			var f *os.File
 			f, err = n.verifiedSource(context.Background(), plan.Object)
@@ -364,10 +413,58 @@ func (n *Node) replicateToPeers(objectID uint64) {
 			log.Printf("replicate %d superseded: %v", objectID, err)
 			return
 		}
-		log.Printf("replicate %d attempt %d: %v", objectID, attempt, err)
-		if attempt < 3 {
-			time.Sleep(time.Duration(attempt) * time.Second)
+		attempts++
+		log.Printf("replicate %d attempt %d: %v", objectID, attempts, err)
+		if attempts >= 3 {
+			return
 		}
+		time.Sleep(time.Duration(attempts) * time.Second)
+	}
+}
+
+// committedPlanOrWait 取一份可推送的复制计划。legacy 未提交 sentinel 在预算内
+// 等待 commit：预算自首次 sentinel 起算，其后取计划请求按 remaining 收窄 ctx、
+// 截止后不再发起新请求；拿到合法 committed plan 即清零截止并返回（等待阶段
+// 终止，后续普通错误只受调用方的 3 次预算约束）。其余错误原样上交。
+func (n *Node) committedPlanOrWait(objectID uint64, deadline *time.Time, waitLogged *bool) (types.ReplicationPlan, error) {
+	for {
+		remaining := time.Until(*deadline)
+		if !deadline.IsZero() && remaining <= 0 {
+			log.Printf("replicate %d: legacy content still uncommitted after %s budget", objectID, n.legacyUncommittedWaitBudget())
+			return types.ReplicationPlan{}, errUncommittedBudgetExhausted
+		}
+		planCtx := context.Background()
+		var planCancel context.CancelFunc
+		if !deadline.IsZero() {
+			planCtx, planCancel = context.WithTimeout(context.Background(), remaining)
+		}
+		plan, err := n.replicationPlan(planCtx, objectID)
+		if planCancel != nil {
+			planCancel()
+		}
+		if errors.Is(err, errLegacyContentUncommitted) {
+			if deadline.IsZero() {
+				*deadline = time.Now().Add(n.legacyUncommittedWaitBudget())
+			}
+			remaining = time.Until(*deadline)
+			if remaining <= 0 {
+				return types.ReplicationPlan{}, errUncommittedBudgetExhausted
+			}
+			if !*waitLogged {
+				*waitLogged = true
+				log.Printf("replicate %d: legacy content not committed yet; waiting up to %s for client commit", objectID, n.legacyUncommittedWaitBudget())
+			}
+			time.Sleep(min(legacyUncommittedBackoffCap, remaining))
+			continue
+		}
+		if !deadline.IsZero() && errors.Is(err, context.DeadlineExceeded) {
+			// 收窄的元数据请求随预算到期：预算耗尽，不再重试。
+			return types.ReplicationPlan{}, errUncommittedBudgetExhausted
+		}
+		if err == nil {
+			*deadline = time.Time{} // committed plan 到手：终止 precommit 等待阶段
+		}
+		return plan, err
 	}
 }
 
@@ -717,7 +814,7 @@ func (p *progressCounter) Write(b []byte) (int, error) {
 
 // progressReportInterval 是计划拉取的进度心跳周期：足够密以支撑续租判断，
 // 足够疏以免进度请求本身成为 master 负载。测试可注入缩短。
-var progressReportInterval = 15 * time.Second
+var progressReportInterval = types.ProtectionProgressInterval
 
 // progressLoop 周期上报进度；上报失败只记日志（进度是尽力而为的续租心跳，
 // 真正的授权闸在 descriptor 与回执两处）。stop 关闭或 ctx 结束即退出。
@@ -801,7 +898,7 @@ func (n *Node) sendPullProgress(ctx context.Context, report types.ProtectionProg
 	if report.PlanID == "" || report.Attempt == 0 {
 		return result, errors.New("missing feedback attempt")
 	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, types.ProtectionProgressTimeout)
 	defer cancel()
 	body, err := json.Marshal(report)
 	if err != nil {
@@ -1277,28 +1374,104 @@ func parseObjectID(w http.ResponseWriter, r *http.Request) (uint64, bool) {
 
 // Register 向 master 注册并启动心跳循环（阻塞直到首次注册成功）。
 // security 模式下注册即设备挑战换会话，并启动到期前主动续期循环。
+// 首次注册与心跳/续期循环都挂节点生命周期（lifeWG 占位 + ctx 贯穿）：CloseP2P
+// 取消并 join，之后 Register 被拒、会话不再重建。legacy 不调 CloseP2P，行为不变。
 func (n *Node) Register() error {
-	if err := n.registerOnce(); err != nil {
+	n.lifeMu.Lock()
+	if n.lifeClosed {
+		n.lifeMu.Unlock()
+		return errNodeClosed
+	}
+	if !n.lifeOn {
+		n.lifeCtx, n.lifeCancel = context.WithCancel(context.Background())
+		n.lifeOn = true
+	}
+	ctx := n.lifeCtx
+	// 占位计数在 lifeMu 内 Add：与 CloseP2P 的 lifeClosed 写互斥，Close 的
+	// Wait 绝不漏掉尚未返回的首次注册。
+	n.lifeWG.Add(1)
+	n.lifeMu.Unlock()
+	if err := n.registerOnceCtx(ctx); err != nil {
+		n.lifeWG.Done()
 		return err
 	}
 	if n.sec != nil {
-		go n.sec.renewLoop()
+		n.goLife(func(ctx context.Context) { n.sec.renewLoop(ctx) })
 	}
-	go n.heartbeatLoop()
+	n.goLife(func(ctx context.Context) { n.heartbeatLoop(ctx) })
+	n.lifeWG.Done()
 	return nil
 }
 
+// anchorLifeContext 把节点生命周期锚到调用方 ctx（P2P 模式下 EnableP2P 的参数，
+// CLI 传 signal ctx）：SIGTERM 在 Register 期间取消即中止在途注册，不必等退出
+// 时 defer 的 CloseP2P。已有生命周期（或已关停）时为 no-op；legacy 无 P2P 不锚，
+// 保持 background 行为。CloseP2P 仍可经 lifeCancel 提前取消。
+func (n *Node) anchorLifeContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	n.lifeMu.Lock()
+	defer n.lifeMu.Unlock()
+	if n.lifeOn || n.lifeClosed {
+		return
+	}
+	n.lifeCtx, n.lifeCancel = context.WithCancel(ctx)
+	n.lifeOn = true
+}
+
+// goLife 在节点生命周期上启动一条被跟踪的 goroutine：ctx 随 CloseP2P 取消、
+// CloseP2P join 它，关停后拒绝再启动。401 kick 等路径可能先于 Register 触发，
+// 因此生命周期 ctx 在此惰性创建——kick goroutine 一样可被取消并 join。
+// 返回 false = 生命周期已关停，fn 未启动。
+func (n *Node) goLife(fn func(ctx context.Context)) bool {
+	n.lifeMu.Lock()
+	if n.lifeClosed {
+		n.lifeMu.Unlock()
+		return false
+	}
+	if !n.lifeOn {
+		n.lifeCtx, n.lifeCancel = context.WithCancel(context.Background())
+		n.lifeOn = true
+	}
+	ctx := n.lifeCtx
+	n.lifeWG.Add(1)
+	n.lifeMu.Unlock()
+	go func() {
+		defer n.lifeWG.Done()
+		fn(ctx)
+	}()
+	return true
+}
+
+// lifeIsClosed 报告节点生命周期是否已关停（CloseP2P 开始后为真）。
+func (n *Node) lifeIsClosed() bool {
+	n.lifeMu.Lock()
+	defer n.lifeMu.Unlock()
+	return n.lifeClosed
+}
+
 func (n *Node) registerOnce() error {
+	return n.registerOnceCtx(context.Background())
+}
+
+// registerOnceCtx 执行一次注册：security 模式走设备挑战（ctx 贯穿，关停即中止）；
+// legacy 走 /nodes/register。ctx 仅约束本次注册的网络等待。
+func (n *Node) registerOnceCtx(ctx context.Context) error {
 	// security 模式：设备挑战注册/续期（master 报 unknown node 走到这里时
 	// 强制重建会话，重新绑定 identity→addr）。已持有未临期会话时为 no-op。
 	if n.sec != nil {
-		return n.sec.establishSession(context.Background(), n.sec.hasSession())
+		return n.sec.establishSession(ctx, n.sec.hasSession())
 	}
 	body, _ := json.Marshal(map[string]any{
 		"addr":        n.advertise,
 		"total_bytes": n.totalBytes,
 	})
-	resp, err := n.httpClient.Post(n.masterURL+"/nodes/register", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.masterURL+"/nodes/register", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("register: %w", err)
+	}
+	resp, err := n.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
@@ -1317,21 +1490,28 @@ func (n *Node) registerOnce() error {
 	return nil
 }
 
-// heartbeatLoop 定期心跳；master 重启后重新注册。
-func (n *Node) heartbeatLoop() {
+// heartbeatLoop 定期心跳；master 重启后重新注册。生命周期 ctx 取消即退出
+// （CloseP2P join）；未调 CloseP2P 的 legacy 部署 ctx 永不取消，行为不变。
+func (n *Node) heartbeatLoop(ctx context.Context) {
 	t := time.NewTicker(n.heartbeatInterval)
 	defer t.Stop()
-	for range t.C {
-		if err := n.heartbeatOnce(); err != nil {
-			if errors.Is(err, errUnknownNode) {
-				// master 丢了注册信息（比如 master 数据被清空），重新注册。
-				log.Printf("heartbeat: unknown node, re-registering: %v", err)
-				if rerr := n.registerOnce(); rerr != nil {
-					log.Printf("re-register failed: %v", rerr)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := n.heartbeatOnce(ctx); err != nil {
+				if errors.Is(err, errUnknownNode) {
+					// master 丢了注册信息（比如 master 数据被清空），重新注册。
+					// ctx 沿用循环生命周期：关停后不会继续重注册。
+					log.Printf("heartbeat: unknown node, re-registering: %v", err)
+					if rerr := n.registerOnceCtx(ctx); rerr != nil {
+						log.Printf("re-register failed: %v", rerr)
+					}
+					continue
 				}
-				continue
+				log.Printf("heartbeat: %v", err)
 			}
-			log.Printf("heartbeat: %v", err)
 		}
 	}
 }
@@ -1354,7 +1534,7 @@ func (n *Node) usageSnapshot() *types.NodeUsage {
 	return &types.NodeUsage{Epoch: n.usageEpoch, Sequence: n.usageSeq, UsedBytes: n.used.Load()}
 }
 
-func (n *Node) heartbeatOnce() error {
+func (n *Node) heartbeatOnce(ctx context.Context) error {
 	usage := n.usageSnapshot()
 	used := n.used.Load()
 	if usage != nil {
@@ -1365,7 +1545,11 @@ func (n *Node) heartbeatOnce() error {
 		"used_bytes": used,
 		"usage":      usage,
 	})
-	resp, err := n.httpClient.Post(n.masterURL+"/nodes/heartbeat", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.masterURL+"/nodes/heartbeat", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("heartbeat: %w", err)
+	}
+	resp, err := n.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("heartbeat: %w", err)
 	}

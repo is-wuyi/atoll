@@ -1,0 +1,121 @@
+{
+  "date": "2026-10-31",
+  "baseline": "cab4ed6299f13ad91b651767460fd64e10193f77",
+  "branch": "feat/admin-console",
+  "status": "implementation_complete_stability_gate_blocked",
+  "committed": false,
+  "deployed": false,
+  "scope": "local production P2P wiring; no public WAN, NAS, or kernel FUSE acceptance",
+  "go": "go1.26.7 darwin/amd64",
+  "root_go_requirement": "1.26.0",
+  "source_manifest_sha256": "59dc9b738d5b5d45d5e9acde677636e3feda8aaf60ec2a90e19ef4bdd28f5c31",
+  "private_evidence_sha256": "31991a982e6629c02607d8265d2ace437e4c4cdf5ca94a98d97e6c3a8ec0b93e",
+  "final_root_run": {
+    "command": "GOMAXPROCS=2 go test -race -p 1 ./... -count=1 -timeout=1200s",
+    "exit_code": 1,
+    "data_race_reported": false,
+    "failures": [
+      {
+        "test": "TestFaultStalledNodeReassignsToHealthy",
+        "error": "all three node attempts failed or timed out",
+        "fixture_put_timeout_ms": 400,
+        "same_source_isolated_race_count_3_passed": true
+      },
+      {
+        "test": "TestPeerDirectRoundTrip",
+        "error": "client EnableP2P: client P2P directory: context deadline exceeded",
+        "failure_phase": "directory initialization before payload",
+        "runtime_blocking_stack_captured": false
+      }
+    ],
+    "passed_packages": [
+      "atoll/cmd/atoll", "atoll/cmd/transferlab", "atoll/console",
+      "atoll/internal/scheduler", "atoll/master", "atoll/master/meta",
+      "atoll/mount", "atoll/node", "atoll/pkg/access", "atoll/pkg/auth",
+      "atoll/pkg/contentcrypto", "atoll/pkg/edgeidentity", "atoll/pkg/keyfile",
+      "atoll/pkg/metacrypto", "atoll/pkg/peerauth", "atoll/pkg/peerhttp",
+      "atoll/pkg/peertransport", "atoll/pkg/transferbudget", "atoll/pkg/types"
+    ],
+    "log_sha256": "dee6eab20f904a97a8905a6fbca99c8a7683177c9627ae80b635c329a39373f4"
+  },
+  "verified_results": [
+    {"scope": "final complete integration/peer race", "exit_code": 0, "seconds": 233.834, "log_sha256": "1d46139392939399aa718205242b57d3b3d677716cef180676d72457a0ce56ba"},
+    {"scope": "final node complete race", "exit_code": 0, "seconds": 52.949},
+    {"scope": "final legacy concurrent upload, checksum failover, multichunk commit race count=3", "exit_code": 0, "seconds": 17.169},
+    {"scope": "legacy 400ms fault test isolated race count=3", "exit_code": 0, "seconds": 13.667},
+    {"scope": "runtime complete race count=3", "exit_code": 0, "seconds": 14.579},
+    {"scope": "real AEAD partial-receive recovery race", "exit_code": 0, "seconds": 13.015},
+    {"scope": "real CLI processes and peer release race", "exit_code": 0, "seconds": 97.578},
+    {"scope": "legacy commit atomic replay regression race count=3", "exit_code": 0, "seconds": 24.081},
+    {"scope": "concurrent create/replace commit and WAL replay race count=3", "exit_code": 0, "seconds": 18.175},
+    {"scope": "real slow flight across initial lease race count=2", "exit_code": 0, "seconds": 79.042},
+    {"scope": "independent prototype module", "exit_code": 0},
+    {"scope": "independent prototype-production module with integration tag", "exit_code": 0},
+    {"scope": "final source go vet ./...", "exit_code": 0}
+  ],
+  "builds": {
+    "linux_amd64_cgo_disabled": "7b643e05286ddad3caf15c9780e303566fbfb81ff1f58f55f347a5f82ce2d2d4",
+    "darwin_amd64_cgo_disabled": "fd03b3382654ed79489236771fe7fcc08e6fb0c6df53847aa8f25898e59a4793"
+  },
+  "environment_observations": {
+    "go_file_sync_darwin": "F_FULLFSYNC",
+    "full_sync_seconds_first_sample": [3.442, 0.378, 0.345, 1.775, 2.278, 1.847],
+    "full_sync_seconds_later_sample": [0.0251, 0.0182, 0.0220, 0.0190],
+    "ordinary_fsync_seconds_approx": 0.0001,
+    "directory_stall_root_cause": "not conclusively established",
+    "diagnostic_timing_overlay": {
+      "runs": 10,
+      "passed": 10,
+      "seconds": 58.037,
+      "directory_handler_ms_range": [0.67, 2.14],
+      "stall_reproduced": false
+    },
+    "production_sync_disabled": false,
+    "production_timeouts_relaxed": false
+  },
+  "stage_two": {
+    "status": "linux_preacceptance_pending",
+    "earlier_manifest_and_build_hashes_apply_only_to_stage_one": true,
+    "fault_test": {
+      "mechanism": "shared in-flight handler barrier with ErrAbortHandler; healthy nodes keep default timeout",
+      "race_fault_and_probe_suite": {"exit_code": 0, "seconds": 17.227},
+      "final_control": {"exit_code": 0, "seconds": 7.098},
+      "without_exclude_overlay": {"exit_code": 1, "seconds": 0.929, "expected_failure": "first recovery request omitted failed node from exclude"},
+      "production_source_mutated": false
+    },
+    "peer_diagnostics": {
+      "opt_in": true,
+      "event_limit_per_fixture": 512,
+      "slow_request_seconds": 3,
+      "stack_limit_per_fixture": 3,
+      "stack_bytes_limit": 524288,
+      "cli_subprocess_observer_installed": false,
+      "scenarios": ["TestPeerDirectRoundTrip", "TestPeerBadCertRejected", "TestPeerNodeRestartSameIdentity"],
+      "count_each": 5,
+      "exit_code": 0,
+      "seconds": 156.448,
+      "directory_client_completed": 50,
+      "directory_server_completed": 50,
+      "directory_client_median_ms": 1.449717,
+      "directory_client_max_ms": 5.923718,
+      "directory_server_max_ms": 2.163096,
+      "natural_directory_stall_reproduced": false,
+      "stack_samples_in_scenario_run": 0
+    },
+    "linux_ci": {
+      "workflow": ".github/workflows/p2p-validation.yml",
+      "trigger_branch_pattern": "ci/p2p-validation-*",
+      "status": "not_started",
+      "go": "1.26.7",
+      "checks": ["root race", "root vet", "prototype race", "prototype-production integration race"],
+      "deploys": false
+    }
+  },
+  "unverified": [
+    "stable all-root race pass in this environment",
+    "public non-overlay direct connectivity and NAT hole punching",
+    "cross-NAS production P2P fault injection",
+    "kernel FUSE mount",
+    "production deployment and metadata migration"
+  ]
+}

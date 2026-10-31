@@ -516,7 +516,7 @@ func TestHeartbeatUsesDeviceBearer(t *testing.T) {
 	n := newSecureNode(t, fm, "127.0.0.1:9103", "")
 	n.SetToken("cluster-secret") // legacy token 在 security 模式必须被忽略
 	mustRegister(t, n)
-	if err := n.heartbeatOnce(); err != nil {
+	if err := n.heartbeatOnce(context.Background()); err != nil {
 		t.Fatalf("heartbeat: %v", err)
 	}
 	fm.mu.Lock()

@@ -22,7 +22,7 @@ func enableWriteRecoveryTx(w *txw) error {
 	if err := json.Unmarshal(w.tx.Bucket(bucketWrites).Get(keyWriteConfig), &cfg); err != nil {
 		return err
 	}
-	if cfg.Version == 3 {
+	if cfg.Version == 3 || cfg.Version == 4 {
 		return nil
 	}
 	if cfg.Version != 1 && cfg.Version != 2 {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"atoll/pkg/edgeidentity"
+	"atoll/pkg/peerauth"
 	"atoll/pkg/types"
 )
 
@@ -37,6 +38,7 @@ type TicketRequest struct {
 	// object under the current epoch. It never authorizes new payload bytes.
 	Resume         bool   `json:"resume,omitempty"`
 	WriteAttemptID string `json:"write_attempt_id,omitempty"`
+	SourcePeerID   string `json:"source_peer_id,omitempty"`
 }
 
 type Ticket struct {
@@ -59,6 +61,7 @@ type CheckRequest struct {
 	WriteEpoch     uint64 `json:"write_epoch,omitempty"`
 	Resume         bool   `json:"resume,omitempty"`
 	WriteAttemptID string `json:"write_attempt_id,omitempty"`
+	SourcePeerID   string `json:"source_peer_id,omitempty"`
 }
 
 type CheckResult struct {
@@ -67,10 +70,11 @@ type CheckResult struct {
 }
 
 type DeviceChallengeRequest struct {
-	PublicKey  []byte `json:"public_key"`
-	Addr       string `json:"addr"`
-	TotalBytes int64  `json:"total_bytes"`
-	Invite     string `json:"invite,omitempty"`
+	PublicKey  []byte               `json:"public_key"`
+	Addr       string               `json:"addr"`
+	TotalBytes int64                `json:"total_bytes"`
+	Invite     string               `json:"invite,omitempty"`
+	Peer       *peerauth.Enrollment `json:"peer,omitempty"`
 }
 
 type DeviceChallenge struct {
@@ -79,14 +83,16 @@ type DeviceChallenge struct {
 }
 
 type DeviceLoginRequest struct {
-	ChallengeID string `json:"challenge_id"`
-	Signature   []byte `json:"signature"`
+	ChallengeID   string `json:"challenge_id"`
+	Signature     []byte `json:"signature"`
+	PeerSignature []byte `json:"peer_signature,omitempty"`
 }
 
 type DeviceSession struct {
-	NodeID    uint64    `json:"node_id"`
-	Token     string    `json:"token"`
-	ExpiresAt time.Time `json:"expires_at"`
+	NodeID    uint64            `json:"node_id"`
+	Token     string            `json:"token"`
+	ExpiresAt time.Time         `json:"expires_at"`
+	Peer      *peerauth.Binding `json:"peer,omitempty"`
 }
 
 func WriteAttemptID(req *http.Request) (string, error) {

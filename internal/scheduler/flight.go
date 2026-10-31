@@ -143,7 +143,8 @@ func DecideTransferFlight(s TransferFlightState, now time.Time) (TransferDecisio
 		return d, nil
 	}
 	d.EstimatedFinish, d.Measured = finish, true
-	if s.BytesDone == s.Size || !finish.After(s.LeaseUntil) {
+	// Payload completion still needs the existing verification/receipt margin.
+	if !finish.After(s.LeaseUntil) {
 		d.Reason = "completion_within_lease"
 		return d, nil
 	}
@@ -366,7 +367,7 @@ func ValidateTransferDecision(s TransferFlightState, d TransferDecision, now tim
 		}
 		return nil
 	}
-	if !now.Before(s.LeaseUntil) || !now.Before(s.HardUntil) || s.BytesDone <= s.PreviousBytes || s.BytesDone >= s.Size || s.GoodputBPS == 0 || s.ProgressAt.IsZero() || now.Sub(s.ProgressAt) >= s.ObservationTTL || s.RenewWindow <= 0 || s.Renewals >= s.MaxRenewals || s.LeaseUntil.Sub(now) > s.RenewBefore || !d.LeaseUntil.After(s.LeaseUntil) || d.LeaseUntil.After(s.HardUntil) || d.LeaseUntil.After(now.Add(s.RenewWindow)) {
+	if !now.Before(s.LeaseUntil) || !now.Before(s.HardUntil) || s.BytesDone <= s.PreviousBytes || s.BytesDone > s.Size || s.GoodputBPS == 0 || s.ProgressAt.IsZero() || now.Sub(s.ProgressAt) >= s.ObservationTTL || s.RenewWindow <= 0 || s.Renewals >= s.MaxRenewals || s.LeaseUntil.Sub(now) > s.RenewBefore || !d.LeaseUntil.After(s.LeaseUntil) || d.LeaseUntil.After(s.HardUntil) || d.LeaseUntil.After(now.Add(s.RenewWindow)) {
 		return errors.New("unbounded or unmeasured transfer renewal")
 	}
 	finish, ok := completionWithMargin(now, s.Size-s.BytesDone, s.GoodputBPS)

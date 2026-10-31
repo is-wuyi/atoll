@@ -79,12 +79,33 @@ func (s *secureSession) snapshot() (token string, spaceID uint64, hasSpace bool)
 	return s.token, s.spaceID, s.hasSpace
 }
 
+// updateRegistrationIfCurrent 在同一 sec.mu 临界区内比对当前会话快照，一致时执行
+// store（登记落库）。会话切换（写 sec 字段，同样持 sec.mu）与登记落库因此互斥，
+// 杜绝「比对通过后、赋值前」切换会话把旧登记写进新会话的窗口——落库时的会话
+// 状态与登记内容保证一致。返回 false = 快照已切换，调用方不得落库。
+func (s *secureSession) updateRegistrationIfCurrent(token string, spaceID uint64, hasSpace bool, store func()) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.token != token || s.spaceID != spaceID || s.hasSpace != hasSpace {
+		return false
+	}
+	store()
+	return true
+}
+
 // secureTransport 是 secure 模式的唯一出站 transport：
 // master 源注入用户会话；其余源（节点）换票据。
 type secureTransport struct {
 	master *url.URL // 解析后的 master origin（scheme://host）
 	base   http.RoundTripper
 	s      *secureSession
+	// peerID 返回本客户端的 P2P source peer id（nil = P2P 未启用，票据不携带
+	// source peer id，保持 legacy ordinary-TCP 语义）。
+	peerID func() string
+	// ensureRegistered 在换票前确保本客户端已按当前会话/space 向 master 登记
+	// 为 peer（nil = P2P 未启用）。文件操作先登记再拨号，首个上传不依赖后台缓存。
+	// 返回 error 时整条节点请求 fail-closed，绝不静默降级为普通 TCP。
+	ensureRegistered func(ctx context.Context, token string, spaceID uint64, hasSpace bool) error
 }
 
 // NewSecure 创建安全会话客户端。masterURL 无 scheme 默认 https；明文 http:// 仅在
@@ -130,6 +151,24 @@ func NewSecure(masterURL string, tlsCfg *tls.Config, allowInsecure bool) (*Clien
 		sec:          s,
 		secTransport: tr,
 	}, nil
+}
+
+// pinnedOrigin 返回构造时固定的 master origin（scheme://host）。Client.MasterURL
+// 是可变导出字段；P2P 控制请求的目标与签名 proof 的 origin 必须绑定构造时的
+// secureTransport.master——换票、登记、释放与会话 token 绝不发往其它源。
+func (t *secureTransport) pinnedOrigin() string {
+	if t == nil || t.master == nil {
+		return ""
+	}
+	return t.master.Scheme + "://" + t.master.Host
+}
+
+// pinnedMasterOrigin 是 Client 侧的 pinned origin 快照（未启用 secure 模式为空串）。
+func (c *Client) pinnedMasterOrigin() string {
+	if c.secTransport == nil {
+		return ""
+	}
+	return c.secTransport.pinnedOrigin()
 }
 
 // SetRequireEncryption 在 secure 会话下要求加密写入：探测 master content-key
@@ -257,6 +296,14 @@ func (t *secureTransport) applyNodeAuth(req *http.Request) error {
 	if token == "" || !hasSpace {
 		return fmt.Errorf("secure client: 无会话或未选择 space，拒绝直连节点 %s", req.URL.Host)
 	}
+	// P2P 启用时：先确保本客户端已按同一 token/space 登记为 peer，再换票拨号。
+	// 否则首上传会赶在 25s 后台刷新前，节点对未知 source 做有界目录刷新后仍
+	// 拒绝——这里把登记提到文件操作路径上，不靠等缓存。失败即 fail-closed。
+	if t.ensureRegistered != nil {
+		if err := t.ensureRegistered(req.Context(), token, spaceID, hasSpace); err != nil {
+			return fmt.Errorf("secure client: 确保 peer 登记: %w", err)
+		}
+	}
 	tk, err := t.fetchTicket(req, token, spaceID)
 	if err != nil {
 		return err
@@ -294,6 +341,9 @@ func (t *secureTransport) fetchTicket(req *http.Request, token string, spaceID u
 		WriteEpoch:     writeEpoch,
 		Resume:         resume,
 		WriteAttemptID: writeAttemptID,
+	}
+	if t.peerID != nil {
+		tr.SourcePeerID = t.peerID()
 	}
 	b, err := json.Marshal(tr)
 	if err != nil {
@@ -426,6 +476,7 @@ func (c *Client) Login(ctx context.Context, username, password string) (LoginRes
 		c.sec.spaceID, c.sec.hasSpace = 0, false
 	}
 	c.sec.mu.Unlock()
+	c.p2pSessionChanged()
 	return out, nil
 }
 
@@ -454,6 +505,7 @@ func (c *Client) SetSession(token string) error {
 	c.sec.hasSpace = false
 	c.sec.spaceID = 0
 	c.sec.mu.Unlock()
+	c.p2pSessionChanged()
 	return nil
 }
 
@@ -466,6 +518,7 @@ func (c *Client) UseSpace(spaceID uint64) error {
 	c.sec.mu.Lock()
 	c.sec.spaceID, c.sec.hasSpace = spaceID, spaceID != 0
 	c.sec.mu.Unlock()
+	c.p2pSessionChanged()
 	return nil
 }
 
@@ -480,6 +533,7 @@ func (c *Client) Logout(ctx context.Context) error {
 	c.sec.token = ""
 	c.sec.spaceID, c.sec.hasSpace = 0, false
 	c.sec.mu.Unlock()
+	c.p2pSessionChanged()
 	return err
 }
 

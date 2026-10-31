@@ -1,10 +1,10 @@
 # Atoll — 分布式文件存储系统
 
-Atoll（环礁）面向零配置、自治调度的跨地域边缘主存储。当前系统提供多副本存储、FUSE 本地挂载和故障修复；新增默认关闭的观测／旁路／仅增保护控制循环，已接入持久计划与预算，但尚未部署真集群。本批新增默认关闭的安全模式（受邀账号、个人/团队空间、节点独立身份与在线访问票据，见 [安全说明](SECURITY.md)）：**`-secure` 代码路径下节点已改用 `pkg/edgeidentity` 持久 Ed25519 独立身份入网**（尚未部署真集群）。内置 P2P（libp2p）与内容加密基础仍是独立库、未接入生产链路；现有部署的 EasyTier 地址通道仍在使用，本批不做网络迁移、不拆除 EasyTier。
+Atoll（环礁）面向零配置、自治调度的跨地域边缘主存储。当前提供多副本存储、FUSE 本地挂载、故障修复、受邀账号和个人/团队空间。安全模式以持久 Ed25519 设备身份、HTTPS 与在线访问票据控制访问；计划写入可使用 AEAD 内容加密。内置 P2P 通过显式 `-p2p` 接入 Master、节点、CLI 和挂载客户端，详见 [P2P 说明](P2P.md)；本地功能用例已有通过记录，旧紧时限故障测试已改为确定性屏障；偶发目录超时已补两端取证，正在做 Linux 对照，当前验收状态见 [验收记录](P2P_ACCEPTANCE.md)。功能接线、本地验收和现网部署是独立阶段；现有 EasyTier 通道保持不变，本批不做网络迁移或正式数据迁移。
 
 运行方法与边界见 [计划写入说明](WRITE_PLANNING.md)、[拓扑与带宽感知传输](TRANSFER_PLANNING.md)、[对象退隐与容量释放](RETIREMENT.md) 和 [自治多副本说明](AUTONOMY.md)；前一批协议、升级限制与原型记录见 [完整性基础说明](EDGE_FOUNDATION.md)。`-write-planning` 为默认关闭的新写入口：Master 调度器冻结复制布局与具体确认集合，满足后原子发布；保护档位只影响优化权重，不是固定副本数。
 
-`-write-transfer-planning` 在计划写入上增加方向性连接观测、多个上传入口与节点复制路线；后台补副本可为不同不可变块绑定多个来源，共享上下行预算。`pkg/peerhttp` 保留 HTTPS 与在线票据，经真实 TLS-over-peer-stream 接生产组件；libp2p 的实际装配由独立模块隔离验证，CLI 自动发现/身份绑定与公网打洞验收仍未完成。当前不替换现网 EasyTier。验收记录见 [传输批次验收](TRANSFER_PLANNING_ACCEPTANCE.md)，后续 [隔离实机验收](TRANSFER_PLANNING_REAL_ACCEPTANCE.md) 为部分通过：单入口与断源恢复通过，多源流重叠已确认，但慢链路完整副本和指定节点对公网直连尚未通过。
+`-write-transfer-planning` 在计划写入上增加方向性连接观测、多个上传入口与节点复制路线；后台补副本可为不同不可变块绑定多个来源，共享上下行预算。`pkg/peerhttp` 保留 HTTPS 与在线票据，`pkg/peertransport` 提供 libp2p 传输，授权绑定和目录由 HTTPS Master 管理。P2P 默认关闭，不能从 `direct` 标签推断公网直连已验收，也不替换现网 EasyTier。既有传输批次与隔离实机边界分别见 [传输批次验收](TRANSFER_PLANNING_ACCEPTANCE.md) 和 [隔离实机验收](TRANSFER_PLANNING_REAL_ACCEPTANCE.md)，不能与后续 P2P 接线验收混为一批。
 
 ## 架构
 
@@ -42,7 +42,7 @@ go build -o atoll ./cmd/atoll
 ```bash
 # 引导（master 停止时；密码经环境变量，12..72 字节）
 ATOLL_PASSWORD='<初始管理员密码>' ./atoll auth init -user admin -db atoll.db
-# secure master（强制 TLS + ≥24 字符控制凭据；拒绝 -seeds）
+# secure master（强制 TLS + ≥24 字符控制凭据；远程备份还需内容 KEK）
 ATOLL_CONTROL_TOKEN='<≥24字符>' ./atoll master -db atoll.db -secure -tls-cert ... -tls-key ... -tls-ca ...
 # secure node（强制 TLS；首次入网带设备邀请码）
 ATOLL_NODE_INVITE='<设备邀请码>' ./atoll node -secure -master https://<master>:9420 ...
@@ -61,7 +61,7 @@ export ATOLL_MASTER='https://master.example:9420' ATOLL_SESSION='<登录JSON的t
 
 ## Web 管理后台（atoll console）
 
-独立进程的只读为主管理后台，Go 服务端渲染，通过集群 token 调 master 的只读 `/admin/*` API，自带控制台账号与会话（与集群文件用户无关）。**console 未接入本批安全账号/空间/会话体系**：安全模式下它对 master 的 `/admin/*` 请求需携带控制凭据（读）与 admin token（破坏性操作），账号与空间管理不经 console。注意元数据备份页在安全模式下会因 master 对 `/admin/metabackup*` 整体封禁而不可用（返回 409）。
+独立进程的只读为主管理后台，Go 服务端渲染，通过集群 token 调 master 的只读 `/admin/*` API，自带控制台账号与会话（与集群文件用户无关）。**console 未接入本批安全账号/空间/会话体系**：安全模式下它对 master 的 `/admin/*` 请求需携带控制凭据（读）与 admin token（破坏性操作），账号与空间管理不经 console。注意元数据备份页在安全模式下仅于配置加密备份后可用；未配置时 `/admin/metabackup*` 返回 409。
 
 ```bash
 # 1. 建控制台账号（密码经环境变量传入，避免进 shell 历史）

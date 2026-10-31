@@ -17,6 +17,7 @@ import (
 
 	"atoll/pkg/access"
 	"atoll/pkg/edgeidentity"
+	"atoll/pkg/peerauth"
 	"atoll/pkg/types"
 
 	bolt "go.etcd.io/bbolt"
@@ -41,12 +42,13 @@ const (
 )
 
 type DeviceRecord struct {
-	Identity       string `json:"identity"`
-	PublicKey      []byte `json:"public_key"`
-	NodeID         uint64 `json:"node_id"`
-	Addr           string `json:"addr"`
-	Revoked        bool   `json:"revoked"`
-	SessionVersion uint64 `json:"session_version"`
+	Identity       string            `json:"identity"`
+	PublicKey      []byte            `json:"public_key"`
+	NodeID         uint64            `json:"node_id"`
+	Addr           string            `json:"addr"`
+	Revoked        bool              `json:"revoked"`
+	SessionVersion uint64            `json:"session_version"`
+	Peer           *peerauth.Binding `json:"peer,omitempty"`
 }
 
 type deviceInviteRecord struct {
@@ -134,7 +136,7 @@ func validDeviceEndpoint(addr string) bool {
 // inviteHash 必须进复用判据：完成登录时烧掉的是记录里的 InviteHash 对应邀请，
 // 若跨邀请复用，换邀请的请求会拿到绑定别人邀请的挑战——一次登录烧不掉任何邀请，
 // 邀请的"一次性"语义被旁路。
-func deviceChallengeUsageTx(tx *bolt.Tx, pub ed25519.PublicKey, addr string, total int64, inviteHash string, now time.Time) (global, perIdentity int, reuse *deviceChallengeRecord, err error) {
+func deviceChallengeUsageTx(tx *bolt.Tx, pub ed25519.PublicKey, addr string, total int64, inviteHash string, now time.Time, enrollment *peerauth.Enrollment) (global, perIdentity int, reuse *deviceChallengeRecord, err error) {
 	b := tx.Bucket(bucketSecurity)
 	if b == nil {
 		return 0, 0, nil, nil
@@ -160,7 +162,7 @@ func deviceChallengeUsageTx(tx *bolt.Tx, pub ed25519.PublicKey, addr string, tot
 			// 同 request 复用：同一 endpoint + 同容量 + 同一邀请。签名域绑定 addr，
 			// 复用不会让任何签名把设备切到别的 endpoint；邀请哈希相同则完成登录时
 			// 烧掉的正是该请求所凭的那张邀请，语义不脱钩。
-			if reuse == nil && ch.Request.Addr == addr && ch.Request.TotalBytes == total && ch.InviteHash == inviteHash {
+			if reuse == nil && ch.Request.Addr == addr && ch.Request.TotalBytes == total && ch.InviteHash == inviteHash && samePeerEnrollment(ch.Request.Peer, enrollment) {
 				cp := ch
 				reuse = &cp
 			}
@@ -185,9 +187,22 @@ func (s *Store) NewDeviceChallenge(req access.DeviceChallengeRequest, now time.T
 	identity := string(edgeidentity.DeriveNodeID(ed25519.PublicKey(req.PublicKey)))
 	out = access.DeviceChallenge{ID: id, Challenge: edgeidentity.Challenge{Audience: "atoll-master-device-v1", Purpose: "node-session", Nonce: nonce,
 		NotBefore: now, ExpiresAt: now.Add(2 * time.Minute), Extras: map[string]string{"challenge_id": id, "node_id": identity, "addr": req.Addr, "total_bytes": strconv.FormatInt(req.TotalBytes, 10)}}}
+	for key, value := range peerauth.EnrollmentExtras(req.Peer) {
+		out.Challenge.Extras[key] = value
+	}
+	if req.Peer != nil && (peerauth.ValidateIdentity(req.Peer.PeerID, req.Peer.PublicKey) != nil || !peerauth.ValidNodeAddr(req.Addr)) {
+		return out, ErrDeviceAuth
+	}
 	inviteHash := secHash(req.Invite)
 	req.Invite = ""
 	err = s.write(func(w *txw) error {
+		if req.Peer != nil {
+			cfg, enabled, err := peerConfigTx(w.tx)
+			if err != nil || !enabled {
+				return ErrDeviceAuth
+			}
+			out.Challenge.Audience = cfg.Origin
+		}
 		var existing DeviceRecord
 		err := readSecurityData(w.tx, "device", identity, &existing)
 		if err == nil {
@@ -202,7 +217,7 @@ func (s *Store) NewDeviceChallenge(req access.DeviceChallengeRequest, now time.T
 		} else {
 			return err
 		}
-		global, perIdentity, reuse, err := deviceChallengeUsageTx(w.tx, ed25519.PublicKey(req.PublicKey), req.Addr, req.TotalBytes, inviteHash, now)
+		global, perIdentity, reuse, err := deviceChallengeUsageTx(w.tx, ed25519.PublicKey(req.PublicKey), req.Addr, req.TotalBytes, inviteHash, now, req.Peer)
 		if err != nil {
 			return err
 		}
@@ -275,6 +290,12 @@ func (s *Store) CompleteDeviceChallenge(req access.DeviceLoginRequest, now time.
 		}); err != nil {
 			return err
 		}
+		if err := bindDevicePeerTx(w, &device, ch.Request.Peer, peerauth.EnrollmentProof(ch.Challenge), req.PeerSignature, now); err != nil {
+			return err
+		}
+		if ch.Request.Peer == nil && len(req.PeerSignature) != 0 {
+			return ErrDeviceAuth
+		}
 		device.Addr = ch.Request.Addr
 		if device.SessionVersion == ^uint64(0) {
 			return ErrDeviceAuth
@@ -303,7 +324,7 @@ func (s *Store) CompleteDeviceChallenge(req access.DeviceLoginRequest, now time.
 		if err := w.putNode(raw, node.ID); err != nil {
 			return err
 		}
-		out = access.DeviceSession{NodeID: device.NodeID, Token: token, ExpiresAt: now.Add(30 * time.Minute)}
+		out = access.DeviceSession{NodeID: device.NodeID, Token: token, ExpiresAt: now.Add(30 * time.Minute), Peer: device.Peer}
 		if err := putSecurityData(w, "device-session", secHash(token), deviceSessionRecord{Identity: identity, Version: device.SessionVersion, ExpiresAt: out.ExpiresAt}); err != nil {
 			return err
 		}

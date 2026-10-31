@@ -2,13 +2,16 @@ package client
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"atoll/master"
 	"atoll/master/meta"
 	"atoll/node"
+	"atoll/pkg/types"
 )
 
 // ---- WAN 抖动故障注入档 ----
@@ -23,12 +27,121 @@ import (
 // 节点 HTTP handler 上注入确定性故障（固定延迟、PUT 卡死），验证系统在慢网下
 // 仍正确/不永久挂起。超时用 SetPutTimeout 注入小值以便秒级跑完。
 
+// 首个 PUT 选出故障节点；该节点直到下一个文件开始前都拒绝 PUT。
+// 用屏障注入失败，避免健康节点刷盘耗时决定测试结果。
+type putGate struct {
+	mu       sync.Mutex
+	armed    bool
+	fail     chan struct{}
+	arrived  chan struct{}
+	bad      uint64
+	arrivals int
+}
+
+func newPutGate() *putGate { return &putGate{} }
+
+func (g *putGate) arm() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.armed = true
+	g.fail = make(chan struct{})
+	g.arrived = make(chan struct{}, 1)
+	g.bad = 0
+}
+
+// 保留关闭的通道，使故障节点的后续 PUT 仍失败。
+func (g *putGate) trigger() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.fail == nil {
+		return
+	}
+	select {
+	case <-g.fail:
+	default:
+		close(g.fail)
+	}
+}
+
+func (g *putGate) waitArrived() chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.arrived
+}
+
+func (g *putGate) onArrive(nodeID uint64) chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.armed && g.bad == 0 {
+		return nil
+	}
+	if g.bad == 0 {
+		g.armed = false
+		g.bad = nodeID
+		g.arrivals++
+		select {
+		case g.arrived <- struct{}{}:
+		default:
+		}
+		return g.fail
+	}
+	if nodeID == g.bad {
+		g.arrivals++
+		return g.fail
+	}
+	return nil
+}
+
+func (g *putGate) stats() (arrivals int, bad uint64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.arrivals, g.bad
+}
+
+// 直接检查 exclude，避免靠随机重选到故障节点才能发现回归。
+type chunkAssignLog struct {
+	mu   sync.Mutex
+	reqs []struct {
+		Reassign bool
+		Exclude  []uint64
+	}
+}
+
+func (l *chunkAssignLog) add(reassign bool, exclude []uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.reqs = append(l.reqs, struct {
+		Reassign bool
+		Exclude  []uint64
+	}{reassign, exclude})
+}
+
+func (l *chunkAssignLog) reassigns() []struct {
+	Reassign bool
+	Exclude  []uint64
+} {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []struct {
+		Reassign bool
+		Exclude  []uint64
+	}
+	for _, r := range l.reqs {
+		if r.Reassign {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // faultOpts 描述对单个节点注入的故障。
 type faultOpts struct {
-	latency    time.Duration // 每个请求前固定延迟（模拟 RTT）
-	stallPut   time.Duration // 对 PUT /objects 额外卡住这么久（模拟"连得上但传不动"）
-	stallGet   time.Duration // 对 GET /objects 额外卡住这么久（模拟读路径节点卡死）
-	healthzCnt *int64        // 非 nil 时统计 /healthz 被探测的次数（验证探测缓存）
+	latency    time.Duration  // 每个请求前固定延迟（模拟 RTT）
+	stallPut   time.Duration  // 对 PUT /objects 额外卡住这么久（模拟"连得上但传不动"）
+	stallGet   time.Duration  // 对 GET /objects 额外卡住这么久（模拟读路径节点卡死）
+	healthzCnt *int64         // 非 nil 时统计 /healthz 被探测的次数（验证探测缓存）
+	putGate    *putGate       // 非 nil 时参与全局在途 PUT 屏障（见 putGate）
+	nodeID     *atomic.Uint64 // fixture 填充的节点注册 ID（handler 读，须 atomic）
 }
 
 // faultHandler 包装节点 Handler 注入故障；/healthz 永远快速正常，
@@ -41,6 +154,17 @@ func faultHandler(inner http.Handler, f faultOpts) http.Handler {
 			}
 			inner.ServeHTTP(w, r)
 			return
+		}
+		// 在途屏障：bad 节点的 PUT 挂起至 trigger/ctx，随后真实中止连接
+		//（panic(http.ErrAbortHandler) 是 net/http 的静默连接终止，不假报状态）。
+		if f.putGate != nil && r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/objects/") {
+			if failCh := f.putGate.onArrive(f.nodeID.Load()); failCh != nil {
+				select {
+				case <-r.Context().Done(): // 客户端可取消 ctx 到期兜底
+				case <-failCh: // 测试确定性触发
+				}
+				panic(http.ErrAbortHandler)
+			}
 		}
 		// 卡死/延迟都尊重请求取消：客户端 context 超时断连时 handler 立即返回，
 		// 避免 httptest.Server.Close() 在 t.Cleanup 里干等整段 stall。
@@ -72,20 +196,48 @@ func faultHandler(inner http.Handler, f faultOpts) http.Handler {
 	})
 }
 
-// newFaultCluster 起 1 master + N node，第 i 个节点套用 faults[i]（缺省无故障）。
-func newFaultCluster(t *testing.T, numNodes int, faults map[int]faultOpts) *Client {
+// faultCluster 携带 fixture 句柄：节点注册 ID 供排除断言，chunk 请求日志供
+// exclude 断言。
+type faultCluster struct {
+	*Client
+	nodeIDs []uint64
+	chunks  *chunkAssignLog
+}
+
+// newFaultClusterState 起 1 master + N node，第 i 个节点套用 faults[i]，全部注册。
+// master 包一层录制中间件：POST /files/chunks 请求体（reassign/exclude）入账。
+func newFaultClusterState(t *testing.T, numNodes int, faults map[int]faultOpts) *faultCluster {
 	t.Helper()
 	store, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
 	if err != nil {
 		t.Fatalf("meta.Open: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	masterSrv := httptest.NewServer(master.NewServer(store, time.Hour).Handler())
+	chunks := &chunkAssignLog{}
+	masterHandler := master.NewServer(store, time.Hour).Handler()
+	masterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/files/chunks" {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			r.Body.Close()
+			var rec struct {
+				Reassign bool     `json:"reassign"`
+				Exclude  []uint64 `json:"exclude"`
+			}
+			_ = json.Unmarshal(body, &rec)
+			chunks.add(rec.Reassign, rec.Exclude)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		masterHandler.ServeHTTP(w, r)
+	}))
 	t.Cleanup(func() { masterSrv.Close() })
 
+	fc := &faultCluster{chunks: chunks}
 	for i := 0; i < numNodes; i++ {
 		n := node.New(filepath.Join(t.TempDir(), "data"), masterSrv.URL, "", 1<<30)
-		h := faultHandler(n.Handler(), faults[i])
+		idSlot := new(atomic.Uint64)
+		f := faults[i]
+		f.nodeID = idSlot
+		h := faultHandler(n.Handler(), f)
 		nodeSrv := httptest.NewServer(h)
 		t.Cleanup(func() { nodeSrv.Close() })
 		resp, err := postRaw(masterSrv.URL+"/nodes/register",
@@ -100,9 +252,17 @@ func newFaultCluster(t *testing.T, numNodes int, faults map[int]faultOpts) *Clie
 			t.Fatalf("解码注册: %v", err)
 		}
 		resp.Body.Close()
+		idSlot.Store(reg.ID)
 		n.SetNodeIDForTest(reg.ID)
+		fc.nodeIDs = append(fc.nodeIDs, reg.ID)
 	}
-	return New(masterSrv.URL)
+	fc.Client = New(masterSrv.URL)
+	return fc
+}
+
+// newFaultCluster 起 1 master + N node，第 i 个节点套用 faults[i]（缺省无故障）。
+func newFaultCluster(t *testing.T, numNodes int, faults map[int]faultOpts) *Client {
+	return newFaultClusterState(t, numNodes, faults).Client
 }
 
 // PLACEHOLDER_TESTS
@@ -167,15 +327,19 @@ func TestFaultStalledNodeBoundedFailure(t *testing.T) {
 	}
 }
 
-// 卡死节点旁有健康节点时应确定性自愈：节点0 PUT 卡死、节点1/2 健康，PUT 超时 400ms。
-// reassign 排除刚卡死的节点后必落到健康节点——每个文件都应成功、内容一致。
-// （靠"reassign 排除失败节点"才能确定性通过，否则随机重选可能再撞坏节点而 flaky。）
+// 故障由屏障触发，健康节点使用默认超时；短超时不能区分 WAN 卡死与慢刷盘。
 func TestFaultStalledNodeReassignsToHealthy(t *testing.T) {
 	withChunkSize(t, 1<<20) // 大块 → 单块文件，一次 PUT 决策
-	c := newFaultCluster(t, 3, map[int]faultOpts{
-		0: {stallPut: 3 * time.Second},
+	gate := newPutGate()
+	fc := newFaultClusterState(t, 3, map[int]faultOpts{
+		0: {putGate: gate},
+		1: {putGate: gate},
+		2: {putGate: gate},
 	})
-	c.SetPutTimeout(400 * time.Millisecond)
+	// LIFO：cleanup 先 trigger（放行可能仍挂起的屏障请求），再关服务器——
+	// 失败路径不会让 httptest.Server.Close 干等 hold。
+	t.Cleanup(gate.trigger)
+	c := fc.Client
 	if _, err := c.Mkdir("/w"); err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
@@ -185,10 +349,54 @@ func TestFaultStalledNodeReassignsToHealthy(t *testing.T) {
 	if err := os.WriteFile(src, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 5; i++ {
+	const files = 8
+	for i := 0; i < files; i++ {
 		remote := fmt.Sprintf("/w/r%d.bin", i)
-		if err := c.PutChunked(src, remote, 1); err != nil {
-			t.Fatalf("有健康节点时第 %d 个文件仍失败: %v", i, err)
+		gate.arm()
+		putDone := make(chan error, 1)
+		go func() { putDone <- c.PutChunked(src, remote, 1) }()
+		select {
+		case <-gate.waitArrived(): // 屏障：请求已在目标 handler 在途
+		case err := <-putDone:
+			t.Fatalf("PUT 在屏障触发前就结束（fixture 失真）: err=%v", err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("PUT 未到达目标节点——屏障未触发")
+		}
+		gate.trigger() // 在途确定性失败（真实连接中止，非超时竞速）
+		select {
+		case err := <-putDone:
+			if err != nil {
+				t.Fatalf("有健康节点时第 %d 个文件仍失败: %v", i, err)
+			}
+		case <-time.After(90 * time.Second):
+			t.Fatalf("第 %d 个文件在屏障失败后未恢复（疑似挂起）", i)
+		}
+		_, bad := gate.stats()
+		// 排除断言（确定性）：恢复（reassign）请求必须排除被拦节点。
+		reassigns := fc.chunks.reassigns()
+		if len(reassigns) != i+1 {
+			t.Fatalf("第 %d 个文件后 reassign 应恰好 %d 次，got %d", i, i+1, len(reassigns))
+		}
+		if !containsUint64(reassigns[i].Exclude, bad) {
+			t.Fatalf("r%d 恢复请求 exclude 应包含被拦节点 %d: %+v", i, bad, reassigns[i].Exclude)
+		}
+		// 屏障拦截数（确定性）：bad 节点被排除后不应再有第二次拦截。
+		arrivals, _ := gate.stats()
+		if arrivals != i+1 {
+			t.Fatalf("第 %d 个文件后屏障拦截应恰好 %d 次，got %d（失败节点被复选）", i, i+1, arrivals)
+		}
+		in, _, err := c.Lookup(remote)
+		if err != nil {
+			t.Fatalf("Lookup r%d: %v", i, err)
+		}
+		// chunked 副本断言直接查块表：primary 不落在 bad 节点且已 Done
+		//（chunked 的 Lookup reps 可能为空，块表才是权威）。
+		if len(in.Chunks) != 1 {
+			t.Fatalf("r%d 应恰好 1 块，got %d", i, len(in.Chunks))
+		}
+		ch := in.Chunks[0]
+		if len(ch.Replicas) != 1 || ch.Replicas[0] == bad || !types.ContainsUint64(ch.Done, ch.Replicas[0]) || types.ContainsUint64(ch.Done, bad) {
+			t.Fatalf("r%d 块 primary 不应落在被拦节点 %d 且须 Done: replicas=%v done=%v", i, bad, ch.Replicas, ch.Done)
 		}
 		out := filepath.Join(t.TempDir(), fmt.Sprintf("o%d", i))
 		if err := c.Get(remote, out); err != nil {
@@ -199,6 +407,15 @@ func TestFaultStalledNodeReassignsToHealthy(t *testing.T) {
 			t.Fatalf("r%d 读回不符", i)
 		}
 	}
+}
+
+func containsUint64(list []uint64, v uint64) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // 探测缓存：连传一批小文件时，master 对节点 /healthz 的探测次数应远小于文件数
@@ -264,4 +481,3 @@ func TestFaultStalledGetBoundedFailure(t *testing.T) {
 		t.Fatalf("读取应有界失败（~500ms 量级），实际 %v——退化成挂起了", elapsed)
 	}
 }
-

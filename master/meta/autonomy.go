@@ -1409,7 +1409,8 @@ func (s *Store) RecordProtectionProgressResult(report ProtectionProgressReport, 
 		}
 		hard := result.HardUntil
 		path := scheduler.TransferHTTP
-		renewBefore := min(renew.Window/3, time.Minute)
+		// The next progress report and its response must fit before the old lease expires.
+		renewBefore := min(renew.Window, time.Minute, max(renew.Window/3, types.ProtectionProgressInterval+types.ProtectionProgressTimeout))
 		state := scheduler.TransferFlightState{PlanID: plan.ID, ObjectID: plan.Expected.ObjectID, Generation: plan.Expected.Generation, IntegrityEpoch: plan.Expected.IntegrityEpoch, Attempt: t.Attempts, Size: plan.Expected.Size, BytesDone: report.BytesDone, PreviousBytes: previousBytes, Source: fmt.Sprint(t.SourceID), Target: fmt.Sprint(t.NodeID), Path: path, Active: true, LeaseStart: t.LeaseStart, LeaseUntil: t.NextAttempt, HardUntil: hard, ProgressAt: report.Now, GoodputBPS: t.GoodputBPS, Renewals: t.Renewals, MaxRenewals: renew.MaxRenewals, RenewWindow: renew.Window, RenewBefore: renewBefore, ObservationTTL: 30 * time.Second, UploadBPS: t.UploadBPS, DownloadBPS: t.DownloadBPS}
 		decision, e := scheduler.DecideTransferFlight(state, report.Now)
 		if e != nil {

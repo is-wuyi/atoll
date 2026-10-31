@@ -974,8 +974,19 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64, bindi
 		return types.Inode{}, types.Inode{}, false, err
 	}
 	var out, old types.Inode
-	var hadOld bool
+	var hadOld, replayed bool
 	err := s.write(func(w *txw) error {
+		// A retry may have entered before the first publisher wrote its result.
+		if len(bindings) > 0 {
+			rec, ok, err := opResultTx(w.tx, bindings[0].OpID, "commit", bindings[0].Fingerprint)
+			if err != nil {
+				return err
+			}
+			if ok {
+				out, replayed = rec.Inode, true
+				return nil
+			}
+		}
 		in, err := getInodeTx(w.tx, inodeID)
 		if err != nil {
 			return err
@@ -1076,6 +1087,9 @@ func (s *Store) CommitStagingFile(inodeID uint64, name string, size int64, bindi
 		}
 		return nil
 	})
+	if err == nil && replayed {
+		err = s.EnsureDurable()
+	}
 	if err != nil {
 		return types.Inode{}, types.Inode{}, false, err
 	}

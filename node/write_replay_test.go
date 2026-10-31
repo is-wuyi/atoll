@@ -2,6 +2,7 @@ package node
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -119,7 +120,7 @@ func TestUsageSnapshotsShareMonotonicSequence(t *testing.T) {
 	}))
 	defer srv.Close()
 	n.masterURL = srv.URL
-	if err := n.heartbeatOnce(); err != nil {
+	if err := n.heartbeatOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	data := []byte("abc")
@@ -130,7 +131,7 @@ func TestUsageSnapshotsShareMonotonicSequence(t *testing.T) {
 	if err := n.reportStored(t.Context(), types.ObjectIntegrity{ObjectID: 8, Size: 3, ChecksumKnown: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.heartbeatOnce(); err != nil {
+	if err := n.heartbeatOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()

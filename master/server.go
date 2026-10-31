@@ -32,6 +32,7 @@ type Server struct {
 	writePlanner      *writePlanner
 	transferLinks     transferLinkStore
 	security          *serverSecurity
+	peers             *serverPeer
 	token             auth.Token  // 集群认证；空 = 兼容模式
 	adminToken        auth.Token  // 破坏性操作（/admin/gc）专用；空 = 回退用 token
 	scheme            string      // 出站访问节点的 scheme：http（默认）/https
@@ -104,7 +105,11 @@ func (s *Server) nodeHTTPClient(timeout time.Duration) *http.Client {
 		s.nodeTransport = auth.HTTPTransport(s.token, s.tlsCfg, nil)
 	})
 	if s.security != nil {
-		return &http.Client{Timeout: timeout, Transport: s.secureControlTransport(s.nodeTransport.Fallback), CheckRedirect: rejectRedirect}
+		var base http.RoundTripper = s.nodeTransport.Fallback
+		if s.peers != nil && s.peers.transport != nil {
+			base = s.peers.transport
+		}
+		return &http.Client{Timeout: timeout, Transport: s.secureControlTransport(base), CheckRedirect: rejectRedirect}
 	}
 	return &http.Client{Timeout: timeout, Transport: s.nodeTransport}
 }
@@ -709,10 +714,22 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
-	// v2-3a 幂等回放：commit 是最终写，响应丢失后重试必须返回原结果而非
-	// ErrNotStaging 误报（审计 F3）。回放发生在一切校验之前——原结果即真相。
+	binding, secureCommit := secureCommitFrom(r.Context())
+	if !secureCommit && req.OpID != "" && req.ChunkCount > 0 {
+		raw, _ := json.Marshal(req)
+		binding = meta.SecureCommitBinding{OpID: req.OpID, Fingerprint: meta.BodySHA256(raw)}
+	}
 	if req.OpID != "" && req.ChunkCount > 0 {
-		if rec, ok, err := s.store.GetOpResult(req.OpID); err == nil && ok {
+		rec, ok, err := s.store.GetOpResult(req.OpID)
+		if err != nil {
+			httpError(w, http.StatusServiceUnavailable, "operation unavailable")
+			return
+		}
+		if ok {
+			if rec.Kind != "commit" || rec.Fingerprint != "" && rec.Fingerprint != binding.Fingerprint {
+				httpError(w, http.StatusConflict, "operation ID conflict")
+				return
+			}
 			if err := s.store.EnsureDurable(); err != nil {
 				httpError(w, http.StatusServiceUnavailable, err.Error())
 				return
@@ -788,9 +805,8 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 				time.Sleep(200 * time.Millisecond)
 			}
 		}
-		binding, secureCommit := secureCommitFrom(r.Context())
 		var bindings []meta.SecureCommitBinding
-		if secureCommit {
+		if binding.OpID != "" {
 			bindings = append(bindings, binding)
 		}
 		in, old, hadOld, err := s.store.CommitStagingFile(req.InodeID, req.Name, req.Size, bindings...)
@@ -801,13 +817,6 @@ func (s *Server) handleCommitFile(w http.ResponseWriter, r *http.Request) {
 		// 旧版本（含 legacy 整对象与旧分块）回收；失败由 GC 两轮确认兜底。
 		if hadOld {
 			s.reclaimReplacedObject(old)
-		}
-		// v2-3a：记录 op 结果供重试回放（仅分块提交路径；legacy commit 天然幂等安全）。
-		if req.OpID != "" && !secureCommit {
-			if err := s.store.PutOpResult(req.OpID, "commit", in); err != nil {
-				httpErrorFromMeta(w, err)
-				return
-			}
 		}
 		writeJSON(w, http.StatusOK, in)
 		return

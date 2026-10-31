@@ -241,7 +241,7 @@ func TestAuditRenewAfterServerInvalidation(t *testing.T) {
 	base := fm.sessSeq
 	fm.mu.Unlock()
 
-	if err := n.heartbeatOnce(); err == nil {
+	if err := n.heartbeatOnce(context.Background()); err == nil {
 		t.Fatalf("heartbeat with invalidated token must fail with 401")
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -270,7 +270,7 @@ func TestAuditRenewAfterServerInvalidation(t *testing.T) {
 	if _, sess, _, _ := fm.counts(); sess != base+1 {
 		t.Fatalf("exactly one rebuild expected: sess=%d, want %d", sess, base+1)
 	}
-	if err := n.heartbeatOnce(); err != nil {
+	if err := n.heartbeatOnce(context.Background()); err != nil {
 		t.Fatalf("heartbeat must recover with renewed session: %v", err)
 	}
 }

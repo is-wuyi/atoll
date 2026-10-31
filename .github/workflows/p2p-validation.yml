@@ -1,0 +1,135 @@
+name: P2P Validation
+
+# Linux 对照只消费当前 ref，不写回仓库或部署；结果不覆盖历史失败记录。
+on:
+  push:
+    branches:
+      - 'ci/p2p-validation-*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p2p-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  p2p-validation:
+    name: linux race+vet (pre-acceptance)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # 只采集隔离测试的阶段事件和有界 goroutine 栈，不打包密钥或请求正文。
+      ATOLL_PEER_TRACE_DIR: ${{ runner.temp }}/p2p-diag
+      DIAG: ${{ runner.temp }}/p2p-diag
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false # 不持久化 git 凭据，无任何写回
+
+      - name: Setup Go 1.26.7
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.7' # 与本机 darwin/amd64 对照
+          cache: true
+
+      - name: Prepare diagnostics dir
+        run: mkdir -p "$DIAG"
+
+      - name: Record toolchain
+        run: |
+          {
+            go version
+            go env GOTOOLCHAIN GOOS GOARCH CGO_ENABLED
+          } 2>&1 | tee "$DIAG/toolchain.log"
+
+      # pipefail 保证 rc=真实 go 退出码；set +e 抵消 GitHub 默认 bash -e，
+      # 使管道失败后仍执行 .exit 落盘再 exit。
+      - name: Root go test -race (serial -p 1)
+        continue-on-error: true # 失败继续收集，最终由 Guard 统一 exit 1
+        run: |
+          set -o pipefail
+          set +e
+          go test -race -p 1 ./... -count=1 -timeout=20m 2>&1 | tee "$DIAG/root-test.log"
+          rc=$?
+          echo "$rc" > "$DIAG/root-test.exit"
+          exit "$rc"
+
+      - name: Root go vet
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          set +e
+          go vet ./... 2>&1 | tee "$DIAG/root-vet.log"
+          rc=$?
+          echo "$rc" > "$DIAG/root-vet.exit"
+          exit "$rc"
+
+      # 独立模块一：root ./... 不覆盖，需单独跑；无 build tag。
+      - name: Prototype peertransport go test -race
+        continue-on-error: true
+        working-directory: prototypes/peertransport
+        run: |
+          set -o pipefail
+          set +e
+          go test -race -p 1 ./... -count=1 -timeout=10m 2>&1 | tee "$DIAG/proto-peertransport.log"
+          rc=$?
+          echo "$rc" > "$DIAG/proto-peertransport.exit"
+          exit "$rc"
+
+      # 独立模块二：测试在 //go:build integration 后，必须显式 -tags integration，否则零测试空过。
+      - name: Prototype peertransport-production go test -race (-tags integration)
+        continue-on-error: true
+        working-directory: prototypes/peertransport-production
+        run: |
+          set -o pipefail
+          set +e
+          go test -race -p 1 -tags integration ./... -count=1 -timeout=10m 2>&1 | tee "$DIAG/proto-peertransport-production.log"
+          rc=$?
+          echo "$rc" > "$DIAG/proto-peertransport-production.exit"
+          exit "$rc"
+
+      # 仅单个已跟踪证据 json，不打包 repo/环境。
+      - name: Collect evidence json
+        if: always()
+        run: |
+          mkdir -p "$DIAG"
+          src="scripts/transferlab/evidence/2026-10-31-production-p2p-local.json"
+          if [ -f "$src" ]; then
+            cp "$src" "$DIAG/"
+          else
+            echo "evidence json 不在本 commit 中" > "$DIAG/evidence-json-missing.txt"
+          fi
+
+      # 无论成败上传；范围仅 diag 目录（trace/诊断 JSON/*.log/*.exit）。
+      - name: Upload diagnostics artifact (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2p-diag-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p2p-diag/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Guard
+        if: always()
+        run: |
+          total=0
+          for name in root-test root-vet proto-peertransport proto-peertransport-production; do
+            f="$DIAG/$name.exit"
+            if [ ! -f "$f" ]; then
+              echo "::error::$name: exit 码缺失（步骤未执行/被取消）"
+              total=1
+              continue
+            fi
+            rc="$(cat "$f")"
+            if [ "$rc" -eq 0 ]; then
+              echo "$name: PASS"
+            else
+              echo "::error::$name: exit=$rc（完整日志见 artifact 同名 .log）"
+              total=1
+            fi
+          done
+          exit "$total"

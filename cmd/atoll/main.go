@@ -29,6 +29,7 @@ import (
 	"atoll/node"
 	"atoll/pkg/auth"
 	"atoll/pkg/keyfile"
+	"atoll/pkg/peertransport"
 	"atoll/pkg/types"
 )
 
@@ -79,7 +80,17 @@ const usageText = `usage: atoll <command> [args]
     不再使用——会话只发 master，直连节点的读写自动换取短期票据并由节点逐请求
     在线核验（登出/禁用/移除成员对下一请求立即生效；内核页缓存与已开始请求除外）。
   设备入网邀请码经 ATOLL_NODE_INVITE 传给 node -secure；邀请码由平台管理员经
-    HTTP 接口创建（详见 SECURITY.md）。`
+  HTTP 接口创建（详见 SECURITY.md）。
+
+Peer 数据面 (P2P，默认关闭，需 -secure + 验证 TLS):
+  atoll master -p2p -p2p-origin https://<master>:<port> [-p2p-listen ...] [-p2p-announce ...] [-p2p-identity FILE] [-p2p-public-only]
+                    要求 -write-planning；origin 必须是本 master 的精确 HTTPS 地址
+  atoll node   -p2p [-p2p-listen ...] [-p2p-announce ...] [-p2p-identity FILE]
+                    （默认身份 data-dir/peer.key；须配 -tls-cert/-tls-key）
+  atoll put/get/mount -p2p [-p2p-listen ...] [-p2p-announce ...]
+                    （要求登录会话与 -space；用户客户端使用临时 peer 身份）
+  -p2p-listen 可重复/逗号分隔（ip4/ip6 tcp 或 quic-v1；默认 /ip4/0.0.0.0/tcp/0）；
+  -p2p-announce 覆盖自动发现的公布地址；-p2p-public-only 仅允许公共地址。`
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -161,6 +172,8 @@ func runMaster(args []string, stderr io.Writer) int {
 	writePlanning := fs.Bool("write-planning", false, "由调度器规划新写入（启用状态持久化，重启须保留此开关）")
 	writeReplicas := fs.Int("write-max-replicas", 8, "新写入复制布局搜索上限，不是固定副本数")
 	writeTransfer := fs.Bool("write-transfer-planning", false, "规划上传入口和节点复制路径（需 write-planning；启用状态持久化）")
+	p2p := addP2PFlags(fs)
+	p2pOrigin := fs.String("p2p-origin", "", "用于 peer 证明的精确 HTTPS Master origin（启用 -p2p 时必填）")
 	contentKeyFile := fs.String("content-key-file", "", "secure 内容主密钥文件（加密对象功能启用时必需；不进入数据库/WAL）")
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
 	adminToken := fs.String("admin-token", envDefault("ATOLL_ADMIN_TOKEN", ""), "破坏性操作(/admin/gc)专用 token（空 = 回退用集群 token）")
@@ -175,6 +188,10 @@ func runMaster(args []string, stderr io.Writer) int {
 	backupRetention := fs.Int("meta-backup-retention", 3, "保留最近 N 个元数据快照版本")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if err := validateMasterP2P(p2p, *p2pOrigin, *secure, *allowInsecure, *tlsSkip, *writePlanning); err != nil {
+		fmt.Fprintln(stderr, "atoll master:", err)
+		return 1
 	}
 	if *writeTransfer && !*writePlanning {
 		fmt.Fprintln(stderr, "write transfer planning requires -write-planning")
@@ -242,6 +259,13 @@ func runMaster(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "write transfer database requires -write-transfer-planning and intact configuration")
 		return 1
 	}
+	// 已持久化的 peer 目录配置必须继续以 -p2p 启动：缺 flag 时静默退回不提供
+	// peer 路由会让依赖 peer 的客户端 503，不如在启动早期 fail-stop。
+	if peerConfigured, err := store.PeerDirectoryEnabled(); err != nil || (peerConfigured && !p2p.enabledValue()) {
+		store.Close()
+		fmt.Fprintln(stderr, "peer directory database requires -p2p and intact configuration")
+		return 1
+	}
 	if *protectionFeedback {
 		if err := store.EnableProtectionFeedback(); err != nil {
 			store.Close()
@@ -274,6 +298,8 @@ func runMaster(args []string, stderr io.Writer) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	var peerPs *peerServe
+
 	scanner := master.NewScanner(store, *nodeMaxAge, *repairIntv, *gcIntv)
 	scanner.SetToken(auth.Token(*token))
 	scanner.SetTLS(outTLS)
@@ -287,6 +313,11 @@ func runMaster(args []string, stderr io.Writer) int {
 		if autonomy != nil {
 			autonomy.Wait()
 		}
+		// peer 循环必须先在 store 关闭前停止：runtime 的 resolver 闭包持有
+		// store 引用，关闭顺序反了会在关库后继续读。
+		if peerPs != nil {
+			_ = peerPs.Close()
+		}
 		store.Close()
 	}()
 
@@ -296,6 +327,10 @@ func runMaster(args []string, stderr io.Writer) int {
 	srv.SetToken(auth.Token(*token))
 	srv.SetAdminToken(auth.Token(*adminToken))
 	srv.SetTLS(outTLS)
+	// 元数据备份循环是否启动。只在 AttachSecureTransports 之后启动：备份通道
+	// 依赖安全模式就位（控制票据/加密 KEK/peer transport），提前启动会用旧的
+	// 明文 transport 或未加密密钥写进集群。
+	startMetaBackupLoop := false
 	if *secure {
 		if *contentKeyFile != "" {
 			kek, keyErr := keyfile.Load(*contentKeyFile)
@@ -313,10 +348,7 @@ func runMaster(args []string, stderr io.Writer) int {
 					fmt.Fprintln(stderr, "secure master metadata backup key:", err)
 					return 1
 				}
-				// KEK 已配置，备份循环从这里启动（首拍即加密；恢复公钥随
-				// 首次成功备份 pin，节点后入池由循环内重试补上）。
-				backup.StartLoop(ctx, 0)
-				log.Printf("元数据备份进集群已启用：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
+				startMetaBackupLoop = true
 			}
 		}
 		if err := srv.EnableSecurity(master.SecurityConfig{ControlToken: auth.Token(os.Getenv(*controlEnv)), AllowInsecure: *allowInsecure}); err != nil {
@@ -330,8 +362,7 @@ func runMaster(args []string, stderr io.Writer) int {
 	}
 	// 非 secure（兼容模式）配了种子：无 KEK 也允许明文备份进集群（legacy 行为）。
 	if !*secure && len(seeds) > 0 {
-		backup.StartLoop(ctx, 0)
-		log.Printf("元数据备份进集群已启用（兼容模式明文）：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
+		startMetaBackupLoop = true
 	}
 	if *writePlanning {
 		if err := srv.EnableWritePlanning(master.WritePlanningConfig{MaxReplicas: *writeReplicas, TransferPlanning: *writeTransfer}); err != nil {
@@ -342,10 +373,29 @@ func runMaster(args []string, stderr io.Writer) int {
 	if autonomy != nil {
 		srv.SetAutonomy(autonomy)
 	}
+	// peer 数据面必须在 EnableSecurity + EnableWritePlanning 之后、
+	// AttachSecureTransports 与任何后台 worker 之前装配：这样启动时路由和
+	// runtime handler 都已就位，绝不会出现 peer 路由 503 或空指针。
+	if p2p.enabledValue() {
+		peerPs, err = masterEnableP2P(ctx, p2p, *p2pOrigin, p2p.identityPath(*dbPath+".peer.key"), *tlsCert, *tlsKey, srv)
+		if err != nil {
+			store.Close()
+			fmt.Fprintln(stderr, "atoll master:", err)
+			return 1
+		}
+	}
 	if *secure {
 		srv.AttachSecureTransports()
 		srv.StartSecurity(ctx)
 		defer func() { cancel(); srv.WaitSecurity() }()
+	}
+	if startMetaBackupLoop {
+		backup.StartLoop(ctx, 0)
+		if *secure {
+			log.Printf("元数据备份进集群已启用（加密）：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
+		} else {
+			log.Printf("元数据备份进集群已启用（兼容模式明文）：种子 %v，快照周期 %v，K=%d", seeds, *backupIntv, *backupReplicas)
+		}
 	}
 	scanner.Start(ctx)
 	if autonomy != nil {
@@ -401,6 +451,7 @@ func runNode(args []string, stderr io.Writer) int {
 	uploadBPS := fs.Uint64("upload-bps", 0, "节点对象传输上行预算（bytes/s；0=未配置）")
 	downloadBPS := fs.Uint64("download-bps", 0, "节点对象传输下行预算（bytes/s；0=未配置）")
 	transferConcurrent := fs.Int("transfer-concurrency", 4, "节点每方向对象传输并发上限")
+	p2p := addP2PFlags(fs)
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token（空 = 兼容模式不校验）")
 	tlsCert := fs.String("tls-cert", "", "TLS 证书文件（配 -tls-key 后 node 走 https）")
 	tlsKey := fs.String("tls-key", "", "TLS 私钥文件")
@@ -408,6 +459,15 @@ func runNode(args []string, stderr io.Writer) int {
 	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	// 整个 runNode 共用这一个信号 ctx：SIGTERM 在装配任何阶段到达都会取消它，
+	// P2P 装配/注册随之中止，HTTP 由 watcher 统一 Shutdown。单一 Notify 源避免
+	// "启动中收到信号、后注册的 channel 错过"导致 serve 永不退出。
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if err := validateNodeP2P(p2p, *secureNode, *allowInsecureNode, *tlsSkip, *tlsCert, *tlsKey); err != nil {
+		fmt.Fprintln(stderr, "atoll node:", err)
+		return 1
 	}
 	outTLS, err := clientTLS(*tlsCA, *tlsSkip)
 	if err != nil {
@@ -435,6 +495,27 @@ func runNode(args []string, stderr io.Writer) int {
 	}
 	n.SetToken(auth.Token(*token))
 	n.SetTLS(outTLS)
+	// peer 数据面身份在 EnableSecurity 之前创建，使设备握手/注册可携带 peer
+	// 上下文；EnableP2P 本身要求先 EnableSecurity 且先于 Register。
+	var peerRT peertransport.RuntimeAPI
+	var peerPs *peerServe
+	if p2p.enabledValue() {
+		peerRT, err = nodePeerRuntime(ctx, p2p, p2p.identityPath(filepath.Join(*dataDir, "peer.key")))
+		if err != nil {
+			fmt.Fprintln(stderr, "atoll node:", err)
+			return 1
+		}
+		// runtime 创建成功这一刻起，任何退出路径都必须关闭它（信号 ctx 取消不会
+		// 自动关闭 libp2p host）。CloseP2P 对未启用的 P2P 是 no-op；peerPs.Close
+		// 内部再次 Close runtime（幂等）并等 Serve 返回。
+		defer func() {
+			_ = n.CloseP2P()
+			_ = peerRT.Close()
+			if peerPs != nil {
+				_ = peerPs.Close()
+			}
+		}()
+	}
 	if *secureNode {
 		if !*allowInsecureNode && (*tlsCert == "" || *tlsKey == "" || *tlsSkip) {
 			fmt.Fprintln(stderr, "secure node requires TLS certificates and certificate verification")
@@ -449,6 +530,12 @@ func runNode(args []string, stderr io.Writer) int {
 			return 1
 		}
 	}
+	if peerRT != nil {
+		if err := n.EnableP2P(ctx, peerRT); err != nil {
+			fmt.Fprintln(stderr, "atoll node:", err)
+			return 1
+		}
+	}
 	if err := n.InitUsedBytes(); err != nil {
 		fmt.Fprintf(stderr, "atoll node: %v\n", err)
 		return 1
@@ -457,21 +544,37 @@ func runNode(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "atoll node: 注册 master 失败: %v\n", err)
 		return 1
 	}
+	if peerRT != nil {
+		// 顺序契约：EnableP2P（Register 前）已由调用方完成；这里只 StartP2P
+		//（Register 成功后）并绑定 TLS peer 监听。
+		peerPs, err = nodeStartP2P(ctx, peerRT, n, *tlsCert, *tlsKey)
+		if err != nil {
+			fmt.Fprintln(stderr, "atoll node:", err)
+			return 1
+		}
+	}
 	httpSrv := &http.Server{
 		Addr:              *listen,
 		Handler:           n.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	watchDone := make(chan struct{})
 	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		defer close(watchDone)
+		<-ctx.Done() // NotifyContext 拦截了默认终止行为，必须显式退出
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
 		httpSrv.Shutdown(shutdownCtx)
 	}()
-	if err := serve(httpSrv, *tlsCert, *tlsKey, stderr, fmt.Sprintf("atoll node listening on %s (data=%s)", *listen, *dataDir)); err != nil {
-		fmt.Fprintf(stderr, "atoll node: %v\n", err)
+	serveErr := serve(httpSrv, *tlsCert, *tlsKey, stderr, fmt.Sprintf("atoll node listening on %s (data=%s)", *listen, *dataDir))
+	// serve 结束（无论成败）先取消 ctx 让 watcher 收尾，再 join，不留悬挂 goroutine。
+	cancel()
+	select {
+	case <-watchDone:
+	case <-time.After(6 * time.Second):
+	}
+	if serveErr != nil {
+		fmt.Fprintf(stderr, "atoll node: %v\n", serveErr)
 		return 1
 	}
 	return 0
@@ -495,8 +598,17 @@ func runMount(args []string, stderr io.Writer) int {
 	clientUploadBPS := fset.Uint64("upload-bps", 0, "挂载上传预算（bytes/s；传输计划模式需配置）")
 	clientDownloadBPS := fset.Uint64("download-bps", 0, "挂载下载预算（bytes/s；传输计划模式需配置）")
 	clientTransferConcurrency := fset.Int("transfer-concurrency", 2, "挂载上传并发上限")
+	p2p := addP2PFlags(fset)
 	if err := fset.Parse(args); err != nil {
 		return 2
+	}
+	if err := validateClientP2P(p2p, *masterURL, os.Getenv(*sessionEnv), *space, *allowInsecure, *tlsSkip); err != nil {
+		fmt.Fprintln(stderr, "atoll mount:", err)
+		return 1
+	}
+	if err := validateP2PFlags(p2p); err != nil {
+		fmt.Fprintln(stderr, "atoll mount:", err)
+		return 1
 	}
 	if fset.NArg() != 1 {
 		fmt.Fprintln(stderr, "用法: atoll mount [-cache 目录] <挂载点>")
@@ -517,6 +629,16 @@ func runMount(args []string, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "atoll mount:", err)
 		return 1
+	}
+	// peer 数据面先于 FUSE 挂载装配；挂载复用 c.ObjectTransport()，关闭路径统一。
+	var peerRT peertransport.RuntimeAPI
+	if p2p.enabledValue() {
+		peerRT, err = clientEnableP2P(context.Background(), p2p, c)
+		if err != nil {
+			fmt.Fprintln(stderr, "atoll mount:", err)
+			return 1
+		}
+		defer closeClientP2P(c, peerRT)
 	}
 	if *clientUploadBPS != 0 || *clientDownloadBPS != 0 {
 		if err := c.SetTransferBudget(types.TransferBudget{UploadBPS: *clientUploadBPS, DownloadBPS: *clientDownloadBPS, MaxConcurrent: *clientTransferConcurrency}); err != nil {
@@ -585,8 +707,13 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	token := fs.String("token", envDefault("ATOLL_TOKEN", ""), "集群认证 token")
 	tlsCA := fs.String("tls-ca", "", "校验服务端证书用的 CA（master 走 https 时）")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "跳过证书校验（自签名内网）")
+	p2p := addP2PFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if err := validateClientP2P(p2p, *masterURL, os.Getenv(*sessionEnv), *space, *allowInsecure, *tlsSkip); err != nil {
+		fmt.Fprintln(stderr, "atoll client:", err)
+		return 1
 	}
 	tlsCfg, err := clientTLS(*tlsCA, *tlsSkip)
 	if err != nil {
@@ -597,6 +724,16 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "atoll client:", err)
 		return 1
+	}
+	// peer 数据面在首次元数据/文件操作之前挂接；任何退出路径都关闭 peer 传输。
+	var peerRT peertransport.RuntimeAPI
+	if p2p.enabledValue() {
+		peerRT, err = clientEnableP2P(context.Background(), p2p, c)
+		if err != nil {
+			fmt.Fprintln(stderr, "atoll client:", err)
+			return 1
+		}
+		defer closeClientP2P(c, peerRT)
 	}
 	if *clientUploadBPS != 0 || *clientDownloadBPS != 0 {
 		if err := c.SetTransferBudget(types.TransferBudget{UploadBPS: *clientUploadBPS, DownloadBPS: *clientDownloadBPS, MaxConcurrent: *clientTransferConcurrency}); err != nil {

@@ -22,6 +22,7 @@ import (
 	"atoll/pkg/access"
 	"atoll/pkg/auth"
 	"atoll/pkg/contentcrypto"
+	"atoll/pkg/peerauth"
 	"atoll/pkg/types"
 )
 
@@ -100,7 +101,7 @@ func (s *Server) securityHandler(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if s.servePublicSecurity(w, r) {
+		if s.servePublicSecurity(w, r) || s.servePeers(w, r) {
 			return
 		}
 		token := bearer(r)
@@ -110,7 +111,7 @@ func (s *Server) securityHandler(next http.Handler) http.Handler {
 				return
 			}
 			var req access.CheckRequest
-			if decodeJSON(w, r, &req) != nil {
+			if peerauth.DecodeJSON(r.Body, &req) != nil {
 				httpError(w, http.StatusBadRequest, "invalid access check")
 				return
 			}
@@ -123,8 +124,12 @@ func (s *Server) securityHandler(next http.Handler) http.Handler {
 			return
 		}
 		if r.URL.Path == "/security/tickets" && r.Method == http.MethodPost {
+			if constantToken(token, s.security.config.ControlToken) || constantToken(token, s.adminToken) {
+				httpError(w, http.StatusForbidden, "control credential is not a user session")
+				return
+			}
 			var req access.TicketRequest
-			if decodeJSON(w, r, &req) != nil {
+			if peerauth.DecodeJSON(r.Body, &req) != nil {
 				httpError(w, http.StatusBadRequest, "invalid ticket request")
 				return
 			}
@@ -246,7 +251,7 @@ func (s *Server) servePublicSecurity(w http.ResponseWriter, r *http.Request) boo
 		writeJSON(w, http.StatusCreated, map[string]any{"user": user, "space": publicSpace(space)})
 	case "POST /security/devices/challenge":
 		var req access.DeviceChallengeRequest
-		if decodeJSON(w, r, &req) != nil {
+		if peerauth.DecodeJSON(r.Body, &req) != nil {
 			httpError(w, http.StatusBadRequest, "invalid device challenge")
 			break
 		}
@@ -258,7 +263,7 @@ func (s *Server) servePublicSecurity(w http.ResponseWriter, r *http.Request) boo
 		writeJSON(w, http.StatusOK, out)
 	case "POST /security/devices/session":
 		var req access.DeviceLoginRequest
-		if decodeJSON(w, r, &req) != nil {
+		if peerauth.DecodeJSON(r.Body, &req) != nil {
 			httpError(w, http.StatusBadRequest, "invalid device proof")
 			break
 		}
@@ -897,6 +902,12 @@ func (s *Server) secureControlTransport(base http.RoundTripper) http.RoundTrippe
 			}
 			req.BodyHash = meta.BodySHA256(raw)
 		}
+		if s.peers != nil {
+			if s.peers.runtime == nil {
+				return errors.New("peer runtime is unavailable")
+			}
+			req.SourcePeerID = s.peers.runtime.PeerID()
+		}
 		ticket, err := s.store.IssueControlTicket(req, time.Now())
 		if err != nil {
 			return err
@@ -910,7 +921,10 @@ func (s *Server) AttachSecureTransports() {
 	if s.security == nil {
 		return
 	}
-	base := auth.HTTPTransport("", s.tlsCfg, nil).Fallback
+	var base http.RoundTripper = auth.HTTPTransport("", s.tlsCfg, nil).Fallback
+	if s.peers != nil && s.peers.transport != nil {
+		base = s.peers.transport
+	}
 	if s.scanner != nil {
 		s.scanner.scheme = s.nodeScheme()
 		s.scanner.httpClient.Transport = s.secureControlTransport(base)
@@ -939,6 +953,7 @@ func (s *Server) AttachSecureTransports() {
 func rejectRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 func (s *Server) StartSecurity(ctx context.Context) {
+	s.StartPeers(ctx)
 	if s.security == nil {
 		return
 	}
@@ -963,6 +978,7 @@ func (s *Server) StartSecurity(ctx context.Context) {
 }
 
 func (s *Server) WaitSecurity() {
+	s.WaitPeers()
 	if s.security != nil {
 		s.security.wg.Wait()
 	}

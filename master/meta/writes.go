@@ -61,6 +61,10 @@ func writeOpKey(actor WriteActor, kind, op string) []byte {
 func writePlanningEnabledTx(tx *bolt.Tx) (bool, error) {
 	b := tx.Bucket(bucketWrites)
 	marker := tx.Bucket(bucketMeta).Get(keyWriteInitialized)
+	peerInitialized := tx.Bucket(bucketMeta).Get(keyPeerInitialized) != nil || tx.Bucket(bucketSecurity).Get(keyPeerConfig) != nil
+	if peerInitialized && (b == nil || b.Get(keyWriteConfig) == nil) {
+		return false, ErrPeerConflict
+	}
 	if b == nil {
 		if marker != nil {
 			return false, errors.New("write planning configuration missing")
@@ -79,8 +83,13 @@ func writePlanningEnabledTx(tx *bolt.Tx) (bool, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return false, err
 	}
-	if (cfg.Version < 1 || cfg.Version > 3) || cfg.EnabledAt.IsZero() || !bytes.Equal(marker, []byte{1}) {
+	if (cfg.Version < 1 || cfg.Version > 4) || cfg.EnabledAt.IsZero() || !bytes.Equal(marker, []byte{1}) {
 		return false, errors.New("invalid write planning configuration")
+	}
+	if cfg.Version == 4 || peerInitialized {
+		if _, enabled, err := peerConfigTx(tx); err != nil || !enabled {
+			return false, ErrPeerConflict
+		}
 	}
 	return true, nil
 }

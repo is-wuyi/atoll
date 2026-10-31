@@ -15,8 +15,10 @@ import (
 	"sync"
 	"time"
 
+	"atoll/internal/peertrace"
 	"atoll/internal/scheduler"
 	"atoll/master/meta"
+	"atoll/pkg/peerauth"
 	"atoll/pkg/types"
 )
 
@@ -99,11 +101,21 @@ func (s *Server) writePlanningGuard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		peertrace.Mark(r.Context(), "write_config_start")
 		enabled, err := s.store.WritePlanningEnabled()
+		peertrace.Mark(r.Context(), "write_config_done")
 		transferEnabled, transferErr := s.store.TransferPlanningEnabled()
+		peertrace.Mark(r.Context(), "transfer_config_done")
 		configuredTransfer := s.writePlanner != nil && s.writePlanner.config.TransferPlanning
 		if err != nil || transferErr != nil || enabled != (s.writePlanner != nil) || transferEnabled != configuredTransfer {
 			writePlanningError(w, http.StatusServiceUnavailable, types.WritePlanRequired, "write planning state is unavailable or does not match server configuration")
+			return
+		}
+		peerEnabled, peerErr := s.store.PeerDirectoryEnabled()
+		peertrace.Mark(r.Context(), "peer_config_done")
+		configuredPeer := s.peers != nil && s.peers.runtime != nil
+		if peerErr != nil || peerEnabled != configuredPeer {
+			writePlanningError(w, http.StatusServiceUnavailable, types.WritePlanRequired, "peer discovery state is unavailable or does not match server configuration")
 			return
 		}
 		if r.Method == http.MethodGet && r.URL.Path == "/capabilities" {
@@ -114,6 +126,9 @@ func (s *Server) writePlanningGuard(next http.Handler) http.Handler {
 			features := []string{types.ObjectIDFeature, types.WritePlanFeature, types.WriteRecoveryFeature}
 			if transferEnabled {
 				features = append(features, types.WriteTransferFeature)
+			}
+			if peerEnabled {
+				features = append(features, peerauth.Feature)
 			}
 			writeJSON(w, http.StatusOK, types.Capabilities{Features: features, WritePlanning: enabled})
 			return
@@ -552,6 +567,18 @@ func (s *Server) newWriteSnapshot(ctx context.Context, snapshot meta.AutonomySna
 	if len(nodes) > 256 {
 		return world, errors.New("write planning node limit exceeded")
 	}
+	peerNodes := make(map[uint64]string)
+	if s.peers != nil {
+		directory, err := s.store.PeerDirectory(now, s.nodeMaxAge)
+		if err != nil {
+			return world, err
+		}
+		for _, endpoint := range directory.Endpoints {
+			if endpoint.Role == peerauth.RoleNode {
+				peerNodes[endpoint.NodeID] = endpoint.Addr
+			}
+		}
+	}
 	world.Nodes = make([]scheduler.Node, len(nodes))
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -573,6 +600,9 @@ func (s *Server) newWriteSnapshot(ctx context.Context, snapshot meta.AutonomySna
 			if _, err := s.store.DeviceByNode(node.ID); err != nil {
 				continue
 			}
+		}
+		if s.peers != nil && peerNodes[node.ID] != node.Addr {
+			continue
 		}
 		if s.writePlanner.config.TransferPlanning {
 			world.Nodes[i].Online = true
