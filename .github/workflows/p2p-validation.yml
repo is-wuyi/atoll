@@ -19,10 +19,6 @@ jobs:
     name: linux race+vet (pre-acceptance)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      # 只采集隔离测试的阶段事件和有界 goroutine 栈，不打包密钥或请求正文。
-      ATOLL_PEER_TRACE_DIR: ${{ runner.temp }}/p2p-diag
-      DIAG: ${{ runner.temp }}/p2p-diag
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -36,7 +32,9 @@ jobs:
           cache: true
 
       - name: Prepare diagnostics dir
-        run: mkdir -p "$DIAG"
+        run: |
+          mkdir -p "$RUNNER_TEMP/p2p-diag"
+          printf 'DIAG=%s\nATOLL_PEER_TRACE_DIR=%s\n' "$RUNNER_TEMP/p2p-diag" "$RUNNER_TEMP/p2p-diag" >> "$GITHUB_ENV"
 
       - name: Record toolchain
         run: |
