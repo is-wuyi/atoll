@@ -1,0 +1,146 @@
+{
+  "date": "2026-11-01",
+  "batch": "production P2P isolated cross-NAS acceptance",
+  "status": "passed_with_environment_failures",
+  "committed": false,
+  "deployed": false,
+  "scope": "isolated secure Master/nodes on EasyTier overlay; no public NAT/WAN proof; no production replacement",
+  "source_commit": "b61167e691ed9ec95544cb17c46bb1524bcc7c23",
+  "binary_sha256": {
+    "linux_amd64": "2cb40bc051a6335597016a65898517c41607985c5b5642b33e9ac70b9434586a",
+    "darwin_amd64": "44701fcb5dd8a5a0fb07ee1098949a82b65470f1f43a8a7fd251a603b4592c7f"
+  },
+  "isolation": {
+    "master": "26666.et.net:29570 (HTTPS), peer 29573",
+    "nodes": {
+      "28425": "28425.et.net:29571, peer 29572",
+      "27472": "27472.et.net:29571, peer 29572 then 29574 after restart",
+      "29038": "29038.et.net:29571, peer 29572"
+    },
+    "offline_not_touched": [
+      "27119.et.net",
+      "27348.et.net"
+    ],
+    "owner_json_verified_before_stop": true,
+    "process_identity_checks": [
+      "/proc/PID/cwd equals isolated dir",
+      "uid 0 on master / 1026 on NAS"
+    ],
+    "firewall": "runtime rules only; permanent rule count 0 before and after",
+    "firewall_ttl_incident": {
+      "ttl_seconds": 7200,
+      "expired_at": "2026-10-31T23:25+08:00",
+      "effect": "all node heartbeats failed and master marked all nodes dead in the same minute",
+      "resolution": "runtime rules re-added with ttl 21600s; not a product defect and not a production change"
+    },
+    "production_health_before_and_after": {
+      "master_9420": 200,
+      "28425_9421": 200,
+      "27472_9421": 200,
+      "29038_9421": "000 (production node was already not running before this batch)"
+    },
+    "cleanup": {
+      "isolated_dirs_removed": true,
+      "isolated_processes_remaining": 0,
+      "firewall_runtime_rules_remaining": 0
+    }
+  },
+  "results": [
+    {
+      "name": "authorized discovery",
+      "result": "pass",
+      "evidence": "directory returned node endpoints with real PeerIDs, /dns4 addresses, binding revision and 2-minute lease; infrastructure relay published"
+    },
+    {
+      "name": "AEAD planned write 8 MiB (f1)",
+      "result": "pass",
+      "upload_seconds": 14,
+      "chunk": {
+        "encoding": "aead-record-v1",
+        "size": 8392832,
+        "replicas": [
+          2
+        ],
+        "done": [
+          2
+        ]
+      },
+      "ciphertext_on_node": {
+        "magic": "ATCR",
+        "size": 8392832,
+        "expected_plaintext": 8388608,
+        "overhead_bytes": 4224
+      }
+    },
+    {
+      "name": "read back f1",
+      "result": "pass_after_retries",
+      "attempts": "1x 503 fail-closed (master DNS timeout), 1x connection failure, 1x success in 7s",
+      "sha256_match": true
+    },
+    {
+      "name": "direct path observation",
+      "result": "observed",
+      "detail": "during f2 upload node 29038 held an established peer connection from 10.126.126.5:58147 (the Mac client's EasyTier address), i.e. non-circuit",
+      "cannot_prove": "non-overlay"
+    },
+    {
+      "name": "f2 single-replica availability",
+      "result": "failed_while_replica_node_flapped",
+      "detail": "chunk replicas [4] done [4] on 29038; that node repeatedly failed heartbeats to master, and read attempts failed with no usable connection; file was later served when the node recovered"
+    },
+    {
+      "name": "multi-replica f3 with security tier",
+      "result": "pass",
+      "upload_seconds": 16,
+      "replicas": [
+        2,
+        3
+      ],
+      "done": [
+        3,
+        2
+      ],
+      "get_seconds": 7,
+      "sha256_match": true
+    },
+    {
+      "name": "single-replica loss after stopping node 3",
+      "result": "pass",
+      "get_seconds": 5,
+      "detail": "node 27472 isolated process stopped; f3 still read from node 2 with identical bytes"
+    },
+    {
+      "name": "node restart same identity new peer port",
+      "result": "pass",
+      "detail": "node 3 reused persistent device and peer keys; directory kept peer 12D3KooWNE6rKu2jZt6uTABeuUsQtdeLRYPFdBeJvYp1fD5Y9JJ5 and changed address /dns4/27472.et.net/tcp/29572 -> tcp/29574; get 4s, identical bytes"
+    },
+    {
+      "name": "relay-forced fallback",
+      "result": "partial",
+      "detail": "node 2 announced a closed port so direct dial failed; master relay connection bytes_received grew from 2138 to 6327194 during one read (~6.3 MB); attempts were fail(stream reset), fail(timeout 49s), fail(timeout 50s), success(41s, sha256 match); then announce restored and direct read took 5s"
+    },
+    {
+      "name": "scheduler refuses infeasible layout",
+      "result": "fail_closed_observed",
+      "detail": "security tier PUT returned 422 no feasible write layout twice while only 1-2 nodes were alive; retry with 2+ alive nodes succeeded"
+    },
+    {
+      "name": "master directory 401/403 negative",
+      "result": "pass",
+      "detail": "unauthenticated /peers/directory returned 401; user session without X-Atoll-Space returned 403 space required"
+    }
+  ],
+  "logs": {
+    "master": "32d7134983cd0da61a4b5b0cdd2defdde8ae3da2a59db55dc1d909168fadcf55",
+    "28425": "8a0a501aaed4419f75194946720a99fabd56f2bc22991979417c1a1717174fcb",
+    "27472": "b183fec25c718326d55ae55664ca27b73d3bb044bed3cc92e0017a7266aa8f83",
+    "29038": "d4b5206f28b635536ef0a2fff48afb02988a3809ed4fe976e7b9ef7b185713e5"
+  },
+  "unverified": [
+    "public non-overlay direct connectivity and NAT hole punching",
+    "relay stability under sustained transfer in this environment",
+    "cross-NAS production deployment or main merge"
+  ],
+  "private_archive_sha256": "8cfe75a9fa806bfc820c1732cc6e5bd171030173cdcbcaa1c546000f9757e272"
+}
