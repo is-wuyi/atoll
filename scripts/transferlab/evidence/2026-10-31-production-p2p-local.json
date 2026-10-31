@@ -2,15 +2,15 @@
   "date": "2026-10-31",
   "baseline": "cab4ed6299f13ad91b651767460fd64e10193f77",
   "branch": "feat/admin-console",
-  "status": "implementation_complete_stability_gate_blocked",
-  "committed": false,
+  "status": "local_and_linux_ci_accepted",
+  "committed": true,
   "deployed": false,
   "scope": "local production P2P wiring; no public WAN, NAS, or kernel FUSE acceptance",
   "go": "go1.26.7 darwin/amd64",
   "root_go_requirement": "1.26.0",
-  "source_manifest_sha256": "59dc9b738d5b5d45d5e9acde677636e3feda8aaf60ec2a90e19ef4bdd28f5c31",
-  "private_evidence_sha256": "31991a982e6629c02607d8265d2ace437e4c4cdf5ca94a98d97e6c3a8ec0b93e",
-  "final_root_run": {
+  "stage_one_source_manifest_sha256": "59dc9b738d5b5d45d5e9acde677636e3feda8aaf60ec2a90e19ef4bdd28f5c31",
+  "stage_one_private_evidence_sha256": "31991a982e6629c02607d8265d2ace437e4c4cdf5ca94a98d97e6c3a8ec0b93e",
+  "stage_one_final_root_run": {
     "command": "GOMAXPROCS=2 go test -race -p 1 ./... -count=1 -timeout=1200s",
     "exit_code": 1,
     "data_race_reported": false,
@@ -38,7 +38,7 @@
     ],
     "log_sha256": "dee6eab20f904a97a8905a6fbca99c8a7683177c9627ae80b635c329a39373f4"
   },
-  "verified_results": [
+  "stage_one_verified_results": [
     {"scope": "final complete integration/peer race", "exit_code": 0, "seconds": 233.834, "log_sha256": "1d46139392939399aa718205242b57d3b3d677716cef180676d72457a0ce56ba"},
     {"scope": "final node complete race", "exit_code": 0, "seconds": 52.949},
     {"scope": "final legacy concurrent upload, checksum failover, multichunk commit race count=3", "exit_code": 0, "seconds": 17.169},
@@ -53,7 +53,7 @@
     {"scope": "independent prototype-production module with integration tag", "exit_code": 0},
     {"scope": "final source go vet ./...", "exit_code": 0}
   ],
-  "builds": {
+  "stage_one_builds": {
     "linux_amd64_cgo_disabled": "7b643e05286ddad3caf15c9780e303566fbfb81ff1f58f55f347a5f82ce2d2d4",
     "darwin_amd64_cgo_disabled": "fd03b3382654ed79489236771fe7fcc08e6fb0c6df53847aa8f25898e59a4793"
   },
@@ -74,7 +74,7 @@
     "production_timeouts_relaxed": false
   },
   "stage_two": {
-    "status": "linux_preacceptance_pending",
+    "status": "local_and_linux_ci_accepted",
     "earlier_manifest_and_build_hashes_apply_only_to_stage_one": true,
     "fault_test": {
       "mechanism": "shared in-flight handler barrier with ErrAbortHandler; healthy nodes keep default timeout",
@@ -105,14 +105,65 @@
     "linux_ci": {
       "workflow": ".github/workflows/p2p-validation.yml",
       "trigger_branch_pattern": "ci/p2p-validation-*",
-      "status": "not_started",
-      "go": "1.26.7",
-      "checks": ["root race", "root vet", "prototype race", "prototype-production integration race"],
+      "status": "success",
+      "go": "go1.26.7 linux/amd64",
+      "cgo_enabled": true,
+      "run_id": 41182185516,
+      "run_url": "https://github.com/is-wuyi/atoll/actions/runs/41182185516",
+      "tested_commit": "054a2d5ff9a64c02e5e8b5f095bc6fd341691a1f",
+      "artifact_name": "p2p-diag-41182185516-1",
+      "artifact_downloaded_and_exit_files_reviewed": true,
+      "checks": {
+        "root_race": {"exit_code": 0, "step_seconds": 590, "tested_packages": 22, "packages_without_tests": 1, "integration_peer_seconds": 79.176, "log_sha256": "e5a55d574d1e5207943119df7d144b46b6e78a12735797237c9b6300b98c12b1"},
+        "root_vet": {"exit_code": 0, "step_seconds": 6},
+        "prototype_race": {"exit_code": 0, "step_seconds": 38},
+        "prototype_production_integration_race": {"exit_code": 0, "step_seconds": 8}
+      },
+      "guard_passed": true,
+      "data_race_reported": false,
+      "short_mode": false,
+      "diagnostics": {"reports": 10, "directory_client_completed": 38, "directory_server_completed": 38, "directory_client_max_ms": 2.281857, "directory_server_max_ms": 1.797362, "stack_samples": 0, "directory_errors": 0},
+      "earlier_runs": [
+        {"run_id": 41180940609, "commit": "ddba3c21ae45d9b6ca7fcdecb8ae22027d3cc671", "conclusion": "failure", "tests_executed": false, "reason": "runner context is not permitted in job-level env; fixed by step initialization through GITHUB_ENV"},
+        {"run_id": 41181286044, "commit": "0bed2a0ef5fe40c5776a167f5a493b6a28214fb0", "conclusion": "failure", "root_test_exit": 1, "only_failed_test": "TestApplyDNSOverrideProxyCache", "observed_dns_flags": "0x0120", "reason": "resolver trust-ad query intentionally bypasses proxy cache; platform assumption in test corrected", "other_three_checks_exit": 0, "integration_peer_seconds": 69.905}
+      ],
       "deploys": false
+    },
+    "darwin_root": {
+      "source_commit": "ddba3c21ae45d9b6ca7fcdecb8ae22027d3cc671",
+      "command": "GOMAXPROCS=2 ATOLL_PEER_TRACE_DIR=<isolated-diagnostics-dir> go test -race -p 1 ./... -count=1 -timeout=20m",
+      "exit_code": 0,
+      "seconds": 1143.411,
+      "log_sha256": "5bb1f70c6b80806c8917ceed4d7e7162b1ca6905750b229f9232dff7392ad3a3",
+      "integration_peer_seconds": 221.063,
+      "data_race_reported": false,
+      "diagnostics": {"reports": 10, "directory_client_completed": 37, "directory_server_completed": 37, "directory_client_max_ms": 6.182152, "directory_server_max_ms": 2.390727, "stack_samples": 0, "directory_errors": 0},
+      "final_dns_test_increment_package_race": {"exit_code": 0, "seconds": 7.816},
+      "final_root_vet_exit": 0
+    },
+    "dns_contract_regression": {
+      "production_dns_behavior_changed": false,
+      "system_dns_changed": false,
+      "race_count_3": {"exit_code": 0, "seconds": 6.169},
+      "ad_cache_mutation": {"exit_code": 1, "expected_failure": "authentic-data upstream queries got 1 want 3", "production_source_unchanged": true}
+    },
+    "source_equivalence": {
+      "build_and_darwin_root_commit": "ddba3c21ae45d9b6ca7fcdecb8ae22027d3cc671",
+      "linux_ci_commit": "054a2d5ff9a64c02e5e8b5f095bc6fd341691a1f",
+      "production_go_and_root_modules_files": 340,
+      "production_go_and_root_modules_sha256": "85997a7b482682554ad7d8ddbbd06b949c81490daf5e2e7f01ac1a2c216dafab",
+      "differences": [".github/workflows/p2p-validation.yml", "cmd/transferlab/config_test.go", "cmd/transferlab/dnsproxy_contract_test.go"],
+      "same_production_go_and_root_modules": true
+    },
+    "builds": {
+      "source_commit": "ddba3c21ae45d9b6ca7fcdecb8ae22027d3cc671",
+      "cgo_enabled": false,
+      "linux_amd64": {"exit_code": 0, "sha256": "f4891a6f51fe601a778f6ca6051dae742fb43178ed35d7be1b81a489bd5c6543"},
+      "darwin_amd64": {"exit_code": 0, "sha256": "44d49d0427d1a831e2b32929300875b2a31f7be7f4a0d622cd879583b9dabce0"}
     }
   },
   "unverified": [
-    "stable all-root race pass in this environment",
+    "root cause of historical intermittent directory initialization timeout",
     "public non-overlay direct connectivity and NAT hole punching",
     "cross-NAS production P2P fault injection",
     "kernel FUSE mount",
