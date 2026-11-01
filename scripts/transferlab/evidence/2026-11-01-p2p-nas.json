@@ -1,8 +1,8 @@
 {
   "date": "2026-11-01",
   "batch": "production P2P isolated cross-NAS acceptance",
-  "status": "passed_with_environment_failures",
-  "committed": false,
+  "status": "partial_content_acceptance_path_verification_incomplete",
+  "committed": true,
   "deployed": false,
   "scope": "isolated secure Master/nodes on EasyTier overlay; no public NAT/WAN proof; no production replacement",
   "source_commit": "b61167e691ed9ec95544cb17c46bb1524bcc7c23",
@@ -75,19 +75,21 @@
     {
       "name": "read back f1",
       "result": "pass_after_retries",
-      "attempts": "1x 503 fail-closed (master DNS timeout), 1x connection failure, 1x success in 7s",
+      "attempts": "1x 503 fail-closed (master DNS timeout), 2x connection failures, then success in 7s",
       "sha256_match": true
     },
     {
-      "name": "direct path observation",
-      "result": "observed",
-      "detail": "during f2 upload node 29038 held an established peer connection from 10.126.126.5:58147 (the Mac client's EasyTier address), i.e. non-circuit",
-      "cannot_prove": "non-overlay"
+      "name": "peer TCP connection observation",
+      "result": "connection_observed_not_request_correlated",
+      "detail": "while sampling GET f2, node 29038 peer port 29572 had a TCP connection from 10.126.126.5:58147, the Mac EasyTier address; no HTTP stream or payload was correlated to that connection",
+      "cannot_prove": ["successful upload path", "request path", "non-overlay"],
+      "source_peer_or_stream_correlated": false
     },
     {
       "name": "f2 single-replica availability",
       "result": "failed_while_replica_node_flapped",
-      "detail": "chunk replicas [4] done [4] on 29038; that node repeatedly failed heartbeats to master, and read attempts failed with no usable connection; file was later served when the node recovered"
+      "detail": "chunk replicas [4] done [4] on 29038; heartbeat failures and a no-usable-connection GET were recorded, with zero output bytes; no successful f2 readback was captured",
+      "successful_readback_verified": false
     },
     {
       "name": "multi-replica f3 with security tier",
@@ -113,17 +115,23 @@
     {
       "name": "node restart same identity new peer port",
       "result": "pass",
-      "detail": "node 3 reused persistent device and peer keys; directory kept peer 12D3KooWNE6rKu2jZt6uTABeuUsQtdeLRYPFdBeJvYp1fD5Y9JJ5 and changed address /dns4/27472.et.net/tcp/29572 -> tcp/29574; get 4s, identical bytes"
+      "detail": "node 3 reused persistent device and peer keys; directory kept peer 12D3KooWNE6rKu2jZt6uTABeuUsQtdeLRYPFdBeJvYp1fD5Y9JJ5 and changed address /dns4/27472.et.net/tcp/29572 -> tcp/29574; a new client read the multi-replica file in 4s with identical bytes, but the serving node was not correlated",
+      "same_peer_and_changed_endpoint_verified": true,
+      "same_client_stale_cache_recovery_verified": false,
+      "read_from_restarted_node_verified": false
     },
     {
-      "name": "relay-forced fallback",
-      "result": "partial",
-      "detail": "node 2 announced a closed port so direct dial failed; master relay connection bytes_received grew from 2138 to 6327194 during one read (~6.3 MB); attempts were fail(stream reset), fail(timeout 49s), fail(timeout 50s), success(41s, sha256 match); then announce restored and direct read took 5s"
+      "name": "relay fallback attempt with later content readback",
+      "result": "partial_not_strict_path_acceptance",
+      "detail": "node 2 announced a closed port; in one failed GET window the center-to-node TCP bytes_received grew from 2138 to 6327194. GET outcomes were stream reset, timeout 49s, timeout 50s, then success 41s with matching hash. No actual stream path or required-circuit assertion correlated the successful read; restored-address GET completed in 5s without path evidence",
+      "successful_request_path_verified": false,
+      "node_failure_cause_verified": false
     },
     {
       "name": "scheduler refuses infeasible layout",
       "result": "fail_closed_observed",
-      "detail": "security tier PUT returned 422 no feasible write layout twice while only 1-2 nodes were alive; retry with 2+ alive nodes succeeded"
+      "detail": "a recovery request returned 422 no feasible write layout; subsequent separate uploads obtained two completed replicas. The failed plan and full feasibility inputs were not captured, so an online-node-count cause is unproven",
+      "root_cause_verified": false
     },
     {
       "name": "master directory 401/403 negative",
@@ -136,6 +144,36 @@
     "28425": "8a0a501aaed4419f75194946720a99fabd56f2bc22991979417c1a1717174fcb",
     "27472": "b183fec25c718326d55ae55664ca27b73d3bb044bed3cc92e0017a7266aa8f83",
     "29038": "d4b5206f28b635536ef0a2fff48afb02988a3809ed4fe976e7b9ef7b185713e5"
+  },
+  "evidence_review_20261101": {
+    "status": "content_results_retained_path_and_failure_attributions_narrowed",
+    "nas_churn_is_expected": true,
+    "manual_nat_changes_required": false,
+    "f2_successful_readback_removed": true,
+    "f1_failed_get_count_before_success": 3,
+    "aead_record_overhead_bytes": 33,
+    "aead_8m_record_count": 128,
+    "aead_8m_overhead_bytes": 4224,
+    "second_round_fixed_overlay_and_lan_announce_is_not_public_acceptance": true,
+    "autonat_callback_gate_diagnostic": {
+      "scope": "loopback-only private Go overlay; public test AllowPrivateAddrs; production and module cache unchanged",
+      "strict_runtime_gate_denied_exact_temporary_dialer": true,
+      "strict_gate_observed_status": "E_DIAL_BACK_ERROR",
+      "same_endpoint_exact_callback_identity_control_status": "OK",
+      "race_count": 3,
+      "exit_code": 0,
+      "seconds": 1.648,
+      "does_not_prove_all_dcutr_failed": true
+    },
+    "second_round_process_closeout": {
+      "stopped_after_exact_owner_process_identity_check": 5,
+      "private_logs_and_master_databases_saved_before_removal": true,
+      "isolated_directories_removed_after_exact_owner_and_inactive_process_check": 8,
+      "center_mesh_ssh_failed_once_public_ssh_cleanup_succeeded": true,
+      "runtime_tcp_rules_removed": [29570, 29573, 29580, 29583, 29590, 29593],
+      "permanent_rules_added": false,
+      "nas_dns_change_executed": false
+    }
   },
   "unverified": [
     "public non-overlay direct connectivity and NAT hole punching",
