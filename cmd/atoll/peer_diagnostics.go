@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"atoll/client"
+	"atoll/pkg/peerauth"
 	"atoll/pkg/peerhttp"
 	"atoll/pkg/peertransport"
 )
@@ -294,7 +295,7 @@ func (s *peerDiagnosticsSink) flush(runtimeCloseOK bool) error {
 }
 
 // diagnosticRuntime 包住真实 runtime：事件回调已接线，Close 先关 runtime
-//（join 全部事件源）再一次性落盘。Close 幂等：重复调用返回首次结果，绝不二次
+// （join 全部事件源）再一次性落盘。Close 幂等：重复调用返回首次结果，绝不二次
 // flush。runtime 关停错误与落盘错误分开保存：落盘错误决定 CLI 退出码，二者
 // 经 Close 的返回值 join 上抛，绝不互相掩盖。
 type diagnosticRuntime struct {
@@ -387,9 +388,10 @@ type peerDiagnosticsRoundTripper struct {
 // 控制面。
 func newPeerDiagnosticsRoundTripper(inner http.RoundTripper, masterURL string, reporter *peerhttp.Reporter) *peerDiagnosticsRoundTripper {
 	rt := &peerDiagnosticsRoundTripper{inner: inner, reporter: reporter}
-	if u, err := url.Parse(masterURL); err == nil && u.Host != "" {
-		rt.masterScheme = strings.ToLower(u.Scheme)
-		rt.masterHost = strings.ToLower(u.Host)
+	if origin, err := peerauth.CanonicalOrigin(masterURL); err == nil {
+		u, _ := url.Parse(origin)
+		rt.masterScheme = u.Scheme
+		rt.masterHost = u.Host
 	}
 	return rt
 }
@@ -411,8 +413,11 @@ func (d *peerDiagnosticsRoundTripper) isMaster(req *http.Request) bool {
 	if req == nil || req.URL == nil || d.masterHost == "" {
 		return true
 	}
-	return strings.EqualFold(req.URL.Host, d.masterHost) &&
-		strings.ToLower(req.URL.Scheme) == d.masterScheme
+	origin, err := peerauth.CanonicalOrigin(req.URL.Scheme + "://" + req.URL.Host)
+	if err != nil {
+		return true
+	}
+	return origin == d.masterScheme+"://"+d.masterHost
 }
 
 func (d *peerDiagnosticsRoundTripper) requestID() string {

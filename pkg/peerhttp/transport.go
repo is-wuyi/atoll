@@ -492,7 +492,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// Exact origin match decides the master path. Scheme is part of the match,
 	// so http://master can never take the master's dial settings.
-	if t.master != "" && scheme == t.scheme && target == t.master {
+	if t.master != "" && scheme == t.scheme && strings.EqualFold(target, t.master) {
 		if want, required := RequiredPath(req.Context()); required && (want == PathDirect || want == PathRelay) {
 			return nil, fmt.Errorf("peerhttp: %s is the pinned master origin and cannot take the %s peer path", target, want)
 		}
@@ -595,7 +595,8 @@ func (t *Transport) peerDial(ctx context.Context, network, addr string) (net.Con
 // to guess one.
 func (t *Transport) dialConn(ctx context.Context, network, addr string) (net.Conn, PeerDial, error) {
 	// Belt and braces: the master must never be dialed as a peer.
-	if t.master != "" && addr == t.master {
+	masterAddr, masterErr := canonicalHost("https", addr)
+	if t.master != "" && masterErr == nil && strings.EqualFold(masterAddr, t.master) {
 		return nil, PeerDial{Path: PathUnknown}, &dialFailure{err: errMasterViaPeer, kind: ErrorRefused}
 	}
 	if network != "tcp" {

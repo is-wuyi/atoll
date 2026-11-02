@@ -30,6 +30,7 @@ package peer
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -568,6 +569,26 @@ func ledgerHasGetObject(l *nodeLedger, path, source string) bool {
 	return false
 }
 
+type natReadBody struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *natReadBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.once.Do(b.release)
+	}
+	return n, err
+}
+
+func (b *natReadBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
 func TestPeerNATMidGetNodeLossFailsOverToSurvivor(t *testing.T) {
 	pki := newTestPKI(t)
 	kek, err := contentcrypto.NewKEKFromSecret("peer-nat-failover-key", bytes.Repeat([]byte{0x43}, 32))
@@ -637,9 +658,33 @@ func TestPeerNATMidGetNodeLossFailsOverToSurvivor(t *testing.T) {
 	chunk0ID := types.ChunkObjID(in.Chunks[0], in.ID)
 	chunk0Path := "/objects/" + strconv.FormatUint(chunk0ID, 10)
 
+	getCtx, cancelGet := context.WithCancel(m.ctx)
+	base := cl.HTTP.Transport
+	cl.HTTP.Transport = recoveryRoundTripper(func(req *http.Request) (*http.Response, error) {
+		ctx, cancel := context.WithCancel(req.Context())
+		stop := context.AfterFunc(getCtx, cancel)
+		response, err := base.RoundTrip(req.Clone(ctx))
+		if err != nil || response == nil || response.Body == nil {
+			stop()
+			cancel()
+			return response, err
+		}
+		response.Body = &natReadBody{ReadCloser: response.Body, release: func() { stop(); cancel() }}
+		return response, nil
+	})
 	getErr := make(chan error, 1)
+	getDone := make(chan struct{})
+	// 失败也先释放 handler、取消并 join，再恢复全局和关闭节点。
+	t.Cleanup(func() {
+		gate.release()
+		cancelGet()
+		<-getDone
+	})
 	out := filepath.Join(t.TempDir(), "out.bin")
-	go func() { getErr <- cl.Get("/nat-failover.bin", out) }()
+	go func() {
+		defer close(getDone)
+		getErr <- cl.Get("/nat-failover.bin", out)
+	}()
 
 	select {
 	case <-gate.signal:
