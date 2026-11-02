@@ -219,7 +219,9 @@ func TestPeerCLIProcessesAndRelease(t *testing.T) {
 		"master", "-secure", "-write-planning", "-write-max-replicas", "1", "-p2p", "-p2p-origin", origin,
 		"-db", dbPath, "-listen", masterAddr, "-p2p-identity", masterPeerPath,
 		"-tls-cert", certFile, "-tls-key", keyFile, "-tls-ca", caFile, "-content-key-file", kekPath,
-		"-p2p-listen", "/ip4/127.0.0.1/tcp/0")
+		"-p2p-listen", "/ip4/127.0.0.1/tcp/0",
+		// 纯回环 fixture：显式进入隔离 local/LAN 模式（公网安全默认只放行公共地址）。
+		"-p2p-public-only=false")
 	hc := pki.httpsClient()
 	hc.Timeout = 30 * time.Second
 	t.Cleanup(hc.CloseIdleConnections)
@@ -258,7 +260,9 @@ func TestPeerCLIProcessesAndRelease(t *testing.T) {
 	nodeAddr := peerCLIAddress(t)
 	nodeDir := filepath.Join(dir, "node")
 	nodeArgs := []string{"node", "-secure", "-p2p", "-master", origin, "-listen", nodeAddr, "-advertise", nodeAddr,
-		"-data-dir", nodeDir, "-tls-cert", certFile, "-tls-key", keyFile, "-tls-ca", caFile, "-p2p-listen", "/ip4/127.0.0.1/tcp/0"}
+		"-data-dir", nodeDir, "-tls-cert", certFile, "-tls-key", keyFile, "-tls-ca", caFile, "-p2p-listen", "/ip4/127.0.0.1/tcp/0",
+		// 纯回环 fixture：显式进入隔离 local/LAN 模式（公网安全默认只放行公共地址）。
+		"-p2p-public-only=false"}
 	np := startPeerCLI(t, binary, peerCLIEnv("ATOLL_NODE_INVITE="+invite.Invite), nodeArgs...)
 	var directory peerauth.Directory
 	readDirectory := func() error {
@@ -291,7 +295,9 @@ func TestPeerCLIProcessesAndRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	clientEnv := peerCLIEnv("ATOLL_SESSION=" + login.Token)
-	common := []string{"-master", origin, "-p2p", "-tls-ca", caFile, "-space", strconv.FormatUint(spaceID, 10), "-p2p-listen", "/ip4/127.0.0.1/tcp/0"}
+	common := []string{"-master", origin, "-p2p", "-tls-ca", caFile, "-space", strconv.FormatUint(spaceID, 10), "-p2p-listen", "/ip4/127.0.0.1/tcp/0",
+		// 纯回环 fixture：显式进入隔离 local/LAN 模式（公网安全默认只放行公共地址）。
+		"-p2p-public-only=false"}
 	assertReleased := func() {
 		t.Helper()
 		if err := readDirectory(); err != nil {
@@ -357,4 +363,166 @@ func TestPeerCLIProcessesAndRelease(t *testing.T) {
 	getPersistent()
 	np.stop(t)
 	mp.stop(t)
+}
+
+// runPeerCLIExpectFailure 运行一个预期失败的 CLI 命令并返回 stdout/stderr。
+func runPeerCLIExpectFailure(t *testing.T, binary string, env []string, args ...string) (string, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("CLI %s unexpectedly succeeded\n%s", args[0], stderr.String())
+	}
+	return stdout.String(), stderr.String()
+}
+
+// decodedPeerDiagnostics 是 -p2p-diagnostics 文件的解码形态（读取方按 format
+// 绑定字段语义）。
+type decodedPeerDiagnostics struct {
+	Format         string `json:"format"`
+	RuntimeCloseOK bool   `json:"runtime_close_ok"`
+	Dropped        uint64 `json:"dropped"`
+	Events         []struct {
+		Source string `json:"source"`
+		CLI    *struct {
+			Op        string `json:"op"`
+			Ok        bool   `json:"ok"`
+			ErrorKind string `json:"error_kind"`
+		} `json:"cli"`
+	} `json:"events"`
+}
+
+// TestPeerCLIDiagnosticsResultFailure 真实 CLI 对象操作失败：get 404 后诊断
+// 文件必须记一条独立 cli{ok:false} 终判事件（原始错误文本不入档），文件保持
+// 私有 0600，master 侧正常落盘。
+func TestPeerCLIDiagnosticsResultFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs real CLI processes")
+	}
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "atoll")
+	buildCtx, buildCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer buildCancel()
+	build := exec.CommandContext(buildCtx, "go", "build", "-race", "-o", binary, "./cmd/atoll")
+	build.Dir = filepath.Join("..", "..")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+	pki := newTestPKI(t)
+	caFile := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pki.caCert.Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, certFile, keyFile := pki.leafCert(t, "127.0.0.1")
+	dbPath := filepath.Join(dir, "meta.db")
+	kekPath := filepath.Join(dir, "keys", "content.key")
+	runPeerCLI(t, binary, peerCLIEnv("ATOLL_PASSWORD="+testAdminPassword), "auth", "init", "-db", dbPath, "-user", "admin")
+	runPeerCLI(t, binary, peerCLIEnv(), "content-key-init", "-path", kekPath)
+	masterAddr := peerCLIAddress(t)
+	origin := "https://" + masterAddr
+	masterDiag := filepath.Join(dir, "master-diagnostics.json")
+	mp := startPeerCLI(t, binary, peerCLIEnv("ATOLL_CONTROL_TOKEN="+testControlToken),
+		"master", "-secure", "-write-planning", "-p2p", "-p2p-origin", origin,
+		"-db", dbPath, "-listen", masterAddr,
+		"-tls-cert", certFile, "-tls-key", keyFile, "-tls-ca", caFile, "-content-key-file", kekPath,
+		"-p2p-listen", "/ip4/127.0.0.1/tcp/0",
+		// 纯回环 fixture：显式进入隔离 local/LAN 模式。
+		"-p2p-public-only=false",
+		// peer 诊断目标必须是不存在的新文件（已存在拒绝）。
+		"-p2p-diagnostics", masterDiag)
+	hc := pki.httpsClient()
+	hc.Timeout = 30 * time.Second
+	t.Cleanup(hc.CloseIdleConnections)
+	waitPeerCLI(t, mp, func() error { return peerCLIJSON(hc, http.MethodGet, origin+"/healthz", "", 0, nil, nil) })
+
+	var admin client.LoginResult
+	if err := json.Unmarshal(runPeerCLI(t, binary, peerCLIEnv("ATOLL_PASSWORD="+testAdminPassword), "login", "-master", origin, "-tls-ca", caFile, "-user", "admin"), &admin); err != nil {
+		t.Fatal(err)
+	}
+	var invite struct {
+		Invite    string    `json:"invite"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	if err := peerCLIJSON(hc, http.MethodPost, origin+"/auth/invites", admin.Token, 0, map[string]any{"expires_at": time.Now().Add(time.Hour)}, &invite); err != nil {
+		t.Fatal(err)
+	}
+	if err := peerCLIJSON(hc, http.MethodPost, origin+"/auth/register", "", 0, map[string]string{"invite": invite.Invite, "username": "alice", "password": testUserPassword}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var login client.LoginResult
+	if err := json.Unmarshal(runPeerCLI(t, binary, peerCLIEnv("ATOLL_PASSWORD="+testUserPassword), "login", "-master", origin, "-tls-ca", caFile, "-user", "alice"), &login); err != nil {
+		t.Fatal(err)
+	}
+	spaceID := userSpaceID(login)
+	if login.Token == "" || spaceID == 0 {
+		t.Fatal("CLI login returned no usable user session")
+	}
+
+	clientDiag := filepath.Join(dir, "client-diagnostics.json")
+	clientEnv := peerCLIEnv("ATOLL_SESSION=" + login.Token)
+	stdout, _ := runPeerCLIExpectFailure(t, binary, clientEnv,
+		"get", "-master", origin, "-p2p", "-tls-ca", caFile, "-space", strconv.FormatUint(spaceID, 10),
+		"-p2p-listen", "/ip4/127.0.0.1/tcp/0", "-p2p-public-only=false",
+		"-p2p-diagnostics", clientDiag,
+		"/nonexistent-object-for-diagnostics.bin", filepath.Join(dir, "out.bin"))
+	// stdout 只提示私有路径，绝不 dump 内容。
+	if !strings.Contains(stdout, "peer 诊断输出") || !strings.Contains(stdout, clientDiag) {
+		t.Fatalf("stdout must announce the private diagnostics path: %s", stdout)
+	}
+	if strings.Contains(stdout, "events") {
+		t.Fatalf("stdout must not dump diagnostics content: %s", stdout)
+	}
+	info, err := os.Stat(clientDiag)
+	if err != nil {
+		t.Fatalf("client diagnostics file missing: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("diagnostics file mode=%v, want 0600", info.Mode().Perm())
+	}
+	raw, err := os.ReadFile(clientDiag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report decodedPeerDiagnostics
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("decode diagnostics: %v\n%s", err, raw)
+	}
+	if report.Format != "atoll-peer-diagnostics/1" {
+		t.Fatalf("format=%q", report.Format)
+	}
+	var resultSeen bool
+	for _, ev := range report.Events {
+		if ev.Source == "cli" && ev.CLI != nil && ev.CLI.Op == "get" {
+			if ev.CLI.Ok {
+				t.Fatal("a failed get must record ok=false, not EOF-as-success")
+			}
+			if ev.CLI.ErrorKind == "" {
+				t.Fatal("failed result must carry a bounded error kind")
+			}
+			resultSeen = true
+		}
+	}
+	if !resultSeen {
+		t.Fatalf("cli get result event missing: %s", raw)
+	}
+	if strings.Contains(string(raw), "nonexistent-object-for-diagnostics") || strings.Contains(string(raw), "secret") {
+		t.Fatalf("raw error or request material must never reach the file: %s", raw)
+	}
+	// master 收尾（SIGTERM → peerPs.Close → 一次性落盘）。
+	mp.stop(t)
+	masterReport, err := os.ReadFile(masterDiag)
+	if err != nil {
+		t.Fatalf("master diagnostics: %v", err)
+	}
+	var masterEnv decodedPeerDiagnostics
+	if err := json.Unmarshal(masterReport, &masterEnv); err != nil {
+		t.Fatalf("decode master diagnostics: %v", err)
+	}
+	if !masterEnv.RuntimeCloseOK {
+		t.Fatal("clean master shutdown must be recorded as runtime_close_ok=true")
+	}
 }

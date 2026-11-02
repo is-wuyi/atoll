@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,6 +40,51 @@ type putGate struct {
 }
 
 func newPutGate() *putGate { return &putGate{} }
+
+// anchoredTransport 把每个出站请求的 ctx 锚到测试生命周期：legacy 上传入口无 ctx
+// 入参，失败路径要真正取消在途上传，取消只能从 transport 层叠加。保留原请求
+// 自带的 deadline/取消，只在响应体结束（EOF/Close）或出错时释放登记，绝不
+// RoundTrip 返回即取消（会掐死还在读的 body），也不替换生产时限。
+type anchoredTransport struct {
+	base http.RoundTripper
+	ctx  context.Context
+}
+
+func (a anchoredTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	merged, cancel := context.WithCancel(req.Context())
+	stop := context.AfterFunc(a.ctx, cancel)
+	resp, err := a.base.RoundTrip(req.Clone(merged))
+	if err != nil || resp == nil || resp.Body == nil {
+		stop()
+		cancel()
+		return resp, err
+	}
+	resp.Body = &anchoredBody{ReadCloser: resp.Body, release: func() { stop(); cancel() }}
+	return resp, err
+}
+
+// anchoredBody 在响应体读完（EOF/错误）或关闭时释放该请求的取消登记。
+type anchoredBody struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *anchoredBody) releaseOnce() { b.once.Do(b.release) }
+
+func (b *anchoredBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.releaseOnce()
+	}
+	return n, err
+}
+
+func (b *anchoredBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.releaseOnce()
+	return err
+}
 
 func (g *putGate) arm() {
 	g.mu.Lock()
@@ -336,10 +382,46 @@ func TestFaultStalledNodeReassignsToHealthy(t *testing.T) {
 		1: {putGate: gate},
 		2: {putGate: gate},
 	})
-	// LIFO：cleanup 先 trigger（放行可能仍挂起的屏障请求），再关服务器——
-	// 失败路径不会让 httptest.Server.Close 干等 hold。
-	t.Cleanup(gate.trigger)
+	// LIFO：cleanup 顺序 = gate.trigger（放行仍挂起的屏障请求）→ 在途上传护栏
+	// （cancel+join）→ 关服务器 → withChunkSize 恢复全局 ChunkSize。护栏 cleanup
+	// 因此先于 gate.trigger 注册、晚于 withChunkSize：失败路径绝不带着活上传
+	// goroutine 恢复全局。
 	c := fc.Client
+	// 在途上传护栏：PutChunked 全链路无 ctx 入参，失败路径若直接 Fatalf，在途
+	// goroutine 会活到 cleanup，与 withChunkSize 恢复全局 types.ChunkSize 构成
+	// 数据竞态。故 transport 层锚定 ctx（anchoredTransport）+ goroutine 用
+	// close(done) 标记：在途窗口内失败先 trigger/cancel 再 join，cleanup 兜底
+	// join；10s/90s 观察墙与 gate 排除断言原样保留。
+	uploadCtx, cancelUpload := context.WithCancel(context.Background())
+	c.HTTP.Transport = anchoredTransport{base: c.HTTP.Transport, ctx: uploadCtx}
+	var uploadMu sync.Mutex
+	var uploadDone chan struct{}
+	trackUpload := func(done chan struct{}) {
+		uploadMu.Lock()
+		uploadDone = done
+		uploadMu.Unlock()
+	}
+	joinUpload := func() {
+		uploadMu.Lock()
+		done := uploadDone
+		uploadMu.Unlock()
+		if done != nil {
+			<-done
+		}
+	}
+	t.Cleanup(func() {
+		cancelUpload()
+		joinUpload()
+	})
+	t.Cleanup(gate.trigger)
+	// failJoined 供在途窗口内的失败路径使用：先确定性放行屏障，再取消并等真实
+	// 上传 goroutine 退出，最后才 Fatalf（全局恢复永远晚于 worker 退出）。
+	failJoined := func(format string, args ...any) {
+		gate.trigger()
+		cancelUpload()
+		joinUpload()
+		t.Fatalf(format, args...)
+	}
 	if _, err := c.Mkdir("/w"); err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
@@ -354,13 +436,18 @@ func TestFaultStalledNodeReassignsToHealthy(t *testing.T) {
 		remote := fmt.Sprintf("/w/r%d.bin", i)
 		gate.arm()
 		putDone := make(chan error, 1)
-		go func() { putDone <- c.PutChunked(src, remote, 1) }()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			putDone <- c.PutChunked(src, remote, 1)
+		}()
+		trackUpload(done)
 		select {
 		case <-gate.waitArrived(): // 屏障：请求已在目标 handler 在途
 		case err := <-putDone:
-			t.Fatalf("PUT 在屏障触发前就结束（fixture 失真）: err=%v", err)
+			failJoined("PUT 在屏障触发前就结束（fixture 失真）: err=%v", err)
 		case <-time.After(10 * time.Second):
-			t.Fatal("PUT 未到达目标节点——屏障未触发")
+			failJoined("PUT 未到达目标节点——屏障未触发")
 		}
 		gate.trigger() // 在途确定性失败（真实连接中止，非超时竞速）
 		select {
@@ -369,7 +456,7 @@ func TestFaultStalledNodeReassignsToHealthy(t *testing.T) {
 				t.Fatalf("有健康节点时第 %d 个文件仍失败: %v", i, err)
 			}
 		case <-time.After(90 * time.Second):
-			t.Fatalf("第 %d 个文件在屏障失败后未恢复（疑似挂起）", i)
+			failJoined("第 %d 个文件在屏障失败后未恢复（疑似挂起）", i)
 		}
 		_, bad := gate.stats()
 		// 排除断言（确定性）：恢复（reassign）请求必须排除被拦节点。
@@ -416,6 +503,107 @@ func containsUint64(list []uint64, v uint64) bool {
 		}
 	}
 	return false
+}
+
+// blockedRoundTripper 挂住请求直至其 ctx 取消：真实在途阻塞，仅测试取消能解开。
+type blockedRoundTripper struct {
+	inflight chan struct{}
+}
+
+func (b *blockedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	close(b.inflight)
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+// 用真实在途阻塞验证取消穿透和 worker join；响应体 EOF 前不得释放登记。
+func TestFaultAnchoredTransportJoinProof(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	rt := &blockedRoundTripper{inflight: make(chan struct{})}
+	cl := &http.Client{Transport: anchoredTransport{base: rt, ctx: ctx}}
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	go func() {
+		defer close(done)
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://fault.test/x", nil)
+		_, err := cl.Do(req)
+		errCh <- err
+	}()
+	select {
+	case <-rt.inflight:
+	case <-time.After(5 * time.Second):
+		t.Fatal("请求未进入在途阻塞")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("测试取消必须中止在途调用")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("测试取消未到达真实在途调用")
+	}
+	<-done
+
+	// 阶段 a 的取消不得泄漏进响应体生命周期验证。
+	bctx, bcancel := context.WithCancel(context.Background())
+	pr, pw := io.Pipe()
+	writeErr := make(chan error, 1)
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		_, err := pw.Write([]byte{7})
+		writeErr <- err
+	}()
+	t.Cleanup(func() {
+		bcancel()
+		_ = pr.Close()
+		_ = pw.Close()
+		<-writeDone
+	})
+	var bodyDone <-chan struct{}
+	base := plannedTestTransport(func(req *http.Request) (*http.Response, error) {
+		bodyDone = req.Context().Done()
+		return &http.Response{StatusCode: http.StatusOK, Body: pr}, nil
+	})
+	cl2 := &http.Client{Transport: anchoredTransport{base: base, ctx: bctx}}
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://fault.test/y", nil)
+	resp, err := cl2.Do(req)
+	if err != nil {
+		t.Fatalf("阶段 b 请求: %v", err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 1)
+	if n, err := resp.Body.Read(buf); n != 1 || err != nil || buf[0] != 7 {
+		t.Fatalf("RoundTrip 返回后 body 应仍可读: n=%d err=%v body=%v", n, err, buf)
+	}
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("管道写入: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("管道写入未完成")
+	}
+	<-writeDone
+	select {
+	case <-bodyDone:
+		t.Fatal("RoundTrip 返回即取消登记——会掐死仍在读的 body")
+	default:
+	}
+	_ = pw.Close()
+	if _, err := resp.Body.Read(buf); err != io.EOF {
+		t.Fatalf("关闭写端后应读到 EOF: %v", err)
+	}
+	select {
+	case <-bodyDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("EOF 后未释放取消登记")
+	}
 }
 
 // 探测缓存：连传一批小文件时，master 对节点 /healthz 的探测次数应远小于文件数

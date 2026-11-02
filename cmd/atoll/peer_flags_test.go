@@ -83,13 +83,72 @@ func TestP2PAnnouncePublicOnly(t *testing.T) {
 	if err := validateP2PFlags(p2); err == nil {
 		t.Fatal("public-only loopback announce should be rejected by preflight")
 	}
-	// Without public-only, loopback is allowed (local test harness).
+	// Without public-only, loopback is allowed (local test harness). The default
+	// is now public-only, so the local/LAN mode must be selected explicitly.
 	p3 := p2pTestFlags(true)
+	*p3.publicOnly = false
 	if err := p3.announce.Set("/ip4/127.0.0.1/tcp/7000"); err != nil {
 		t.Fatalf("loopback announce without public-only rejected: %v", err)
 	}
 	if err := validateP2PFlags(p3); err != nil {
 		t.Fatalf("loopback announce should pass without public-only: %v", err)
+	}
+}
+
+// Default listen binds both TCP and QUIC; an explicit -p2p-listen fully replaces
+// the default. Public-only defaults on (public-internet safety); an empty public
+// address list stays legal so users are never forced to invent private/ET IPs.
+// -p2p-diagnostics is parsed but its writer is wired by the diagnostics layer.
+func TestP2PDefaultListenAndPublicOnly(t *testing.T) {
+	fs := flag.NewFlagSet("p2p-defaults", flag.ContinueOnError)
+	p := addP2PFlags(fs)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(p.listenAddresses(), ",")
+	want := "/ip4/0.0.0.0/tcp/0,/ip4/0.0.0.0/udp/0/quic-v1"
+	if got != want {
+		t.Fatalf("default listen = %q, want %q", got, want)
+	}
+	if p.publicOnly == nil || !*p.publicOnly {
+		t.Fatal("public-only must default to true (public-internet safety)")
+	}
+	if p.diagnostics == nil || *p.diagnostics != "" {
+		t.Fatal("diagnostics path must default to empty")
+	}
+	// 显式 -p2p-listen 完全覆盖默认（不追加、不去重默认值）。
+	fs2 := flag.NewFlagSet("p2p-explicit-listen", flag.ContinueOnError)
+	p2 := addP2PFlags(fs2)
+	if err := fs2.Parse([]string{"-p2p-listen", "/ip4/127.0.0.1/tcp/7000"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(p2.listenAddresses(), ","), "/ip4/127.0.0.1/tcp/7000"; got != want {
+		t.Fatalf("explicit listen = %q, want %q (default must not be mixed in)", got, want)
+	}
+	// publish 空公共地址列表合法（Normalize 允许 []）：不得强迫手填私网/ET IP。
+	if err := validateP2PFlags(p); err != nil {
+		t.Fatalf("empty announce with default public-only must pass: %v", err)
+	}
+	// 显式 false 是隔离 local/LAN 模式：回环 announce 放行。
+	fs3 := flag.NewFlagSet("p2p-lan", flag.ContinueOnError)
+	p3 := addP2PFlags(fs3)
+	if err := fs3.Parse([]string{"-p2p-public-only=false"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p3.announce.Set("/ip4/127.0.0.1/tcp/7000"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateP2PFlags(p3); err != nil {
+		t.Fatalf("explicit local/LAN mode must accept loopback announce: %v", err)
+	}
+	// -p2p-diagnostics 登记为 path flag（writer 由诊断层接线）。
+	fs4 := flag.NewFlagSet("p2p-diagnostics", flag.ContinueOnError)
+	p4 := addP2PFlags(fs4)
+	if err := fs4.Parse([]string{"-p2p-diagnostics", "/tmp/atoll-peer-diagnostics.json"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := *p4.diagnostics; got != "/tmp/atoll-peer-diagnostics.json" {
+		t.Fatalf("diagnostics = %q, want the parsed path", got)
 	}
 }
 

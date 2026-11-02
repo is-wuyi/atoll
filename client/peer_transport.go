@@ -30,6 +30,9 @@ const (
 	clientPeerInterval       = 25 * time.Second
 	clientPeerRetainMargin   = 60 * time.Second
 	clientPeerResponseLimit  = 64 << 10
+	// clientPeerPrepareTimeout 界定单次 PrepareInfrastructure 尝试：失败走启用
+	// 契约整体恢复重试，但单次必须有界，不因中心不可达悬挂启用/loop 周期。
+	clientPeerPrepareTimeout = 10 * time.Second
 )
 
 // clientPeerReleaseTimeout bounds the best-effort signed slot release in
@@ -152,12 +155,39 @@ func (c *Client) EnableP2P(ctx context.Context, runtime peertransport.RuntimeAPI
 	if err := p.refreshDirectory(p.ctx, true); err != nil {
 		return fail(fmt.Errorf("client P2P directory: %w", err))
 	}
+	// prepare 中心基础设施：首次文件操作前先拿到中心公网 observed 候选。失败
+	// 与登记/目录失败同样中止并恢复 transport（永久身份/授权错误原样透传）。
+	if err := p.prepareInfrastructure(p.ctx); err != nil {
+		return fail(fmt.Errorf("client P2P infrastructure: %w", err))
+	}
 	p.mu.Lock()
 	p.started = true
 	p.mu.Unlock()
 	p.wg.Add(1)
 	go c.clientPeerLoop(p)
 	return nil
+}
+
+// prepareInfrastructure 以目录快照中的当前 infra 调用 PrepareInfrastructure；
+// 目录读取持锁，防止与并发刷新竞态。不做本地计数重试：启用是整体幂等的，
+// 失败交给调用方按契约恢复/重试，避免半成品状态。
+func (p *clientP2P) prepareInfrastructure(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
+		return errClientP2PClosed
+	}
+	directory := clonePeerDirectory(p.directory)
+	p.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, clientPeerPrepareTimeout)
+	defer cancel()
+	return p.runtime.PrepareInfrastructure(peerhttp.ControlContext(attemptCtx), directory.Infrastructure)
 }
 
 // CloseP2P stops the background loop and joins it, then performs one bounded
@@ -368,8 +398,10 @@ func (c *Client) clientPeerLoop(p *clientP2P) {
 	}
 }
 
-// refreshCycle 执行一次有界的重登记+目录刷新。失败有界且非致命（下个 tick 或
-// 下次文件操作重试），但必须记日志，不得静默吞掉——持续失败时这是唯一线索。
+// refreshCycle 执行一次有界的重登记+目录刷新+infra 重 prepare。失败有界且非
+// 致命（下个 tick 或下次文件操作重试），但必须记日志，不得静默吞掉——持续失败
+// 时这是唯一线索。directory 步成功后用当前 infra 重 prepare：中心重启会丢
+// identified 缓存，按 tick 有界修复（prepare 自身受同一 tick ctx 界定）。
 func (p *clientP2P) refreshCycle() {
 	ctx, cancel := context.WithTimeout(p.ctx, clientPeerRefreshTimeout)
 	defer cancel()
@@ -378,6 +410,10 @@ func (p *clientP2P) refreshCycle() {
 	}
 	if err := p.refreshDirectory(ctx, false); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("client P2P directory refresh: %v", err)
+	} else if err == nil {
+		if err := p.prepareInfrastructure(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("client P2P infrastructure prepare: %v", err)
+		}
 	}
 }
 

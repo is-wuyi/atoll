@@ -34,6 +34,14 @@ const (
 	// hub）重启会丢失预约，只等到期才重预留会让节点在 hub 重启后最长一个整租期
 	// 不可达。按此周期重建预约，把修复窗口压到分钟级。
 	peerRelayReserveRefresh = 2 * time.Minute
+	// 首次 prepare / relay 预约的暂时性故障重试预算：每次 ctx<=10s、最多 3 次/
+	// 总 30s、退避 100/200ms；永久错误（ErrInfrastructureInvalid/ErrPeerUnauthorized）
+	// 与父 ctx 终止/closed 立刻终止，父 deadline 不当临时故障。只作用于 StartP2P
+	// 首次 setup；稳态周期由 ticker+tick ctx 另行界定。
+	peerPrepareAttemptTimeout = 10 * time.Second
+	peerFirstSetupMaxAttempts = 3
+	peerFirstSetupTotalBudget = 30 * time.Second
+	peerFirstSetupBackoffStep = 100 * time.Millisecond
 )
 
 var (
@@ -188,10 +196,15 @@ func (n *Node) StartP2P(ctx context.Context) error {
 	if err := p.refresh(p.ctx, true); err != nil {
 		return release(fmt.Errorf("node P2P directory: %w", err))
 	}
+	// 首次 publication / relay 预约前必须先 prepare（验证 infra 身份/授权并直连
+	// 中心等 Identify）；暂时性故障有界重试，最终失败走 release 收尾。
+	if err := n.prepareInfrastructureFirst(p.ctx, p); err != nil {
+		return release(fmt.Errorf("node P2P infrastructure: %w", err))
+	}
 	if err := n.publishP2P(p.ctx, p); err != nil {
 		return release(err)
 	}
-	if err := n.reserveRelay(p.ctx, p); err != nil {
+	if err := n.reserveRelayFirst(p.ctx, p); err != nil {
 		return release(err)
 	}
 	if err := n.publishIfAddressesChanged(p.ctx, p); err != nil {
@@ -269,21 +282,38 @@ func (n *Node) peerPublisherLoop(p *nodeP2P) {
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(p.ctx, peerRefreshTimeout)
-			if err := p.refresh(ctx, true); err != nil && !errors.Is(err, context.Canceled) {
-				logPeerP2P("directory refresh", err)
-			} else if err == nil {
-				if err := n.publishIfNeeded(ctx, p); err != nil && !errors.Is(err, context.Canceled) {
-					logPeerP2P("endpoint publish", err)
-				}
-				if err := n.reserveRelay(ctx, p); err != nil && !errors.Is(err, context.Canceled) {
-					logPeerP2P("relay reservation", err)
-				}
-				if err := n.publishIfAddressesChanged(ctx, p); err != nil && !errors.Is(err, context.Canceled) {
-					logPeerP2P("endpoint republish", err)
-				}
-			}
+			n.publisherCycle(ctx, p)
 			cancel()
 		}
+	}
+}
+
+// publisherCycle 执行一个稳态周期（调用方提供单 tick ctx，失败非致命仅记日志）：
+// 目录刷新 → 按需发布 → infra 重 prepare → relay 预约 → 地址变化重发布。prepare
+// 失败时，同一（可能已坏的）infra 上的预约不得伪记成功：永久身份/授权错误或父
+// 生命周期已终止 → 本周期跳过 reserve；暂时性错误（含 tick 超时）仍独立尝试修复
+// 预约，周期由 ticker 界定，绝不 busy-loop。
+func (n *Node) publisherCycle(ctx context.Context, p *nodeP2P) {
+	if err := p.refresh(ctx, true); err != nil {
+		if !errors.Is(err, context.Canceled) {
+			logPeerP2P("directory refresh", err)
+		}
+		return
+	}
+	if err := n.publishIfNeeded(ctx, p); err != nil && !errors.Is(err, context.Canceled) {
+		logPeerP2P("endpoint publish", err)
+	}
+	prepareErr := p.prepareInfrastructure(ctx)
+	if prepareErr != nil && !errors.Is(prepareErr, context.Canceled) {
+		logPeerP2P("infrastructure prepare", prepareErr)
+	}
+	if prepareErr == nil || !(peerSetupPermanent(prepareErr) || p.ctx.Err() != nil) {
+		if err := n.reserveRelay(ctx, p); err != nil && !errors.Is(err, context.Canceled) {
+			logPeerP2P("relay reservation", err)
+		}
+	}
+	if err := n.publishIfAddressesChanged(ctx, p); err != nil && !errors.Is(err, context.Canceled) {
+		logPeerP2P("endpoint republish", err)
 	}
 }
 
@@ -648,6 +678,76 @@ func (n *Node) reserveRelay(ctx context.Context, p *nodeP2P) error {
 	return nil
 }
 
+// prepareInfrastructure 以目录快照中的当前 infra 调用 PrepareInfrastructure；
+// 只传控制上下文，不变更普通数据通道、不落任何本地状态（relayUntil/relayAt 仅由
+// reserveRelay 在真成功后更新）。
+func (p *nodeP2P) prepareInfrastructure(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	directory := p.directorySnapshot()
+	return p.runtime.PrepareInfrastructure(peerhttp.ControlContext(ctx), directory.Infrastructure)
+}
+
+// peerSetupPermanent 报告永久身份/授权/配置错误：重试无意义，必须立刻失败暴露。
+func peerSetupPermanent(err error) bool {
+	return errors.Is(err, peertransport.ErrInfrastructureInvalid) ||
+		errors.Is(err, peertransport.ErrPeerUnauthorized)
+}
+
+// withFirstSetupRetry 对 StartP2P 首次 prepare / relay 预约做有界重试（每次
+// ctx<=peerPrepareAttemptTimeout、最多 peerFirstSetupMaxAttempts 次/总
+// peerFirstSetupTotalBudget、退避 100/200ms）。永久身份/授权错误不重试；父 ctx
+// 取消/deadline 立刻终止且不当临时故障再试（仅单次尝试自身超时算暂时性）；
+// closed 同样立刻终止。StartP2P 预留的 wg 槽位覆盖 retry，CloseP2P 必然 join。
+func (p *nodeP2P) withFirstSetupRetry(ctx context.Context, fn func(context.Context) error) error {
+	var lastErr error
+	deadline := time.Now().Add(peerFirstSetupTotalBudget)
+	for attempt := 1; attempt <= peerFirstSetupMaxAttempts; attempt++ {
+		budget := time.Until(deadline)
+		if attempt > 1 && budget <= 0 {
+			break // 总预算耗尽：与次数耗尽同样终止
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, min(peerPrepareAttemptTimeout, budget))
+		err := fn(attemptCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if peerSetupPermanent(err) || ctx.Err() != nil {
+			return err
+		}
+		p.mu.RLock()
+		closed := p.closed
+		p.mu.RUnlock()
+		if closed {
+			return err
+		}
+		if attempt < peerFirstSetupMaxAttempts {
+			// 退避随尝试次数递增（100/200ms）；等待期间父 ctx 取消立即终止。
+			select {
+			case <-ctx.Done():
+				return lastErr
+			case <-time.After(peerFirstSetupBackoffStep * time.Duration(attempt)):
+			}
+		}
+	}
+	return lastErr
+}
+
+// prepareInfrastructureFirst 是 StartP2P 首次基础设施 prepare：带上有界重试。
+func (n *Node) prepareInfrastructureFirst(ctx context.Context, p *nodeP2P) error {
+	return p.withFirstSetupRetry(ctx, p.prepareInfrastructure)
+}
+
+// reserveRelayFirst 是 StartP2P 首次 relay 预约：与首次 prepare 共用有界重试。
+func (n *Node) reserveRelayFirst(ctx context.Context, p *nodeP2P) error {
+	return p.withFirstSetupRetry(ctx, func(attemptCtx context.Context) error {
+		return n.reserveRelay(attemptCtx, p)
+	})
+}
+
 func (n *Node) publishAddressAttempt(ctx context.Context, p *nodeP2P, expected uint64, addresses []string) (peerauth.Endpoint, int, error) {
 	var endpoint peerauth.Endpoint
 	binding := n.sec.peerBindingSnapshot()
@@ -663,7 +763,7 @@ func (n *Node) publishAddressAttempt(ctx context.Context, p *nodeP2P, expected u
 		BindingRevision:  binding.Revision,
 		ExpectedRevision: expected,
 		OperationID:      opID,
-		Addresses:        append([]string(nil), addresses...),
+		Addresses:        append([]string{}, addresses...),
 		NotAfter:         time.Now().UTC().Add(peerauth.EndpointLease),
 	}
 	proof, err := peerauth.PublicationProof(n.masterURL, uint64(n.nodeID.Load()), req)

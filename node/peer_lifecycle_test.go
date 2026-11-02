@@ -105,6 +105,9 @@ func (r *stubNodeRuntime) ConnContext(ctx context.Context, _ net.Conn) context.C
 func (r *stubNodeRuntime) ReserveRelay(context.Context, peerauth.Infrastructure) (time.Time, error) {
 	return time.Time{}, nil
 }
+func (r *stubNodeRuntime) PrepareInfrastructure(context.Context, peerauth.Infrastructure) error {
+	return nil
+}
 func (r *stubNodeRuntime) EnableRelay() error { return nil }
 func (r *stubNodeRuntime) Dial(context.Context, peerauth.Endpoint, peerauth.Infrastructure, peerhttp.Path) peertransport.DialResult {
 	return peertransport.DialResult{}
@@ -770,6 +773,478 @@ func TestNodeRelayReservationRefreshedBounded(t *testing.T) {
 	if !p.relayUntil.Equal(relayUntilBefore) {
 		t.Fatalf("失败不得更新 relayUntil: %v", p.relayUntil)
 	}
+}
+
+// ---- 13b. 首次 prepare / relay 预约的有界重试 ----
+
+// firstSetupRuntime 记录 PrepareInfrastructure / ReserveRelay 的调用与错误脚本，
+// 供首次 setup 有界重试的定点测试。脚本耗尽后默认成功；onPrepare/onReserve 为
+// 每次真正调用前的事件钩子；prepareBarrier 非空时按调用次序接管该次结果
+// （真在途屏障用）。
+type firstSetupRuntime struct {
+	stubNodeRuntime
+	mu             sync.Mutex
+	prepareCalls   int
+	prepareErrs    []error
+	lastInfra      peerauth.Infrastructure
+	relayCalls     int
+	relayErrs      []error
+	relayUntil     time.Time
+	onPrepare      func()
+	prepareBarrier func(ctx context.Context, call int) error
+	onReserve      func()
+}
+
+func (r *firstSetupRuntime) PrepareInfrastructure(ctx context.Context, infra peerauth.Infrastructure) error {
+	r.mu.Lock()
+	r.prepareCalls++
+	call := r.prepareCalls
+	r.lastInfra = infra
+	hook := r.onPrepare
+	barrier := r.prepareBarrier
+	errs := r.prepareErrs
+	r.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if barrier != nil {
+		return barrier(ctx, call)
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return errs[0]
+}
+
+func (r *firstSetupRuntime) ReserveRelay(context.Context, peerauth.Infrastructure) (time.Time, error) {
+	r.mu.Lock()
+	r.relayCalls++
+	hook := r.onReserve
+	errs := r.relayErrs
+	r.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if len(errs) == 0 {
+		return r.relayUntil, nil
+	}
+	return time.Time{}, errs[0]
+}
+
+func (r *firstSetupRuntime) prepareCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.prepareCalls
+}
+
+func (r *firstSetupRuntime) relayCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.relayCalls
+}
+
+func newRetryTestP2P() *nodeP2P {
+	p := &nodeP2P{n: &Node{}, runtime: &stubNodeRuntime{}, negative: make(map[string]time.Time)}
+	p.ctx, p.cancel = context.WithCancel(context.Background())
+	return p
+}
+
+// 暂时性网络错误按预算重试：前两次失败第三次成功；每次尝试 ctx 都有界（有
+// deadline 且不超过单次/总预算），成功即停。
+func TestNodeFirstSetupRetrySucceedsAfterTransientFailures(t *testing.T) {
+	p := newRetryTestP2P()
+	defer p.cancel()
+	start := time.Now()
+	var calls int
+	var deadlines []time.Time
+	err := p.withFirstSetupRetry(context.Background(), func(ctx context.Context) error {
+		calls++
+		dl, ok := ctx.Deadline()
+		if !ok {
+			t.Error("attempt ctx must carry a deadline (bounded attempt)")
+		} else {
+			deadlines = append(deadlines, dl)
+		}
+		if calls <= 2 {
+			return errors.New("connection reset by peer")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("第三次尝试应成功: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("attempts = %d, want 3", calls)
+	}
+	for _, dl := range deadlines {
+		if d := time.Until(dl); d > peerPrepareAttemptTimeout || d > peerFirstSetupTotalBudget {
+			t.Fatalf("attempt deadline 超出单次/总预算: %v", d)
+		}
+	}
+	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
+		t.Fatalf("两次退避（100/200ms）应真实发生，elapsed=%v", elapsed)
+	}
+}
+
+// 永久身份/授权错误不重试：一次尝试后立刻失败暴露，错误链保持 errors.Is 可判。
+func TestNodeFirstSetupRetryPermanentErrorsNotRetried(t *testing.T) {
+	p := newRetryTestP2P()
+	defer p.cancel()
+	for _, sentinel := range []error{peertransport.ErrInfrastructureInvalid, peertransport.ErrPeerUnauthorized} {
+		calls := 0
+		err := p.withFirstSetupRetry(context.Background(), func(ctx context.Context) error {
+			calls++
+			return fmt.Errorf("prepare infrastructure: %w", sentinel)
+		})
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("%v: 错误链必须保持 sentinel 可判，got %v", sentinel, err)
+		}
+		if calls != 1 {
+			t.Fatalf("%v: 永久错误不得重试，attempts=%d", sentinel, calls)
+		}
+	}
+}
+
+// 次数耗尽：持续暂时性错误恰好尝试 peerFirstSetupMaxAttempts 次后返回末次错误。
+func TestNodeFirstSetupRetryExhaustsAttempts(t *testing.T) {
+	p := newRetryTestP2P()
+	defer p.cancel()
+	transient := errors.New("relay hub unreachable")
+	calls := 0
+	err := p.withFirstSetupRetry(context.Background(), func(ctx context.Context) error {
+		calls++
+		return transient
+	})
+	if !errors.Is(err, transient) {
+		t.Fatalf("应返回末次暂时性错误，got %v", err)
+	}
+	if calls != peerFirstSetupMaxAttempts {
+		t.Fatalf("attempts = %d, want %d", calls, peerFirstSetupMaxAttempts)
+	}
+}
+
+// 父 ctx 在尝试在途时取消：立刻终止，绝不开始下一次尝试。
+func TestNodeFirstSetupRetryStopsOnParentCancel(t *testing.T) {
+	p := newRetryTestP2P()
+	defer p.cancel()
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	calls := 0
+	fn := func(ctx context.Context) error {
+		calls++
+		close(entered)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			return errors.New("attempt did not observe parent cancel")
+		}
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- p.withFirstSetupRetry(parent, fn) }()
+	<-entered
+	cancel()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("父 ctx 取消后必须返回错误")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("父 ctx 取消未立刻终止首次 retry")
+	}
+	if calls != 1 {
+		t.Fatalf("取消后不得开始下一次尝试: %d", calls)
+	}
+}
+
+// 尝试返回错误时父 ctx 已终止（外部取消/父 deadline 在错误前生效）：按 ctx
+// 分类终止，不当临时故障再试；closed 同样立刻终止。
+func TestNodeFirstSetupRetryStopsWhenParentCancelledOrClosed(t *testing.T) {
+	p := newRetryTestP2P()
+	defer p.cancel()
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	err := p.withFirstSetupRetry(parent, func(ctx context.Context) error {
+		calls++
+		cancel()
+		return errors.New("transient-looking failure")
+	})
+	if err == nil || calls != 1 {
+		t.Fatalf("父 ctx 终止后不得再试: calls=%d err=%v", calls, err)
+	}
+
+	closed := newRetryTestP2P()
+	defer closed.cancel()
+	closedCalls := 0
+	err = closed.withFirstSetupRetry(context.Background(), func(ctx context.Context) error {
+		closedCalls++
+		closed.mu.Lock()
+		closed.closed = true
+		closed.mu.Unlock()
+		return errors.New("transient-looking failure")
+	})
+	if err == nil || closedCalls != 1 {
+		t.Fatalf("closed 后不得再试: calls=%d err=%v", closedCalls, err)
+	}
+}
+
+// ---- 13c. StartP2P 首次 prepare 顺序与失败路径 ----
+
+// nodeStartP2PFixture 装配最小可 StartP2P 的节点：httptest master 供目录/状态/
+// 发布，stub runtime 供可编程 prepare/relay。publish 事件由 /peers/address 记录。
+type nodeStartP2PFixture struct {
+	t  *testing.T
+	n  *Node
+	rt *firstSetupRuntime
+	p  *nodeP2P
+
+	eventsMu sync.Mutex
+	events   []string
+}
+
+func newStartP2PFixture(t *testing.T, peerID string, pub []byte, dir peerauth.Directory) *nodeStartP2PFixture {
+	t.Helper()
+	dirRaw := nodeDirectoryJSON(t, dir)
+	f := &nodeStartP2PFixture{t: t}
+	f.rt = &firstSetupRuntime{stubNodeRuntime: stubNodeRuntime{peerID: peerID, pubKey: pub, addresses: []string{"/ip4/127.0.0.1/tcp/9001"}}}
+	f.rt.relayUntil = time.Now().Add(time.Hour)
+	f.rt.onPrepare = func() { f.record("prepare") }
+	f.rt.onReserve = func() { f.record("reserve") }
+
+	// TLS master：PublicationProof 要求精确 HTTPS origin。
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/peers/directory":
+			_, _ = w.Write(dirRaw)
+		case r.Method == http.MethodGet && r.URL.Path == "/peers/self":
+			writeTestJSON(w, http.StatusOK, peerauth.NodeState{EndpointRevision: 0})
+		case r.Method == http.MethodPost && r.URL.Path == "/peers/address":
+			var pubReq peerauth.AddressPublication
+			_ = json.NewDecoder(r.Body).Decode(&pubReq)
+			f.record("publish")
+			writeTestJSON(w, http.StatusOK, peerauth.Endpoint{
+				Role: peerauth.RoleNode, NodeID: 42, PeerID: pubReq.PeerID,
+				Addr: "127.0.0.1:9001", PublicKey: append([]byte(nil), pub...),
+				BindingRevision: pubReq.BindingRevision, Revision: pubReq.ExpectedRevision + 1,
+				Addresses: pubReq.Addresses, ValidUntil: time.Now().Add(time.Minute),
+			})
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	n := &Node{masterURL: ts.URL, httpClient: ts.Client(), advertise: "127.0.0.1:9001"}
+	n.nodeID.Store(42)
+	n.sec = &nodeSecurity{node: n}
+	n.sec.setPeerRuntime(f.rt)
+	n.sec.peerBinding = &peerauth.Binding{PeerID: peerID, PublicKey: append([]byte(nil), pub...), Revision: 3}
+	f.n = n
+	f.p = &nodeP2P{n: n, runtime: f.rt, negative: make(map[string]time.Time)}
+	n.p2p = f.p
+	return f
+}
+
+func (f *nodeStartP2PFixture) record(event string) {
+	f.eventsMu.Lock()
+	defer f.eventsMu.Unlock()
+	f.events = append(f.events, event)
+}
+
+func (f *nodeStartP2PFixture) snapshotEvents() []string {
+	f.eventsMu.Lock()
+	defer f.eventsMu.Unlock()
+	return append([]string(nil), f.events...)
+}
+
+// 首次 setup 顺序契约：prepare 必须先于首次 publication 与 relay 预约；预约
+// 仅在 ReserveRelay 真正成功后落库 relayUntil/relayAt。
+func TestNodeStartP2PPreparesBeforePublishAndReserve(t *testing.T) {
+	peerID, pub := nodePeerIdentity(t)
+	dir, infraID, _ := nodeValidDirectory(t)
+	f := newStartP2PFixture(t, peerID, pub, dir)
+
+	if err := f.n.StartP2P(context.Background()); err != nil {
+		t.Fatalf("StartP2P: %v", err)
+	}
+	// 关停 join publisher，之后断言终态。
+	if err := f.n.CloseP2P(); err != nil {
+		t.Fatalf("CloseP2P: %v", err)
+	}
+
+	events := f.snapshotEvents()
+	if want := []string{"prepare", "publish", "reserve"}; !equalStrings(events, want) {
+		t.Fatalf("首次 setup 事件 = %v, want %v", events, want)
+	}
+	f.rt.mu.Lock()
+	infra := f.rt.lastInfra
+	f.rt.mu.Unlock()
+	if infra.PeerID != infraID {
+		t.Fatalf("prepare 必须绑定当前目录的 infra 身份: got %q want %q", infra.PeerID, infraID)
+	}
+	f.p.mu.RLock()
+	until, at := f.p.relayUntil, f.p.relayAt
+	f.p.mu.RUnlock()
+	if until.IsZero() || !until.Equal(f.rt.relayUntil) || at.IsZero() {
+		t.Fatalf("成功预约后必须落库 relayUntil/relayAt: until=%v at=%v", until, at)
+	}
+}
+
+// 永久 infra 错误：StartP2P 立刻失败（1 次尝试、不重试、不预约），生命周期按
+// release 收尾（closed、拒绝型 authorizer、重启被拒）。
+func TestNodeStartP2PPermanentPrepareFailureReleases(t *testing.T) {
+	peerID, pub := nodePeerIdentity(t)
+	dir, _, _ := nodeValidDirectory(t)
+	f := newStartP2PFixture(t, peerID, pub, dir)
+	f.rt.mu.Lock()
+	f.rt.prepareErrs = []error{fmt.Errorf("infra has no public address: %w", peertransport.ErrInfrastructureInvalid)}
+	f.rt.mu.Unlock()
+
+	err := f.n.StartP2P(context.Background())
+	if !errors.Is(err, peertransport.ErrInfrastructureInvalid) {
+		t.Fatalf("StartP2P 必须透传永久 infra 错误，got %v", err)
+	}
+	if got := f.rt.prepareCount(); got != 1 {
+		t.Fatalf("永久错误不得重试，prepare attempts=%d", got)
+	}
+	if got := f.rt.relayCount(); got != 0 {
+		t.Fatalf("prepare 失败不得预约 relay，calls=%d", got)
+	}
+	if len(f.snapshotEvents()) != 1 {
+		t.Fatalf("prepare 失败后不得 publication: events=%v", f.snapshotEvents())
+	}
+	// release 已收尾：无残余权威，重启被拒。
+	if f.rt.Authorizer() == nil || f.rt.Authorizer()(context.Background(), "any-peer") {
+		t.Fatal("StartP2P 失败后必须安装拒绝型 authorizer")
+	}
+	if err := f.n.StartP2P(context.Background()); !errors.Is(err, errP2PClosed) {
+		t.Fatalf("失败后 StartP2P 应被拒（errP2PClosed），got %v", err)
+	}
+}
+
+// CloseP2P 必须 join 在途的首次 retry（真并发屏障：Close 在 PrepareInfrastructure
+// 挂起时发出，不是完成后冒充）。取消令在途尝试立刻返回错误，且不再有下一次
+// 尝试；CloseP2P 只有在 retry 收尾（release 释放 wg 槽位）后才返回。
+func TestNodeCloseP2PJoinsInflightFirstPrepareRetry(t *testing.T) {
+	peerID, pub := nodePeerIdentity(t)
+	dir, _, _ := nodeValidDirectory(t)
+	f := newStartP2PFixture(t, peerID, pub, dir)
+	var sawCancel atomic.Bool
+	prepareEntered := make(chan struct{})
+	var once sync.Once
+	f.rt.prepareBarrier = func(ctx context.Context, call int) error {
+		once.Do(func() { close(prepareEntered) })
+		select {
+		case <-ctx.Done():
+			sawCancel.Store(true)
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+			return errors.New("prepare was not cancelled by CloseP2P")
+		}
+	}
+
+	startErr := make(chan error, 1)
+	go func() { startErr <- f.n.StartP2P(context.Background()) }()
+	select {
+	case <-prepareEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("首次 prepare 未进入在途屏障")
+	}
+	closeDone := make(chan struct{})
+	go func() { _ = f.n.CloseP2P(); close(closeDone) }()
+
+	select {
+	case err := <-startErr:
+		if err == nil {
+			t.Fatal("并发关停下 StartP2P 必须失败（首次 prepare 被取消）")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseP2P 未终止在途首次 prepare retry")
+	}
+	<-closeDone
+	// join 证明：CloseP2P 只能在 release 释放 wg 槽位后返回，而 release 只能在
+	// 在途尝试观察到取消并返回后发生。
+	if !sawCancel.Load() {
+		t.Fatal("CloseP2P 返回前在途 prepare 必须已观察到取消")
+	}
+	if got := f.rt.prepareCount(); got != 1 {
+		t.Fatalf("取消后不得开始下一次尝试: %d", got)
+	}
+	if f.rt.Authorizer() == nil || f.rt.Authorizer()(context.Background(), "any-peer") {
+		t.Fatal("关停后必须安装拒绝型 authorizer")
+	}
+	if err := f.n.StartP2P(context.Background()); !errors.Is(err, errP2PClosed) {
+		t.Fatalf("关停后 StartP2P 应被拒，got %v", err)
+	}
+}
+
+// ---- 13d. 稳态周期：prepare 失败时同一坏 infra 的预约不得伪记成功 ----
+
+// 永久身份/授权错误：本周期跳过 reserve（relayUntil/relayAt 原样保留，不伪记）。
+func TestNodePublisherCycleSkipsReserveAfterPermanentPrepareFailure(t *testing.T) {
+	peerID, pub := nodePeerIdentity(t)
+	dir, _, _ := nodeValidDirectory(t)
+	f := newStartP2PFixture(t, peerID, pub, dir)
+	f.p.ctx, f.p.cancel = context.WithCancel(context.Background())
+	defer f.p.cancel()
+	f.rt.mu.Lock()
+	f.rt.prepareErrs = []error{fmt.Errorf("infra has no public address: %w", peertransport.ErrInfrastructureInvalid)}
+	f.rt.mu.Unlock()
+	// 预置过期预约：若无门控，reserve 必然会被尝试。
+	sentinel := time.Now().Add(-time.Hour)
+	f.p.mu.Lock()
+	f.p.relayUntil = sentinel
+	f.p.mu.Unlock()
+
+	f.n.publisherCycle(context.Background(), f.p)
+
+	if got := f.rt.relayCount(); got != 0 {
+		t.Fatalf("永久 prepare 失败后本周期不得预约，relay calls=%d", got)
+	}
+	f.p.mu.RLock()
+	until, at := f.p.relayUntil, f.p.relayAt
+	f.p.mu.RUnlock()
+	if !until.Equal(sentinel) || !at.IsZero() {
+		t.Fatalf("失败不得伪记预约状态: until=%v at=%v", until, at)
+	}
+}
+
+// 暂时性错误（含 tick 超时）：仍独立尝试预约修复，真成功才落库。
+func TestNodePublisherCycleReservesAfterTransientPrepareFailure(t *testing.T) {
+	peerID, pub := nodePeerIdentity(t)
+	dir, _, _ := nodeValidDirectory(t)
+	f := newStartP2PFixture(t, peerID, pub, dir)
+	f.p.ctx, f.p.cancel = context.WithCancel(context.Background())
+	defer f.p.cancel()
+	f.rt.mu.Lock()
+	f.rt.prepareErrs = []error{errors.New("center temporarily unreachable")}
+	f.rt.mu.Unlock()
+
+	f.n.publisherCycle(context.Background(), f.p)
+
+	if got := f.rt.relayCount(); got != 1 {
+		t.Fatalf("暂时性 prepare 失败仍应尝试预约修复，relay calls=%d", got)
+	}
+	f.p.mu.RLock()
+	until, at := f.p.relayUntil, f.p.relayAt
+	f.p.mu.RUnlock()
+	if until.IsZero() || !until.Equal(f.rt.relayUntil) || at.IsZero() {
+		t.Fatalf("真成功预约才落库: until=%v at=%v", until, at)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ---- 13. EnableP2P 把生命周期锚到调用方 ctx：SIGTERM 中止在途首次注册 ----

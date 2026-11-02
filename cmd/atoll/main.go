@@ -153,7 +153,7 @@ func runAuth(args []string, stdout, stderr io.Writer) int {
 
 // ---- master ----
 
-func runMaster(args []string, stderr io.Writer) int {
+func runMaster(args []string, stderr io.Writer) (code int) {
 	fs := flag.NewFlagSet("master", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	listen := fs.String("listen", ":9420", "监听地址")
@@ -316,7 +316,16 @@ func runMaster(args []string, stderr io.Writer) int {
 		// peer 循环必须先在 store 关闭前停止：runtime 的 resolver 闭包持有
 		// store 引用，关闭顺序反了会在关库后继续读。
 		if peerPs != nil {
-			_ = peerPs.Close()
+			if err := peerPs.Close(); err != nil {
+				// 诊断落盘失败必须改判退出码并写明 stderr，绝不静默假成功；
+				// 其余关停错误维持旧行为（仅日志）。
+				if peerDiagnosticsCloseExit(peerPs.rt, err) {
+					fmt.Fprintf(stderr, "atoll master: peer 诊断落盘失败: %v\n", err)
+					code = 1
+				} else {
+					log.Printf("peer data plane close: %v", err)
+				}
+			}
 		}
 		store.Close()
 	}()
@@ -383,6 +392,7 @@ func runMaster(args []string, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "atoll master:", err)
 			return 1
 		}
+		announcePeerDiagnostics(peerPs.rt, nil)
 	}
 	if *secure {
 		srv.AttachSecureTransports()
@@ -436,7 +446,7 @@ func serve(srv *http.Server, certFile, keyFile string, stderr io.Writer, banner 
 
 // ---- node ----
 
-func runNode(args []string, stderr io.Writer) int {
+func runNode(args []string, stderr io.Writer) (code int) {
 	fs := flag.NewFlagSet("node", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
@@ -507,10 +517,18 @@ func runNode(args []string, stderr io.Writer) int {
 		}
 		// runtime 创建成功这一刻起，任何退出路径都必须关闭它（信号 ctx 取消不会
 		// 自动关闭 libp2p host）。CloseP2P 对未启用的 P2P 是 no-op；peerPs.Close
-		// 内部再次 Close runtime（幂等）并等 Serve 返回。
+		// 内部再次 Close runtime（幂等，返回保存的结果）并等 Serve 返回。诊断
+		// 落盘随首次 Close 一次性完成，落盘失败改判退出码并写明 stderr。
 		defer func() {
 			_ = n.CloseP2P()
-			_ = peerRT.Close()
+			if err := peerRT.Close(); err != nil {
+				if peerDiagnosticsCloseExit(peerRT, err) {
+					fmt.Fprintf(stderr, "atoll node: peer 诊断落盘失败: %v\n", err)
+					code = 1
+				} else {
+					log.Printf("peer runtime close: %v", err)
+				}
+			}
 			if peerPs != nil {
 				_ = peerPs.Close()
 			}
@@ -552,6 +570,7 @@ func runNode(args []string, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "atoll node:", err)
 			return 1
 		}
+		announcePeerDiagnostics(peerRT, nil)
 	}
 	httpSrv := &http.Server{
 		Addr:              *listen,
@@ -582,7 +601,7 @@ func runNode(args []string, stderr io.Writer) int {
 
 // ---- FUSE 挂载 ----
 
-func runMount(args []string, stderr io.Writer) int {
+func runMount(args []string, stderr io.Writer) (code int) {
 	fset := flag.NewFlagSet("mount", flag.ContinueOnError)
 	fset.SetOutput(stderr)
 	masterURL := fset.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
@@ -638,7 +657,19 @@ func runMount(args []string, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "atoll mount:", err)
 			return 1
 		}
-		defer closeClientP2P(c, peerRT)
+		defer func() {
+			if err := closeClientP2P(c, peerRT); err != nil {
+				// 诊断落盘失败必须改判退出码并写明 stderr，绝不静默假成功。
+				if peerDiagnosticsCloseExit(peerRT, err) {
+					fmt.Fprintf(stderr, "atoll mount: peer 诊断落盘失败: %v\n", err)
+					code = 1
+				} else {
+					log.Printf("peer runtime close: %v", err)
+				}
+			}
+		}()
+		// runMount 无 stdout 通道：私有路径提示走 log，与 master/node 一致。
+		announcePeerDiagnostics(peerRT, nil)
 	}
 	if *clientUploadBPS != 0 || *clientDownloadBPS != 0 {
 		if err := c.SetTransferBudget(types.TransferBudget{UploadBPS: *clientUploadBPS, DownloadBPS: *clientDownloadBPS, MaxConcurrent: *clientTransferConcurrency}); err != nil {
@@ -690,7 +721,7 @@ func runMount(args []string, stderr io.Writer) int {
 
 // ---- 客户端命令 ----
 
-func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
+func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) (code int) {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	masterURL := fs.String("master", envDefault("ATOLL_MASTER", "http://127.0.0.1:9420"), "master 地址")
@@ -733,7 +764,19 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "atoll client:", err)
 			return 1
 		}
-		defer closeClientP2P(c, peerRT)
+		defer func() {
+			if err := closeClientP2P(c, peerRT); err != nil {
+				// 诊断落盘失败必须改判退出码并写明 stderr，绝不静默假成功；
+				// 其余关停错误维持旧行为（仅日志）。
+				if peerDiagnosticsCloseExit(peerRT, err) {
+					fmt.Fprintf(stderr, "atoll client: peer 诊断落盘失败: %v\n", err)
+					code = 1
+				} else {
+					log.Printf("peer runtime close: %v", err)
+				}
+			}
+		}()
+		announcePeerDiagnostics(peerRT, stdout)
 	}
 	if *clientUploadBPS != 0 || *clientDownloadBPS != 0 {
 		if err := c.SetTransferBudget(types.TransferBudget{UploadBPS: *clientUploadBPS, DownloadBPS: *clientDownloadBPS, MaxConcurrent: *clientTransferConcurrency}); err != nil {
@@ -777,9 +820,13 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 			}
 		}
 		if err != nil {
+			// 失败也记一条独立终判事件（有界类别，不含原始错误文本）。
+			recordPeerDiagnosticsResult(peerRT, "put", err)
 			fmt.Fprintf(stderr, "put 失败: %v\n", err)
 			return 1
 		}
+		// CLI 最终判定是操作级事实：流层 socket EOF 不代表 CRC/AEAD/commit 完成。
+		recordPeerDiagnosticsResult(peerRT, "put", nil)
 		action := "已上传"
 		if *force {
 			action = "已覆盖"
@@ -816,9 +863,13 @@ func runClientCmd(cmd string, args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		if err := c.Get(fs.Arg(0), fs.Arg(1)); err != nil {
+			// 失败也记一条独立终判事件（有界类别，不含原始错误文本）。
+			recordPeerDiagnosticsResult(peerRT, "get", err)
 			fmt.Fprintf(stderr, "get 失败: %v\n", err)
 			return 1
 		}
+		// CLI 最终判定是操作级事实：流层 socket EOF 不代表 CRC/AEAD/commit 完成。
+		recordPeerDiagnosticsResult(peerRT, "get", nil)
 		fmt.Fprintf(stdout, "已下载 %s → %s\n", fs.Arg(0), fs.Arg(1))
 	case "ls":
 		if fs.NArg() != 1 {

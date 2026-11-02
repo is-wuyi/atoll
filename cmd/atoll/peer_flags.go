@@ -12,7 +12,9 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-const defaultP2PListen = "/ip4/0.0.0.0/tcp/0"
+// defaultP2PListen 未显式 -p2p-listen 时 TCP+QUIC 同绑：零 NAT 场景 QUIC 常是
+// 唯一可被中心直连观测的候选；显式 -p2p-listen 完全覆盖。
+var defaultP2PListen = []string{"/ip4/0.0.0.0/tcp/0", "/ip4/0.0.0.0/udp/0/quic-v1"}
 
 // p2pStringList accepts both repeated flags and comma-separated values. Keeping
 // raw values as canonical multiaddrs lets peertransport perform the same
@@ -58,28 +60,33 @@ func (v *p2pStringList) clone() []string {
 }
 
 type p2pCLIFlags struct {
-	enabled    *bool
-	listen     p2pStringList
-	announce   p2pStringList
-	identity   *string
-	publicOnly *bool
+	enabled     *bool
+	listen      p2pStringList
+	announce    p2pStringList
+	identity    *string
+	publicOnly  *bool
+	diagnostics *string
 }
 
 func addP2PFlags(fs *flag.FlagSet) *p2pCLIFlags {
 	p := &p2pCLIFlags{}
 	p.enabled = fs.Bool("p2p", false, "启用安全 peer 数据面")
 	p.listen.allowEphemeral = true
-	fs.Var(&p.listen, "p2p-listen", "peer 监听 multiaddr（可重复或逗号分隔；默认 /ip4/0.0.0.0/tcp/0）")
+	fs.Var(&p.listen, "p2p-listen", "peer 监听 multiaddr（可重复或逗号分隔；默认 /ip4/0.0.0.0/tcp/0 与 /ip4/0.0.0.0/udp/0/quic-v1）")
 	p.announce.allowDNS = true
 	fs.Var(&p.announce, "p2p-announce", "覆盖自动发现的 peer 公布 multiaddr（可重复或逗号分隔）")
 	p.identity = fs.String("p2p-identity", "", "peer 持久身份文件（空 = 使用角色默认路径；用户客户端为空时使用临时身份）")
-	p.publicOnly = fs.Bool("p2p-public-only", false, "只允许公布和使用公共 peer 地址")
+	// 公网安全默认开启；显式 false 是隔离 local/LAN 模式。公布空公共地址列表
+	// 合法（不强迫手填私网/ET IP），infra 缺公网地址由 prepare 以 invalid 拒绝。
+	p.publicOnly = fs.Bool("p2p-public-only", true, "只允许公布和使用公共 peer 地址（默认开启；显式 false 进入隔离 local/LAN 模式）")
+	// 仅登记 flag；私有 JSON writer 由诊断层接线。
+	p.diagnostics = fs.String("p2p-diagnostics", "", "peer 诊断 JSON 输出路径（空 = 关闭）")
 	return p
 }
 
 func (p *p2pCLIFlags) listenAddresses() []string {
 	if len(p.listen.values) == 0 {
-		return []string{defaultP2PListen}
+		return append([]string(nil), defaultP2PListen...)
 	}
 	return p.listen.clone()
 }

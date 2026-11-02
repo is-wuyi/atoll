@@ -114,13 +114,30 @@ func peerPath(effective string) peerhttp.Path {
 	}
 }
 
+type pathLog struct {
+	mu    sync.Mutex
+	paths []peerhttp.Observation
+}
+
+func (l *pathLog) add(o peerhttp.Observation) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.paths = append(l.paths, o)
+}
+
+func (l *pathLog) snapshot() []peerhttp.Observation {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]peerhttp.Observation(nil), l.paths...)
+}
+
 // peerClient builds the production client's HTTP stack over the prototype's
 // peer dialer. peerhttp.NewTransport supplies the base transport and the peer
 // routing (fresh connection per request, so a reported path is always the path
 // that request took); auth.Transport is the production client's own credential
 // wrapper; DialConfig.NewHTTPClient supplies the base transport whose
 // DialContext opens a libp2p stream.
-func peerClient(t *testing.T, dc *pt.DialConfig, tlsCfg *tls.Config, paths *[]peerhttp.Observation) *client.Client {
+func peerClient(t *testing.T, dc *pt.DialConfig, tlsCfg *tls.Config, paths *pathLog) *client.Client {
 	t.Helper()
 	base := dc.NewHTTPClient().Transport.(*http.Transport)
 	base.TLSClientConfig = tlsCfg
@@ -140,7 +157,7 @@ func peerClient(t *testing.T, dc *pt.DialConfig, tlsCfg *tls.Config, paths *[]pe
 		if paths == nil {
 			return
 		}
-		*paths = append(*paths, o)
+		paths.add(o)
 	}})
 	return &client.Client{
 		MasterURL: "http://127.0.0.1:1",
@@ -220,7 +237,7 @@ func TestProductionNodeHandlerOverTLSPeerStream(t *testing.T) {
 		DirectTimeout:  5 * time.Second,
 		ConnectTimeout: 10 * time.Second,
 	}
-	var paths []peerhttp.Observation
+	var paths pathLog
 	c := peerClient(t, dc, clientTLS, &paths)
 
 	payload := make([]byte, 512<<10)
@@ -283,13 +300,30 @@ func TestProductionNodeHandlerOverTLSPeerStream(t *testing.T) {
 	if st.RemoteMultiaddr == "" || strings.Contains(st.RemoteMultiaddr, "p2p-circuit") {
 		t.Fatalf("remote multiaddr = %q", st.RemoteMultiaddr)
 	}
-	if len(paths) != 2 {
-		t.Fatalf("path observations = %d, want 2: %v", len(paths), paths)
+	observations := paths.snapshot()
+	if len(observations) != 4 {
+		t.Fatalf("path observations = %d, want two dial/response pairs: %v", len(observations), observations)
 	}
-	for _, o := range paths {
-		if o.Path != peerhttp.PathDirect || o.Scheme != "https" {
-			t.Fatalf("observation %v, want scheme=https path=direct", o)
+	for i, o := range observations {
+		if o.Path != peerhttp.PathDirect || o.Scheme != "https" || o.Master || o.RequestID == "" || o.RequestPath != "/objects/1" || o.ErrorKind != peerhttp.ErrorNone {
+			t.Fatalf("observation %v, want a successful HTTPS direct object request", o)
 		}
+		method, status := http.MethodPut, http.StatusCreated
+		if i >= 2 {
+			method, status = http.MethodGet, http.StatusOK
+		}
+		phase := peerhttp.PhaseDial
+		if i%2 == 1 {
+			phase = peerhttp.PhaseResponse
+		} else {
+			status = 0
+		}
+		if o.Method != method || o.Phase != phase || o.Status != status || o.Identity != nodeHost.ID().String() {
+			t.Fatalf("observation has wrong method/phase/receipt/peer: %+v", o)
+		}
+	}
+	if observations[0].RequestID != observations[1].RequestID || observations[2].RequestID != observations[3].RequestID || observations[0].RequestID == observations[2].RequestID {
+		t.Fatal("dial and response observations were not bound to two distinct requests")
 	}
 
 	calls0, authz, untls, vers := rec.snapshot()

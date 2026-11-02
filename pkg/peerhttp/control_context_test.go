@@ -10,9 +10,19 @@ func TestControlContextKeepsCancellationButDropsDataPathAndReporter(t *testing.T
 	ctx = WithPath(ctx, PathDirect)
 	reports := 0
 	ctx = WithReporter(ctx, &Reporter{Observe: func(Observation) { reports++ }})
+	ctx = WithRequestID(ctx, "data-request-1")
+	// A data dial context carries the private request meta; a control request
+	// derived from it must not inherit any of it.
+	ctx = context.WithValue(ctx, metaKey, &requestMeta{requestID: "data-request-1", method: "GET"})
 	control := ControlContext(ctx)
 	if _, required := RequiredPath(control); required {
 		t.Fatal("control request inherited data path")
+	}
+	if RequestID(control) != "" {
+		t.Fatal("control request inherited the data request ID")
+	}
+	if metaFrom(control) != nil {
+		t.Fatal("control request inherited the data request meta")
 	}
 	transport := &Transport{}
 	transport.report(control, Observation{Master: true})
@@ -25,5 +35,8 @@ func TestControlContextKeepsCancellationButDropsDataPathAndReporter(t *testing.T
 	}
 	if path, _ := RequiredPath(ctx); path != PathDirect {
 		t.Fatal("original data path mutated")
+	}
+	if RequestID(ctx) != "data-request-1" {
+		t.Fatal("original data request ID mutated")
 	}
 }

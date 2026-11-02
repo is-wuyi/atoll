@@ -8,6 +8,7 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	relaypb "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/pb"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	ma "github.com/multiformats/go-multiaddr"
 
@@ -28,14 +29,37 @@ const (
 // The caller (node/client) manages TTL renewal and retry; this only issues one
 // reservation.
 func (r *Runtime) ReserveRelay(ctx context.Context, infra peerauth.Infrastructure) (time.Time, error) {
-	ai, err := infraAddrInfo(infra)
+	operation, finish, err := r.operationContext(ctx)
 	if err != nil {
 		return time.Time{}, err
 	}
+	defer finish()
+	ctx = operation
+	ai, err := infraAddrInfo(infra)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%w: %v", ErrInfrastructureInvalid, err)
+	}
+	if !r.auth.authorize(ctx, infra.PeerID) {
+		return time.Time{}, ErrPeerUnauthorized
+	}
 	rctx, cancel := context.WithTimeout(ctx, relayReserveTimeout)
 	defer cancel()
-	res, err := relayclient.Reserve(rctx, r.mainHost, ai)
+	bounded := &reservationHost{Host: r.mainHost}
+	defer bounded.finish()
+	res, err := relayclient.Reserve(rctx, bounded, ai)
 	if err != nil {
+		if rctx.Err() != nil {
+			return time.Time{}, rctx.Err()
+		}
+		var reservation relayclient.ReservationError
+		if errors.As(err, &reservation) {
+			switch reservation.Status {
+			case relaypb.Status_PERMISSION_DENIED:
+				return time.Time{}, fmt.Errorf("%w: relay denied reservation", ErrPeerUnauthorized)
+			case relaypb.Status_MALFORMED_MESSAGE:
+				return time.Time{}, fmt.Errorf("%w: malformed relay reservation", ErrInfrastructureInvalid)
+			}
+		}
 		return time.Time{}, fmt.Errorf("peertransport: relay reservation: %w", err)
 	}
 	return res.Expiration, nil
