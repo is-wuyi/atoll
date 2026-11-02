@@ -1,6 +1,12 @@
-# 内置 P2P 最小接线：本地与 Linux CI 验收
+# 内置 P2P：分阶段本地、Linux CI 与隔离公网验收
 
-## 结论
+## 当前批次状态（2026-11-02）
+
+自动公网接线已实现，最终 [Linux 完整验证 41374454040](https://github.com/is-wuyi/atoll/actions/runs/41374454040) 的根模块 race、vet 与两个独立模块 race 均退出 0。隔离第三方 NAS 无手填 announce、无 NAT/DNS 修改：已确认自动公网候选、双侧 QUIC DCUtR 成功和后续同连接 stream、256 KiB/1 MiB 双副本 AEAD 完整读写，以及读中真实节点退出后的故障转移。**8 MiB 多副本稳定性和 Darwin 全根稳定性仍未通过；完整自动公网批次尚未验收，不把本次预验收快照当最终交付。** 详见本报告的“自动公网接线与隔离 NAS”章节和 [本轮结构化证据](scripts/transferlab/evidence/2026-11-02-auto-public-p2p.json)。
+
+本轮源码仅在 `ci/p2p-validation-20261102-auto` 留有预验收提交，开发分支仍保留未提交实现。两个 NAS 和中心的本轮隔离目录、进程及运行态防火墙规则均已核对清理；未替换其它测试部署、拆除 EasyTier、迁移数据或合并 main。
+
+## 2026-10-31 最小接线历史结论
 
 **生产 P2P 最小接线已通过本地与 Linux CI 验收，可交付开发分支。** [Linux 完整验证 41182185516](https://github.com/is-wuyi/atoll/actions/runs/41182185516) 的根模块竞态、vet 和两个独立模块均退出 0；macOS 已提交源码快照的带取证全根竞态也退出 0（1143.411 秒）。真实 TLS、授权发现、AEAD、多块恢复、节点复制、直连/中继、同身份重启和完整 CLI 进程用例均已覆盖。历史失败、预验收提交及其修正保留在下文，不宣称所有轮次全绿。
 
@@ -237,10 +243,71 @@ macOS 全根及双平台 CLI 构建来自精确提交 `ddba3c21ae45d9b6ca7fcdecb
 
 第二轮五个运行中隔离进程已按 owner JSON 三字段、uid、cwd、可执行文件与开始时间精确核对后 SIGTERM，并确认退出；29570/29573/29580/29583/29590/29593 的 runtime 规则已移除，permanent 未增加。日志、owner 与 Master 数据库先保存到本地私有归档，再复核无活跃进程、无符号链接和物理路径后删除五台 NAS 与中心三个隔离目录。中心 mesh SSH 的一次超时保留，改用公网入口完成清理；本轮目录已全部清理，不触及其它测试目录。本段是复核与纠正，不是新的公网通过结果；后续应补自动公网候选、授权可达性探测及逐请求路径取证后再进行验收。
 
+## 自动公网接线与隔离 NAS（2026-11-02）
+
+### 架构硬约束与实现
+
+第三方 NAS 不由用户控制，不能要求节点主人修改 NAT、端口映射、UPnP/NAT-PMP 或系统 DNS；设备随时离线是正常条件。普通节点和客户端不填 `-p2p-announce`，控制面固定到证书验证的公网中心，数据面自动发现候选、协商 DCUtR，失败后仅走授权 relay。
+
+- 同登记身份的 dial-only AutoNAT 回拨 host 使用独立 peerstore/连接池，关闭 Identify 地址发布、无监听和对象服务；保留请求方授权、nonce、速率和资源限额，不放行未知 peer，不因探测结束关闭主数据连接。通过 libp2p v0.50.0 公开 Fx/AutoNAT 接缝保留原生可达性 tracker。
+- 受信中心的真实 Identify 观测必须匹配当前 PeerID/公钥、授权代次和租期、连接、监听端口、地址族与传输类型；候选仍不是 Public 确认，不伪造多个观察者或降低全局阈值。回拨 nonce 负向、候选更新/撤销/过期、关停与部分构造失败有回归。
+- CLI 默认 TCP+QUIC、公网地址政策开启；首次中心准备和 relay 预约有界重试，永久身份/授权错误立即拒绝。caller 取消约束已打开的预约流，并 join Reset 回调。
+- opt-in 逐请求诊断关联实际 PeerID、connection/stream、multiaddr、请求 ID、方法和路径；dial、HTTP 正文结束、CLI 结果分别记录，保留 `path`/`fallback`/`fallback_upgraded`。JSON 只新建 0600、8192 事件/4 MiB，不采 query、body、凭据、私钥或原始错误文本。
+- 主审确定性复现并修复诊断/传输的 Master 域名大小写及默认 `:443` 分类分歧。只改同源比较，不重写已签名逻辑节点地址；无效/非 HTTPS 的诊断 origin 不注入观察。修前 sentinel 回归失败、修后通过。
+
+本地故障夹具另修失败清理与全局 `ChunkSize` 竞争：真实 worker 先取消并 join，响应 body EOF/Close 前不释放请求登记。CLI 夹具的 30 秒命令计时移到编译完成之后，构建自身的两分钟限额与命令三十秒限额均未放宽。loopback-only 组件不再监听 `0.0.0.0`，避免将本机 EasyTier/Tailscale/代理接口公布成“本地”候选；生产默认监听不变。主审真实 TCP runtime 对照确认当前 macOS 默认 reuseport 的出站端口等于监听端口，既有端口过滤没有放宽，不能外推所有平台/NAT。
+
+### 精确源码与本地/Linux 结果
+
+基线 `73dc7c2e71a7d2c3ac6b4e5fa0c2a0d27c9c58eb`。仅预验收分支提交：
+
+| 提交 | Linux run | 结果与范围 |
+| --- | --- | --- |
+| `926bf659d748bb5d311aa98e38d9c99c022e66e9` | [41368592139](https://github.com/is-wuyi/atoll/actions/runs/41368592139) | 四项全部退出 0；尚未含同源分类/CLI 计时/读取清理补强 |
+| `8cf1f319d80f4aaf85978ce1c44f3e7ff62948d9` | [41370272035](https://github.com/is-wuyi/atoll/actions/runs/41370272035) | 四项全部退出 0，含上述补强 |
+| `7aa598ebbf15b028465438549fe3dbf69dc97baf` | [41374454040](https://github.com/is-wuyi/atoll/actions/runs/41374454040) | 最终代码与测试，增加纯 loopback 夹具；四项全部退出 0 |
+
+主审把每次 Actions artifact 下载到独立新目录，逐项核对 `.exit`、完整日志和 Guard。最终 Linux `integration/peer` 为 109.217 秒，`pkg/peertransport` 10.648 秒，无 race/FAIL；仓库当前代码逐文件与最终 CI 相同，只有之后的验收文档/证据更新不在该代码测试提交内。根 Go 要求保持 `1.26.0`，工具链为 `1.26.7`。
+
+Darwin 的固定本地快照结果不合并成全绿：
+
+- 修正后的核心、五项故障/恢复定点、TLS 原型新观测断言、三个 NAT 真实组件定点均通过。
+- 第二轮 `cmd/atoll -race` 整包退出 0（108.059 秒），`integration/peer -race` 整包退出 0（377.827 秒）；最终 loopback 夹具整包再次退出 0（253.125 秒，命令含构建共 272.799 秒）。
+- 第二轮全根仍退出 1（1329.399 秒）：`TestPlannedWriteRecoverySlowProgressOutlivesLegacyTimeout` 得到 422 无可行布局；`TestPeerNATRestartSameIdentityCachedRediscovery` 旧地址拨号后目录强刷超过期限。没有 race。后者的 wildcard 本机接口污染已改为 loopback 并整包通过，未再进行最终代码全根；前者仍未定因或修复，不把 Linux 通过、孤立复跑通过当作 Darwin 全量通过。
+- 第二轮 root vet 与两个独立原型模块 race 均退出 0；最初一轮存在夹具 race、CLI 构建期限和旧原型“两条观察”断言失败，原始失败与不同快照哈希保留。
+
+### 隔离公网与内容证据
+
+中心使用新隔离 HTTPS origin `https://193.134.209.37:29600`，仅中心声明 TCP/QUIC 的真实公网监听；NAS 29038、29663 来自中心 EasyTier 当前清单，SSH 通过中心管理，但对象数据只使用自动公网候选和内置 relay。逻辑 HTTPS 节点名为本轮证书匹配的稳定测试名称，没有把 mesh/LAN IP 注入 peer 公布配置。
+
+真机二进制来自 `8cf1f319` 等价的固定源码清单 `d2e7dfb7d2b259fe124736ea0093f871e7d0af618e9122222a511a803d54df88`；最终 `7aa598e` 只改本地测试监听，不改生产实现。Linux/amd64 SHA-256 `c8929bc5645085f7b15725e3632f1977a59bb2f32dbd4d1a7ddd0164d6718f44`，Darwin/amd64 `6f55e2cd633b8a64f5898d24e571ffbc9169b81f68155ebbf2eee31506e8fee6`。
+
+- `normal256`：256 KiB，两个实际 PUT 为 circuit、`fallback=true`；权威 AEAD 块 replicas/Done 均为节点 2、3，完整 GET 内容校验一致。GET 使用已认证公网 QUIC direct，但客户端没有同请求 DCUtR 成功事件，不称为客户端打洞成功。
+- `strictrelay256` 与 `strictrelay1MiB`：主动严格 circuit 的双副本上传和完整回读均通过，所有对象观察保持 `fallback=false`。strict relay 成功不意味着自动打洞成功。
+- `crossnas256`：客户端实际运行在隔离 NAS 内，无手填 announce，两个 circuit PUT、完整 circuit GET 和内容校验通过；失败打洞事件如实保留。
+- 独立从两台 NAS 取回 `1099511628032` 的实际密文，均 262276 字节、SHA-256 `164eaaecea33a560d53a4aea077852e997d458a84cdae7e41860580aee7cad50`；CRC32C 595829710 与块表一致。主审逐 AEAD 记录解密比对完整明文，篡改被拒绝，不以 socket EOF 或复制进度代替校验。
+- 两个节点最终 runtime 诊断均有一次对应对端的 `holepunch_finished success=true`：公网 QUIC 候选分别为 `49.76.119.132:3445` 与 `161.142.150.94:24558`。双方的实际 connection ID 与随后本节点 direct dial/stream 对上，证明该轮 NAS↔NAS DCUtR 成功及连接复用；节点默认诊断未装逐对象 HTTP 观察，不能仅由这些 dial 事件绑定具体成功对象或宣称大文件复制完成。
+- 读中节点退出：1 MiB 已发布文件有两个 Done。客户端先读到 512 个真实字节，再按 owner/PID/start ticks 精确 SIGTERM 29663；同对象首 GET 在原 circuit 上读失败，随后 29038 的独立连接/请求完成，最终 SHA-256 一致。客户端屏障不能证明服务端未多缓冲，但真实首请求失败与第二请求完成使本轮故障转移成立。
+
+### 未通过的公网大文件场景
+
+8 MiB 双副本仍是本批阻塞项，不承诺生产级稳定性：
+
+- 首个 CLI 上传达到外层 300 秒 guard 被终止，未落 CLI 收尾诊断；未见已发布文件，不计成功或吞吐。
+- 100 秒外层诊断在 macOS 与 NAS 客户端都曾取消大文件操作；真实事件确认已获得 circuit stream，但部分正文/确认未完成，不能把进程退出 0 当操作成功（独立诊断程序用 `operation ok=false` 表达结果）。
+- NAS 内十分钟外层复测没有放宽生产一分钟 idle/三十分钟 HardUntil：一台节点回 201，另一台发生 read/reset，后续尝试在外层到期取消，仍未完成两个保存确认。对应完整事件、节点临时文件正字节和失败状态已私有归档；没有将第一份完整副本丢弃或降低确认要求。
+- 不能仅按丢包采样、UDP 缓冲警告、`DirectDial`、公网 multiaddr 或暂存文件增长给失败定根因。需要下一批针对慢上传/中继与复制流的精确请求绑定与恢复取证，不要求节点主人改 NAT。
+
+### 清理与交付状态
+
+本轮两台节点及中心全部按 owner JSON 三字段、uid、真实物理路径、PID/cwd/executable/start ticks 精确核验后 SIGTERM，已退出。中心数据库、恢复材料与诊断先保存到私有持久归档，不发布凭据；删除前再次遍历 `/proc` 确认没有活跃进程占用隔离目录，再删除三个目录。29600/tcp、29602/tcp、29603/udp 的 runtime TTL 规则已移除并查询确认为不存在，未修改 permanent 或 EasyTier。27119 原有离线残留不属于本轮，未操作。
+
+最终代码留在 CI 预验收分支，`feat/admin-console` 本轮尚未提交推送；原授权以完整可独立验收批次通过为条件，大文件和 Darwin 全量边界仍阻塞，不能自行把预验收升级为最终交付。
+
 ## 未覆盖的边界
 
-- 真实公网直连、NAT 打洞和公网地址变化尚未执行；隔离跨 NAS 的 direct 只证明非 circuit，不能证明非 overlay。部分组件夹具监听全部本机网卡，CLI 子进程夹具显式仅监听 loopback。
+- 只证明本轮列出的公网候选、NAS↔NAS QUIC 打洞、有限内容闭环和读故障转移，不覆盖所有 NAT 组合、TCP 公网打洞、公网地址变化或大文件稳定性。
 - 未执行内核 FUSE 挂载；挂载侧仅复用同一生产客户端 transport。
-- 未运行正式集群升级、恢复材料迁移或全损灾备演练。
+- 未替换其它测试部署、迁移恢复材料或执行全损灾备演练；没有合并 main。
 - 断流后的安全由既有块级重传与重规划契约负责，已经打开的流不会被透明迁移。
 - 调度输入中的注入 RTT/路径只用于确定性选路，不能作为实测延迟或吞吐；没有公布网络吞吐数字。

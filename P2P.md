@@ -4,7 +4,7 @@
 
 内置 P2P 是显式启用的安全数据面，不替代文件模型、内容加密或保存确认规则。未配置 `-p2p` 的旧 HTTPS/HTTP 使用方式保持原样；已初始化 P2P 的 Master 数据库重启时必须继续启用 P2P，不允许静默降级。
 
-本地验收由 `integration/peer` 的真实 Master、设备、客户端、TLS 与 peer runtime 组合覆盖；测试名称和执行结果见 [本批验收记录](P2P_ACCEPTANCE.md)。普通 `direct` 仅表示没有经过 CircuitRelay，不能据此判断连接是否经过 EasyTier、Tailscale 或其它 overlay。本批代码接线不等于真实公网打洞验收，不替换正式集群、不拆除 EasyTier、不迁移正式数据。
+本地验收由 `integration/peer` 的真实 Master、设备、客户端、TLS 与 peer runtime 组合覆盖；测试名称和执行结果见 [分阶段验收记录](P2P_ACCEPTANCE.md)。普通 `direct` 仅表示没有经过 CircuitRelay，不能据此判断连接是否经过 EasyTier、Tailscale 或其它 overlay。2026-11-02 隔离 NAS 已取得自动公网候选、一次双侧 QUIC DCUtR 成功及后续同连接 stream、小块/1 MiB 双副本完整读写和读中断故障转移；8 MiB 多副本稳定性仍未通过，不能将本批描述为完整公网验收完成。没有替换其它测试部署、拆除 EasyTier 或迁移数据。
 
 ## 身份、地址与授权
 

@@ -444,6 +444,9 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 		nodeByID[n.ID] = n
 	}
 	for _, c := range in.Chunks {
+		if in.Staging && c.WriteEpoch > 0 {
+			continue // The active write owns recovery and its confirmation set.
+		}
 		// Done 是按块的：done 集合必须每块单独算，绝不能跨块累积。此前用一个跨块
 		// doneAll，节点在别的块 Done 就会被本块跳过——恰是"某节点 chunk0 Done、
 		// chunk1 的 Done 报告丢了"这一场景不补标，chunk1 零 Done → commit 409 死循环，
@@ -470,6 +473,9 @@ func (s *Scanner) repairChunkedInode(in types.Inode, nodes []types.NodeInfo, now
 		}
 	}
 	for _, c := range in.Chunks {
+		if in.Staging && c.WriteEpoch > 0 {
+			continue
+		}
 		chunkID := types.ChunkObjID(c, in.ID)
 		// 单副本窗口告警（改进项2）：块存活副本数（Done 且节点 alive）< len(Replicas)
 		// 持续超过阈值 → WARN 一次；恢复 → INFO + 清记录。失败告警期间用户至少知道

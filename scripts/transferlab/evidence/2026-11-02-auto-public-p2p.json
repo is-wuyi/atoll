@@ -1,0 +1,453 @@
+{
+  "date": "2026-11-02",
+  "scope": "automatic public production P2P pre-acceptance; isolated third-party NAS",
+  "baseline": "73dc7c2e71a7d2c3ac6b4e5fa0c2a0d27c9c58eb",
+  "code_snapshot": "7aa598ebbf15b028465438549fe3dbf69dc97baf",
+  "developer_branch_batch_committed": false,
+  "full_batch_accepted": false,
+  "linux": {
+    "run_id": 41374454040,
+    "url": "https://github.com/is-wuyi/atoll/actions/runs/41374454040",
+    "head_sha": "7aa598ebbf15b028465438549fe3dbf69dc97baf",
+    "exit_codes": {
+      "proto-peertransport-production": 0,
+      "proto-peertransport": 0,
+      "root-test": 0,
+      "root-vet": 0
+    },
+    "all_logs_checked": true,
+    "data_races": 0,
+    "root_log_sha256": "0db8742600ac55ade5c086580c94eea6e473160059e6f91735ae9115ae3549a7"
+  },
+  "darwin": {
+    "core_and_regression_passed": true,
+    "cli_full_race_exit": 0,
+    "peer_full_race_exit": 0,
+    "final_loopback_peer_race_exit": 0,
+    "final_loopback_peer_package_seconds": 253.125,
+    "full_root_exit": 1,
+    "full_root_seconds": 1329.399,
+    "full_root_data_races": 0,
+    "full_root_remaining_failures": [
+      "TestPlannedWriteRecoverySlowProgressOutlivesLegacyTimeout: no feasible write layout",
+      "TestPeerNATRestartSameIdentityCachedRediscovery: directory refresh deadline exceeded (wildcard fixture; later loopback full peer package passed)"
+    ],
+    "root_vet_exit": 0,
+    "prototype_peertransport_race_exit": 0,
+    "prototype_production_race_exit": 0,
+    "final_code_full_root_rerun": false
+  },
+  "third_party_constraint": {
+    "no_operator_NAT_changes": true,
+    "no_DNS_changes": true,
+    "no_node_announce": true,
+    "easytier_used_only_for_management": true,
+    "fixed_public_center": true
+  },
+  "nas_content_checks": [
+    {
+      "name": "normal256",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 35813558279,
+          "ok": true,
+          "op": "put"
+        },
+        {
+          "match": true,
+          "ok": true,
+          "op": "get"
+        }
+      ],
+      "object_response_count": 3,
+      "paths": [
+        "circuit",
+        "direct"
+      ],
+      "fallback_values": [
+        false,
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "GET",
+          "path": "direct",
+          "status": 200,
+          "error_kind": ""
+        }
+      ],
+      "complete_get_and_match": true,
+      "evidence_sha256": "bc141cfb43877571ad7cc1f21d1147a2d28f81931b00e88307e0d97388ae9fe8",
+      "failed_holepunch_events": 0
+    },
+    {
+      "name": "strictrelay256",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 23887811773,
+          "ok": true,
+          "op": "put"
+        },
+        {
+          "match": true,
+          "ok": true,
+          "op": "get"
+        }
+      ],
+      "object_response_count": 3,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        false
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "GET",
+          "path": "circuit",
+          "status": 200,
+          "error_kind": ""
+        }
+      ],
+      "complete_get_and_match": true,
+      "evidence_sha256": "e32d31820c0b87c484a00342f8c3c0c321111cb7d7f09a1c372d8477f63d12bd",
+      "failed_holepunch_events": 0
+    },
+    {
+      "name": "strictrelay1MiB",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 73288425050,
+          "ok": true,
+          "op": "put"
+        },
+        {
+          "match": true,
+          "ok": true,
+          "op": "get"
+        }
+      ],
+      "object_response_count": 3,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        false
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "GET",
+          "path": "circuit",
+          "status": 200,
+          "error_kind": ""
+        }
+      ],
+      "complete_get_and_match": true,
+      "evidence_sha256": "118b590b68ae3dbe289baaa9d6cd710e06a14b82f8954f02a5b87b6bbeb254cc",
+      "failed_holepunch_events": 0
+    },
+    {
+      "name": "normal8MiB",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 96735833478,
+          "ok": false,
+          "op": "put"
+        }
+      ],
+      "object_response_count": 2,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 0,
+          "error_kind": "canceled"
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 0,
+          "error_kind": "canceled"
+        }
+      ],
+      "complete_get_and_match": false,
+      "evidence_sha256": "0d8b42ff73ce8ca122baab6e0fb86895aef58e11a97d78859ab412c292920a72",
+      "failed_holepunch_events": 3
+    },
+    {
+      "name": "crossnas8MiB",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 99726766933,
+          "ok": false,
+          "op": "put"
+        }
+      ],
+      "object_response_count": 2,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 0,
+          "error_kind": "canceled"
+        }
+      ],
+      "complete_get_and_match": false,
+      "evidence_sha256": "c72a3bf1442dc409b46c936013d2f2d11accbddf8043a9c804863a817417edb1",
+      "failed_holepunch_events": 0
+    },
+    {
+      "name": "crossnas256",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 24089786882,
+          "ok": true,
+          "op": "put"
+        },
+        {
+          "match": true,
+          "ok": true,
+          "op": "get"
+        }
+      ],
+      "object_response_count": 3,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "GET",
+          "path": "circuit",
+          "status": 200,
+          "error_kind": ""
+        }
+      ],
+      "complete_get_and_match": true,
+      "evidence_sha256": "5f8eb211b497542833609b45241c8819af13c26bb5afca7857ac626f6a4a13ed",
+      "failed_holepunch_events": 1
+    },
+    {
+      "name": "crossnas8MiB-bounded",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 599635524108,
+          "ok": false,
+          "op": "put"
+        }
+      ],
+      "object_response_count": 3,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 0,
+          "error_kind": "read"
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 0,
+          "error_kind": "canceled"
+        }
+      ],
+      "complete_get_and_match": false,
+      "evidence_sha256": "b0cba26575eb217ddae23c0bdaa13e60f36d759c805fb660da3fc6b8668a59ad",
+      "failed_holepunch_events": 9
+    },
+    {
+      "name": "getloss1MiB",
+      "operation_outcomes": [
+        {
+          "match": true,
+          "ok": true,
+          "op": "get"
+        }
+      ],
+      "object_response_count": 2,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "GET",
+          "path": "circuit",
+          "status": 200,
+          "error_kind": "read"
+        },
+        {
+          "method": "GET",
+          "path": "circuit",
+          "status": 200,
+          "error_kind": ""
+        }
+      ],
+      "complete_get_and_match": true,
+      "evidence_sha256": "f785a06d8c5b32568bb3dd68eb89f2d1078ac0d63ae5d6963df010e3be10cd50",
+      "failed_holepunch_events": 0
+    }
+  ],
+  "nas_DCutR_confirmations": [
+    {
+      "node": "29038",
+      "local_peer_id": "12D3KooWS34Yj8n7oz5Mzqs1wd5Sj5twS9WS2xBCSLxZGF3HzVsi",
+      "remote_peer_id": "12D3KooWCMriVFSvkSJ3TECvyaVvJwSt642r3DLupJJv5oWxusVn",
+      "time": "2026-11-02T01:38:12.882485844Z",
+      "connection_id": "12D3KooWCM-5",
+      "local_address": "/ip4/0.0.0.0/udp/42577/quic-v1",
+      "remote_address": "/ip4/161.142.150.94/udp/24558/quic-v1",
+      "success": true,
+      "later_stream_dials_same_connection": 7,
+      "does_not_prove_specific_object_success": true
+    },
+    {
+      "node": "29663",
+      "local_peer_id": "12D3KooWCMriVFSvkSJ3TECvyaVvJwSt642r3DLupJJv5oWxusVn",
+      "remote_peer_id": "12D3KooWS34Yj8n7oz5Mzqs1wd5Sj5twS9WS2xBCSLxZGF3HzVsi",
+      "time": "2026-11-02T01:37:59.574235686Z",
+      "connection_id": "12D3KooWS3-5",
+      "local_address": "/ip4/0.0.0.0/udp/57692/quic-v1",
+      "remote_address": "/ip4/49.76.119.132/udp/3445/quic-v1",
+      "success": true,
+      "later_stream_dials_same_connection": 7,
+      "does_not_prove_specific_object_success": true
+    }
+  ],
+  "independent_ciphertext_verification": [
+    {
+      "aead_open_and_bytes_match": true,
+      "ciphertext_sha256": "164eaaecea33a560d53a4aea077852e997d458a84cdae7e41860580aee7cad50",
+      "crc32c": 595829710,
+      "node": "29038",
+      "object_id": 1099511628032,
+      "stored_bytes": 262276,
+      "tamper_rejected": true
+    },
+    {
+      "aead_open_and_bytes_match": true,
+      "ciphertext_sha256": "164eaaecea33a560d53a4aea077852e997d458a84cdae7e41860580aee7cad50",
+      "crc32c": 595829710,
+      "node": "29663",
+      "object_id": 1099511628032,
+      "stored_bytes": 262276,
+      "tamper_rejected": true
+    }
+  ],
+  "read_node_loss": {
+    "bytes_before_stop": 512,
+    "victim": "29663",
+    "barrier": "client first positive byte; server may have buffered more",
+    "failed_first_response_proven": true,
+    "survivor_response_and_complete_readback_proven": true,
+    "distinct_request_and_connection_proven": true
+  },
+  "large_payload": {
+    "accepted": false,
+    "size": 8388608,
+    "original_CLI_guard_seconds": 300,
+    "original_CLI_exit": 124,
+    "diagnostic_100s_runs_completed_operation": false,
+    "diagnostic_600s_run_completed_operation": false,
+    "do_not_treat_process_exit_zero_as_operation_success": true,
+    "one_completed_replica_does_not_satisfy_confirmation_set": true,
+    "production_timeouts_unchanged": true
+  },
+  "cleanup": {
+    "run_id": "p2p-nas-auto-20261102-6x9ew1uw",
+    "isolated_directories_removed": true,
+    "runtime_firewall_rules_removed": true,
+    "permanent_firewall_untouched": true,
+    "easytier_untouched": true
+  },
+  "limitations": [
+    "Not all NAT combinations or TCP public punching tested",
+    "NAS DCUtR connection success and later streams are correlated; no default node per-object HTTP observer, so do not claim a specific successful payload from runtime dial alone",
+    "8MiB multi-replica WAN stability not accepted",
+    "Darwin full-root stability not accepted",
+    "No kernel FUSE, unrelated deployments, main merge or data migration"
+  ],
+  "evidence_private": true
+}
