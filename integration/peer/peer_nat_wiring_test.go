@@ -30,6 +30,7 @@ package peer
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -162,43 +163,102 @@ func (m *peerMaster) natObservedClientPeer(cl *clientSecure, log *natDialLog) *p
 // assertRelayOnlyObservations 校验默认 normal path 的逐请求事实：所有数据观察
 // 落在 logical 目标、实际电路为 relay、Fallback=true；成功响应的 PeerID 是目标
 // 真实身份且 conn/stream/local/remote 齐备。
-func assertRelayOnlyObservations(t *testing.T, obs []peerhttp.Observation, node *peerNode) {
+func assertRelayOnlyObservations(t *testing.T, obs []peerhttp.Observation, node *peerNode, in types.Inode) {
 	t.Helper()
-	sawResponse := false
+	objects := make([]uint64, 0, len(in.Chunks))
+	for _, chunk := range in.Chunks {
+		objects = append(objects, types.ChunkObjID(chunk, in.ID))
+	}
+	if err := validateRelayOnlyObservations(obs, node.nodeDataAddr(), node.rt.PeerID(), objects); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func validateRelayOnlyObservations(obs []peerhttp.Observation, target, peerID string, objects []uint64) error {
+	expected := make(map[string]bool, 2*len(objects))
+	for _, id := range objects {
+		path := "/objects/" + strconv.FormatUint(id, 10)
+		expected[http.MethodPut+" "+path] = true
+		expected[http.MethodGet+" "+path] = true
+	}
+	if len(expected) == 0 {
+		return fmt.Errorf("no authoritative objects to verify")
+	}
+	dials := map[string]peerhttp.Observation{}
+	responses := map[string]bool{}
+	attempts := map[string]int{}
+	successes := map[string]int{}
+	pendingFailure := map[string]bool{}
+	transient := func(kind string) bool {
+		return kind == peerhttp.ErrorRead || kind == peerhttp.ErrorConnect || kind == peerhttp.ErrorTimeout || kind == peerhttp.ErrorCanceled
+	}
 	for _, o := range obs {
-		if o.Master {
-			t.Fatalf("master 请求被 ctxwrap 污染: %+v", o)
-		}
-		if o.Target != node.nodeDataAddr() {
-			t.Fatalf("数据请求落在非目标 %q: %+v", o.Target, o)
-		}
-		if o.Path != peerhttp.PathRelay {
-			t.Fatalf("无直接地址端点必须实际走 circuit: %+v", o)
+		key := o.Method + " " + o.RequestPath
+		if o.Master || o.Target != target || o.RequestID == "" || !expected[key] {
+			return fmt.Errorf("observation has no matching object request: %+v", o)
 		}
 		if !o.Fallback {
-			t.Fatalf("relay 到达必须以 Fallback=true 报告: %+v", o)
+			return fmt.Errorf("normal relay request omitted fallback: %+v", o)
 		}
-		// 实际电路上报形如 /ip4/../tcp/../p2p/<relay>/p2p-circuit（circuit 分量
-		// 只出现在 circuit 连接上，direct 地址绝不含它）。
-		if !strings.Contains(o.RemoteAddress, "/p2p-circuit") {
-			t.Fatalf("实际电路地址必须是 circuit 多地址: %+v", o)
+		if o.Phase == peerhttp.PhaseDial {
+			if _, exists := dials[o.RequestID]; exists {
+				return fmt.Errorf("duplicate request dial: %+v", o)
+			}
+			dials[o.RequestID] = o
+			attempts[key]++
+			if attempts[key] > 3 {
+				return fmt.Errorf("object request exceeded its retry bound: %s", key)
+			}
+			if o.ErrorKind != peerhttp.ErrorNone {
+				if !transient(o.ErrorKind) || o.Path != peerhttp.PathUnknown || o.Identity != "" || o.ConnectionID != "" || o.StreamID != "" || o.RemoteAddress != "" {
+					return fmt.Errorf("failed dial claimed nonexistent connection facts: %+v", o)
+				}
+				pendingFailure[key] = true
+				continue
+			}
+		} else if o.Phase == peerhttp.PhaseResponse {
+			dial, ok := dials[o.RequestID]
+			if !ok || dial.ErrorKind != peerhttp.ErrorNone || responses[o.RequestID] || dial.Method != o.Method || dial.RequestPath != o.RequestPath || dial.ConnectionID != o.ConnectionID || dial.StreamID != o.StreamID || dial.RemoteAddress != o.RemoteAddress {
+				return fmt.Errorf("response was not bound to its accepted dial: %+v", o)
+			}
+			responses[o.RequestID] = true
+		} else {
+			return fmt.Errorf("unknown observation phase: %+v", o)
 		}
-		if o.Phase == peerhttp.PhaseResponse {
-			sawResponse = true
-			if o.Identity != node.rt.PeerID() {
-				t.Fatalf("serving PeerID 与目标不符: got %q want %q", o.Identity, node.rt.PeerID())
+		if o.Path != peerhttp.PathRelay || o.Identity != peerID || o.ConnectionID == "" || o.StreamID == "" || o.LocalAddress == "" || !strings.Contains(o.RemoteAddress, "/p2p-circuit") {
+			return fmt.Errorf("accepted object stream lacks authenticated circuit facts: %+v", o)
+		}
+		if o.Phase != peerhttp.PhaseResponse {
+			continue
+		}
+		if o.ErrorKind != peerhttp.ErrorNone {
+			if !transient(o.ErrorKind) {
+				return fmt.Errorf("unexpected response failure: %+v", o)
 			}
-			if o.ConnectionID == "" || o.StreamID == "" || o.LocalAddress == "" || o.RemoteAddress == "" {
-				t.Fatalf("响应观察缺真实电路事实: %+v", o)
-			}
-			if o.ErrorKind != peerhttp.ErrorNone || o.Status < 200 || o.Status >= 300 {
-				t.Fatalf("响应未成功完成: %+v", o)
-			}
+			pendingFailure[key] = true
+			continue
+		}
+		want := http.StatusOK
+		if o.Method == http.MethodPut {
+			want = http.StatusCreated
+		}
+		if o.Status != want {
+			return fmt.Errorf("object request returned an unexpected receipt: %+v", o)
+		}
+		successes[key]++
+		pendingFailure[key] = false
+	}
+	for key := range expected {
+		if successes[key] != 1 || pendingFailure[key] {
+			return fmt.Errorf("object request never completed after its last failure: %s successes=%d", key, successes[key])
 		}
 	}
-	if !sawResponse {
-		t.Fatal("缺少 response 相位观察")
+	for id, dial := range dials {
+		if dial.ErrorKind == peerhttp.ErrorNone && !responses[id] {
+			return fmt.Errorf("accepted request has no response outcome: %s", id)
+		}
 	}
+	return nil
 }
 
 func TestPeerNATRelayOnlyWiringAEADRoundTrip(t *testing.T) {
@@ -274,7 +334,7 @@ func TestPeerNATRelayOnlyWiringAEADRoundTrip(t *testing.T) {
 	}
 	obs.mu.Lock()
 	defer obs.mu.Unlock()
-	assertRelayOnlyObservations(t, obs.observed, node)
+	assertRelayOnlyObservations(t, obs.observed, node, in)
 }
 
 // ---- 任务 2：同 client 缓存复用，目标同身份重启后经目录强刷重新发现 ----
