@@ -21,7 +21,7 @@ func (m *peerMaster) startClientPeer(cl *clientSecure) *peertransport.Runtime {
 	m.t.Helper()
 	rt, err := peertransport.New(context.Background(), peertransport.Config{
 		IdentityPath:    filepath.Join(m.t.TempDir(), "client.peer.key"),
-		ListenAddresses: []string{"/ip4/0.0.0.0/tcp/0"},
+		ListenAddresses: []string{"/ip4/127.0.0.1/tcp/0"},
 		DirectTimeout:   10 * time.Second,
 		RelayTimeout:    20 * time.Second,
 	})

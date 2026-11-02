@@ -203,7 +203,7 @@ func newPeerMasterOpts(t *testing.T, pki *testPKI, o masterOpts) *peerMaster {
 	origin := "https://" + ln.Addr().String()
 	rt, err := peertransport.New(context.Background(), peertransport.Config{
 		IdentityPath:    filepath.Join(dir, "master.peer.key"),
-		ListenAddresses: []string{"/ip4/0.0.0.0/tcp/0"},
+		ListenAddresses: []string{"/ip4/127.0.0.1/tcp/0"},
 		DirectTimeout:   10 * time.Second,
 		RelayTimeout:    20 * time.Second,
 	})
@@ -549,7 +549,7 @@ func (m *peerMaster) startNodeOn(dataDir, invite string, o nodeOpts, dataLn net.
 	}
 	rtReal, err := peertransport.New(m.ctx, peertransport.Config{
 		IdentityPath:    filepath.Join(dataDir, "peer.key"),
-		ListenAddresses: []string{"/ip4/0.0.0.0/tcp/0"},
+		ListenAddresses: []string{"/ip4/127.0.0.1/tcp/0"},
 		DirectTimeout:   10 * time.Second,
 		RelayTimeout:    20 * time.Second,
 	})
