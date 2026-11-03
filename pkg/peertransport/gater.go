@@ -215,7 +215,13 @@ func publicOnlyLocal(a ma.Multiaddr) bool {
 	ip, kind := transportEndpoint(a)
 	switch kind {
 	case endpointIP:
-		return !ip.IsLoopback() && !ip.IsUnspecified()
+		if ip.IsUnspecified() {
+			// QUIC retains the wildcard UDP listener in LocalMultiaddr. The
+			// authenticated public remote endpoint remains the admission check.
+			protocols := a.Protocols()
+			return len(protocols) == 3 && protocols[1].Code == ma.P_UDP && protocols[2].Code == ma.P_QUIC_V1
+		}
+		return !ip.IsLoopback()
 	case endpointNone:
 		return hasCircuitComponent(a)
 	default:

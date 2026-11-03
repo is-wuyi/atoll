@@ -308,12 +308,32 @@ func TestHTTPSOverPeerStream(t *testing.T) {
 	obsMu.Lock()
 	gotObs := append([]Observation(nil), obs...)
 	obsMu.Unlock()
+	// Auto request IDs are per request: check they exist, that the dial and the
+	// response completion of one request share theirs, then blank them for the
+	// exact comparison below.
+	ids := map[string]bool{}
+	for i := range gotObs {
+		if gotObs[i].Master {
+			continue // the master path reports no auto ID
+		}
+		if gotObs[i].RequestID == "" {
+			t.Fatalf("observation %d carries no request ID", i)
+		}
+		ids[gotObs[i].RequestID] = true
+		gotObs[i].RequestID = ""
+	}
+	if len(ids) != 3 {
+		t.Fatalf("request IDs = %v, want one per peer request", ids)
+	}
 	wantObs := []Observation{
-		{Scheme: "https", Target: peerAddr, Path: PathDirect},
-		{Scheme: "https", Target: masterAddr, Path: PathHTTPS, Master: true},
+		{Scheme: "https", Target: peerAddr, Path: PathDirect, Identity: "peer-a", Method: "GET", RequestPath: "/", Phase: PhaseDial},
+		{Scheme: "https", Target: peerAddr, Path: PathDirect, Identity: "peer-a", Method: "GET", RequestPath: "/", Phase: PhaseResponse, Status: http.StatusOK},
+		{Scheme: "https", Target: masterAddr, Path: PathHTTPS, Master: true, Method: "GET", RequestPath: "/"},
+		{Scheme: "https", Target: "127.0.0.1:1", Path: PathUnknown, Method: "GET", RequestPath: "/", Phase: PhaseDial, Fallback: true, ErrorKind: ErrorConnect},
+		{Scheme: "https", Target: "127.0.0.1:1", Path: PathUnknown, Method: "GET", RequestPath: "/", Phase: PhaseDial, ErrorKind: ErrorRefused},
 	}
 	if !reflect.DeepEqual(gotObs, wantObs) {
-		t.Fatalf("observations = %v, want %v", gotObs, wantObs)
+		t.Fatalf("observations = %+v, want %+v", gotObs, wantObs)
 	}
 }
 
@@ -558,7 +578,9 @@ func TestPathReuseNeverCrosses(t *testing.T) {
 	if got := served.Load(); got != 4 {
 		t.Fatalf("served = %d, want 4: the mismatched connection must not be served", got)
 	}
-	want := []Path{PathDirect, PathRelay, PathDirect, PathRelay}
+	// The fifth dial took the direct path and was then closed: its failure
+	// report states the path the connection actually took, not the required one.
+	want := []Path{PathDirect, PathRelay, PathDirect, PathRelay, PathDirect}
 	obsMu.Lock()
 	got := append([]Path(nil), obs...)
 	obsMu.Unlock()

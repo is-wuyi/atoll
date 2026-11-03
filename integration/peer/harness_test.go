@@ -203,7 +203,7 @@ func newPeerMasterOpts(t *testing.T, pki *testPKI, o masterOpts) *peerMaster {
 	origin := "https://" + ln.Addr().String()
 	rt, err := peertransport.New(context.Background(), peertransport.Config{
 		IdentityPath:    filepath.Join(dir, "master.peer.key"),
-		ListenAddresses: []string{"/ip4/0.0.0.0/tcp/0"},
+		ListenAddresses: []string{"/ip4/127.0.0.1/tcp/0"},
 		DirectTimeout:   10 * time.Second,
 		RelayTimeout:    20 * time.Second,
 	})
@@ -466,13 +466,26 @@ func (l *nodeLedger) hasMethodPath(method, prefix string) bool {
 // （写转移计划需要）；ledger 记录每个到达节点 handler 的请求（method/path/
 // 真实源 peer id），用于证明节点间 replicate 确实到达副本节点且源是节点而非
 // 客户端（区别于客户端直传多 PUT）；handlerWrapper 可选，在 ledger 之外再包
-// 一层（故障注入用），两个 listener 共用同一最终 handler 实例，普通节点为 nil。
+// 一层（故障注入用），两个 listener 共用同一最终 handler 实例，普通节点为 nil；
+// hideTransportAddrs 仅测试用：公布端点不带 unsolicited-direct 传输地址
+// （到达性只能经授权 relay circuit），生产 Runtime 底层不变。
 type nodeOpts struct {
 	peerCertSelfSigned bool
 	transferBudget     *types.TransferBudget
 	ledger             *nodeLedger
 	handlerWrapper     func(http.Handler) http.Handler
+	hideTransportAddrs bool
 }
+
+// hiddenAddrsRuntime 是仅测试的 RuntimeAPI 包装：嵌入真实 Runtime、只覆写
+// Addresses() 恒为空，使节点向 master 公布不带直接地址的端点（第三方 NAS 零
+// NAT 的公布形态）。限制：只影响公布面；监听/身份/拨号/关闭全部委托真实
+// Runtime，生产代码不得依赖此包装存在。
+type hiddenAddrsRuntime struct {
+	peertransport.RuntimeAPI
+}
+
+func (h hiddenAddrsRuntime) Addresses() []string { return nil }
 
 // ledgedHandler 包一层并发安全记录 handler；未配置 ledger 时原样返回。
 func (m *peerMaster) ledgedHandler(o nodeOpts, inner http.Handler) http.Handler {
@@ -534,16 +547,21 @@ func (m *peerMaster) startNodeOn(dataDir, invite string, o nodeOpts, dataLn net.
 			m.t.Fatalf("node transfer budget: %v", err)
 		}
 	}
-	rt, err := peertransport.New(m.ctx, peertransport.Config{
+	rtReal, err := peertransport.New(m.ctx, peertransport.Config{
 		IdentityPath:    filepath.Join(dataDir, "peer.key"),
-		ListenAddresses: []string{"/ip4/0.0.0.0/tcp/0"},
+		ListenAddresses: []string{"/ip4/127.0.0.1/tcp/0"},
 		DirectTimeout:   10 * time.Second,
 		RelayTimeout:    20 * time.Second,
 	})
 	if err != nil {
 		m.t.Fatalf("node runtime: %v", err)
 	}
-	m.t.Cleanup(func() { _ = rt.Close() })
+	m.t.Cleanup(func() { _ = rtReal.Close() })
+	// 生产 Runtime 始终是真实实例；hideTransportAddrs 只在公布面包一层测试包装。
+	var rt peertransport.RuntimeAPI = rtReal
+	if o.hideTransportAddrs {
+		rt = hiddenAddrsRuntime{RuntimeAPI: rtReal}
+	}
 	if err := n.EnableP2P(m.ctx, rt); err != nil {
 		m.t.Fatalf("node EnableP2P: %v", err)
 	}

@@ -34,7 +34,11 @@ func newBackupCluster(t *testing.T, nodes int) (*meta.Store, *MetaBackup, map[ui
 		}
 		addrs[info.ID] = ts.URL[len("http://"):]
 	}
-	b := NewMetaBackup(store, time.Minute, DefaultMetaBackupConfig())
+	// These fixtures exercise backup content, not liveness. Building a large tree
+	// on a slow disk can exceed a one-minute alive window, after which BackupOnce
+	// correctly refuses with "no live nodes"; keep the window generous so the
+	// fixture does not turn disk latency into a false liveness failure.
+	b := NewMetaBackup(store, 30*time.Minute, DefaultMetaBackupConfig())
 	return store, b, addrs
 }
 
@@ -135,7 +139,11 @@ func TestBackupNoNodesFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	b := NewMetaBackup(store, time.Minute, DefaultMetaBackupConfig())
+	// These fixtures exercise backup content, not liveness. Building a large tree
+	// on a slow disk can exceed a one-minute alive window, after which BackupOnce
+	// correctly refuses with "no live nodes"; keep the window generous so the
+	// fixture does not turn disk latency into a false liveness failure.
+	b := NewMetaBackup(store, 30*time.Minute, DefaultMetaBackupConfig())
 	if _, err := b.BackupOnce(); err == nil {
 		t.Fatal("无节点时备份应报错")
 	}

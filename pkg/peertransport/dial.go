@@ -51,7 +51,19 @@ const (
 // non-nil and Err is nil; on failure Conn is nil and Err carries the reason.
 // The returned stream, its completed protocol negotiation included, is not
 // tied to the caller's context: it remains usable after ctx is canceled.
-func (r *Runtime) Dial(ctx context.Context, ep peerauth.Endpoint, infra peerauth.Infrastructure, reqPath peerhttp.Path) DialResult {
+func (r *Runtime) Dial(ctx context.Context, ep peerauth.Endpoint, infra peerauth.Infrastructure, reqPath peerhttp.Path) (result DialResult) {
+	operation, finish, err := r.operationContext(ctx)
+	if err != nil {
+		return DialResult{PeerDial: peerhttp.PeerDial{Err: err, Identity: ep.PeerID, Path: peerhttp.PathUnknown}}
+	}
+	defer finish()
+	ctx = operation
+	started := time.Now()
+	defer func() {
+		if r.cfg.Observe != nil {
+			r.cfg.Observe(RuntimeEvent{Time: time.Now().UTC(), Kind: "dial", RequestID: peerhttp.RequestID(ctx), LocalPeerID: r.PeerID(), RemotePeerID: result.Identity, ConnectionID: result.ConnectionID, StreamID: result.StreamID, LocalAddress: result.LocalAddress, RemoteAddress: result.RemoteAddress, Success: result.Conn != nil && result.Err == nil, ErrorKind: runtimeErrorKind(result.Err), Elapsed: time.Since(started), Path: result.Path, Fallback: result.Fallback, FallbackUpgraded: result.Fallback && result.Path == peerhttp.PathDirect})
+		}
+	}()
 	if err := peerauth.ValidateIdentity(ep.PeerID, ep.PublicKey); err != nil {
 		return DialResult{PeerDial: peerhttp.PeerDial{Err: err, Identity: ep.PeerID, Path: peerhttp.PathUnknown}}
 	}
@@ -79,6 +91,11 @@ func (r *Runtime) Dial(ctx context.Context, ep peerauth.Endpoint, infra peerauth
 }
 
 func (r *Runtime) dialRequiredDirect(ctx context.Context, target peer.ID, pub []byte, addrs []ma.Multiaddr) DialResult {
+	if len(selectConns(r.mainHost.Network().ConnsToPeer(target), connDirectOnly)) > 0 {
+		if stream, err := r.openVerifiedStream(ctx, r.mainHost, target, pub, connDirectOnly); err == nil {
+			return wrapDialResult(stream, false)
+		}
+	}
 	if len(addrs) == 0 {
 		return DialResult{PeerDial: peerhttp.PeerDial{Err: errors.New("peertransport: no direct endpoints"), Identity: target.String(), Path: peerhttp.PathUnknown}}
 	}
@@ -122,6 +139,13 @@ func (r *Runtime) dialRequiredRelay(ctx context.Context, target peer.ID, pub []b
 }
 
 func (r *Runtime) dialNormal(ctx context.Context, target peer.ID, pub []byte, addrs []ma.Multiaddr, infra peerauth.Infrastructure) DialResult {
+	// A punched connection may remain usable while its unsolicited-dial
+	// candidate is marked private. Reuse the verified connection, not its address.
+	if len(selectConns(r.mainHost.Network().ConnsToPeer(target), connDirectOnly)) > 0 {
+		if stream, err := r.openVerifiedStream(ctx, r.mainHost, target, pub, connDirectOnly); err == nil {
+			return wrapDialResult(stream, false)
+		}
+	}
 	var firstErr error
 	if len(addrs) > 0 {
 		ai := peer.AddrInfo{ID: target, Addrs: addrs}
@@ -157,7 +181,7 @@ func (r *Runtime) dialNormal(ctx context.Context, target peer.ID, pub []byte, ad
 		}
 		// The relay attempt is a fact from here on: a failed attempt is still
 		// reported as a fallback (Path stays unknown, Err carries the reason).
-		fallback := DialResult{PeerDial: peerhttp.PeerDial{Identity: target.String(), Path: peerhttp.PathUnknown}, Fallback: true}
+		fallback := DialResult{PeerDial: peerhttp.PeerDial{Identity: target.String(), Path: peerhttp.PathUnknown, Fallback: true}}
 		cctx, cancel := context.WithTimeout(ctx, r.relayTimeout())
 		defer cancel()
 		if err := r.mainHost.Connect(cctx, ai); err != nil {
@@ -311,12 +335,11 @@ func wrapDialResult(stream network.Stream, fallback bool) DialResult {
 		local:  conn.LocalMultiaddr(),
 		remote: conn.RemoteMultiaddr(),
 	}
-	return DialResult{
-		PeerDial:      peerhttp.PeerDial{Conn: sc, Identity: conn.RemotePeer().String(), Path: path},
-		Fallback:      fallback,
-		RemoteAddress: conn.RemoteMultiaddr().String(),
-		LocalAddress:  conn.LocalMultiaddr().String(),
-	}
+	return DialResult{PeerDial: peerhttp.PeerDial{
+		Conn: sc, Identity: conn.RemotePeer().String(), Path: path,
+		Fallback: fallback, ConnectionID: conn.ID(), StreamID: stream.ID(),
+		RemoteAddress: conn.RemoteMultiaddr().String(), LocalAddress: conn.LocalMultiaddr().String(),
+	}}
 }
 
 func filterDirectAddrs(in []string) []ma.Multiaddr {

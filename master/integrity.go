@@ -76,7 +76,9 @@ func (s *Server) handleReplicationPlan(w http.ResponseWriter, r *http.Request) {
 			out.Sources = append(out.Sources, target)
 		}
 		if targetID != nodeID && !types.ContainsUint64(d.Done, targetID) {
-			allowed := out.WriteTransfer == nil
+			// Active recovery writes belong to the client or the explicit transfer
+			// graph; an unplanned push would compete with that target's attempt.
+			allowed := out.WriteTransfer == nil && out.WriteProgress == nil
 			if out.WriteTransfer != nil && time.Now().Before(out.WriteTransfer.ExpiresAt) {
 				for _, leg := range out.WriteTransfer.Legs {
 					if leg.FromNodeID == nodeID && leg.ToNodeID == targetID {

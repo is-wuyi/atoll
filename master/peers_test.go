@@ -86,6 +86,9 @@ func (r *peerRuntimeStub) ConnContext(ctx context.Context, _ net.Conn) context.C
 func (r *peerRuntimeStub) ReserveRelay(context.Context, peerauth.Infrastructure) (time.Time, error) {
 	return time.Time{}, errors.New("stub relay")
 }
+func (r *peerRuntimeStub) PrepareInfrastructure(context.Context, peerauth.Infrastructure) error {
+	return nil
+}
 func (r *peerRuntimeStub) EnableRelay() error { return nil }
 func (r *peerRuntimeStub) Dial(context.Context, peerauth.Endpoint, peerauth.Infrastructure, peerhttp.Path) peertransport.DialResult {
 	return peertransport.DialResult{}

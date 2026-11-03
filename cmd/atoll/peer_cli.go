@@ -36,7 +36,9 @@ type clientP2P interface {
 }
 
 // newPeerRuntime builds the independent runtime identity and transport. An
-// empty identityPath yields an ephemeral identity (user clients).
+// empty identityPath yields an ephemeral identity (user clients). With
+// -p2p-diagnostics it wires cfg.Observe to a bounded private sink and returns a
+// diagnosticRuntime wrapper that owns the flush-once lifecycle.
 func newPeerRuntime(ctx context.Context, p *p2pCLIFlags, identityPath string) (peertransport.RuntimeAPI, error) {
 	cfg := peertransport.Config{
 		IdentityPath:      identityPath,
@@ -47,11 +49,31 @@ func newPeerRuntime(ctx context.Context, p *p2pCLIFlags, identityPath string) (p
 		RelayTimeout:      p2pRelayTimeout,
 		MaxConnections:    p2pMaxConns,
 	}
+	// sink 必须先于 runtime 创建：cfg.Observe 要在 New 之前接线，启动失败也能
+	// 留下有界记录。
+	var sink *peerDiagnosticsSink
+	if path := p.diagnosticsPath(); path != "" {
+		var err error
+		sink, err = openPeerDiagnosticsSink(path)
+		if err != nil {
+			return nil, fmt.Errorf("peer diagnostics: %w", err)
+		}
+		cfg.Observe = sink.runtimeObserve
+	}
 	rt, err := peertransport.New(ctx, cfg)
 	if err != nil {
+		// 启动失败也要落盘有界记录；runtime 失败与落盘失败都如实上抛。
+		if sink != nil {
+			if flushErr := sink.flush(false); flushErr != nil {
+				return nil, errors.Join(fmt.Errorf("peer runtime: %w", err), fmt.Errorf("peer diagnostics: %w", flushErr))
+			}
+		}
 		return nil, fmt.Errorf("peer runtime: %w", err)
 	}
-	return rt, nil
+	if sink == nil {
+		return rt, nil
+	}
+	return &diagnosticRuntime{RuntimeAPI: rt, sink: sink}, nil
 }
 
 // infrastructureFromRuntime builds the Infrastructure a peer directory
@@ -170,18 +192,18 @@ func masterEnableP2P(ctx context.Context, p *p2pCLIFlags, origin, identityPath, 
 		Origin:         origin,
 		Infrastructure: infrastructureFromRuntime(rt),
 	}); err != nil {
-		_ = rt.Close()
+		closePeerRuntime(rt)
 		return nil, fmt.Errorf("master peer directory: %w", err)
 	}
 	if err := srv.SetPeerRuntime(rt); err != nil {
-		_ = rt.Close()
+		closePeerRuntime(rt)
 		return nil, fmt.Errorf("master peer runtime: %w", err)
 	}
 	// SetPeerRuntime already installs the directory authorizer and enables the
 	// relay; the CLI must not repeat EnableRelay here.
 	ps, err := startPeerListener(rt, srv.Handler(), certFile, keyFile)
 	if err != nil {
-		_ = rt.Close()
+		closePeerRuntime(rt)
 		return nil, err
 	}
 	return ps, nil
@@ -223,25 +245,37 @@ func clientEnableP2P(ctx context.Context, p *p2pCLIFlags, c *client.Client) (pee
 	}
 	pc, ok := any(c).(clientP2P)
 	if !ok {
-		_ = rt.Close()
-		return nil, errors.New("client does not support the peer transport")
+		err := errors.New("client does not support the peer transport")
+		// 启用失败也要 flush 一次诊断记录；落盘失败与启用失败都如实上抛。
+		if closeErr := rt.Close(); closeErr != nil {
+			return nil, errors.Join(err, closeErr)
+		}
+		return nil, err
 	}
 	if err := pc.EnableP2P(ctx, rt); err != nil {
-		_ = rt.Close()
-		return nil, fmt.Errorf("client peer enable: %w", err)
+		enableErr := fmt.Errorf("client peer enable: %w", err)
+		if closeErr := rt.Close(); closeErr != nil {
+			return nil, errors.Join(enableErr, closeErr)
+		}
+		return nil, enableErr
 	}
+	// 启用成功后把请求级观察挂上出站 transport（仅诊断开启时生效）。
+	attachClientDiagnostics(c, rt)
 	return rt, nil
 }
 
 // closeClientP2P shuts the client peer transport (and its runtime) down on an
-// exit path. It never panics and is safe to call after a partial setup.
-func closeClientP2P(c *client.Client, rt peertransport.RuntimeAPI) {
+// exit path. It never panics and is safe to call after a partial setup. The
+// runtime close error (including a diagnostics flush failure) is returned so the
+// caller can decide the exit verdict.
+func closeClientP2P(c *client.Client, rt peertransport.RuntimeAPI) error {
 	if c != nil {
 		if pc, ok := any(c).(clientP2P); ok {
 			_ = pc.CloseP2P()
 		}
 	}
-	if rt != nil {
-		_ = rt.Close()
+	if rt == nil {
+		return nil
 	}
+	return rt.Close()
 }

@@ -17,6 +17,8 @@ package client
 //     master 挂起时关停仍有界返回（TTL 兜底）。
 //  7. 控制请求与 proof 绑定构造时固定的 master origin：改写 c.MasterURL 不改变
 //     请求目标（会话 token 绝不发往其它源）。
+//  8. EnableP2P 的基础设施 prepare：登记+首目录成功后、绑定目录 infra、有界单次；
+//     失败中止启用并恢复 transport（可整体重试），在途取消立刻中止。
 //
 // 全部用 stub RuntimeAPI + 可编程 RoundTripper，不依赖真实 peer 网络。
 
@@ -68,13 +70,19 @@ func testPeerIdentity(t *testing.T) (string, []byte) {
 }
 
 // stubPeerRuntime 实现 peertransport.RuntimeAPI：身份 + 可编程目录/授权，供单元测试。
+// PrepareInfrastructure 默认成功（nil）；prepareErrors 非空时按调用次序消费错误，
+// prepareHook 非空时接管该次调用（真在途屏障用），供 EnableP2P prepare 路径测试。
 type stubPeerRuntime struct {
-	peerID     string
-	pubKey     []byte
-	addresses  []string
-	dir        peerauth.Directory
-	allowed    map[string]bool
-	authorizer func(context.Context, string) bool
+	peerID        string
+	pubKey        []byte
+	addresses     []string
+	dir           peerauth.Directory
+	allowed       map[string]bool
+	authorizer    func(context.Context, string) bool
+	prepareCalls  int
+	prepareErrors []error
+	prepareHook   func(ctx context.Context, infra peerauth.Infrastructure) error
+	prepareInfra  peerauth.Infrastructure
 }
 
 func (r *stubPeerRuntime) PeerID() string                  { return r.peerID }
@@ -93,6 +101,19 @@ func (r *stubPeerRuntime) ConnContext(ctx context.Context, _ net.Conn) context.C
 }
 func (r *stubPeerRuntime) ReserveRelay(context.Context, peerauth.Infrastructure) (time.Time, error) {
 	return time.Time{}, nil
+}
+func (r *stubPeerRuntime) PrepareInfrastructure(ctx context.Context, infra peerauth.Infrastructure) error {
+	r.prepareCalls++
+	r.prepareInfra = infra
+	if r.prepareHook != nil {
+		return r.prepareHook(ctx, infra)
+	}
+	if len(r.prepareErrors) == 0 {
+		return nil
+	}
+	err := r.prepareErrors[0]
+	r.prepareErrors = r.prepareErrors[1:]
+	return err
 }
 func (r *stubPeerRuntime) EnableRelay() error { return nil }
 func (r *stubPeerRuntime) Dial(context.Context, peerauth.Endpoint, peerauth.Infrastructure, peerhttp.Path) peertransport.DialResult {
@@ -721,7 +742,262 @@ func TestClientCloseP2PReleaseBoundedUnderHangingMaster(t *testing.T) {
 	}
 }
 
-// ---- 8. 控制请求与 proof 绑定构造时固定的 origin：改写 MasterURL 不漂移 ----
+// ---- 8. EnableP2P 的基础设施 prepare：登记+首目录成功后、有界单次、失败可恢复 ----
+
+// newEnableP2PServer 装配一个可编程的 master：按次序记录 client-self/client/
+// directory 请求，登记与目录响应始终合法。返回它所服务的目录（prepare 绑定断言用）。
+func newEnableP2PServer(t *testing.T, peerID string, pub []byte, events *[]string, eventsMu *sync.Mutex) (*httptest.Server, peerauth.Directory) {
+	t.Helper()
+	dir := validPeerDirectory(t)
+	dirRaw := directoryJSON(t, dir)
+	record := func(event string) {
+		eventsMu.Lock()
+		*events = append(*events, event)
+		eventsMu.Unlock()
+	}
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/peers/client-self":
+			record("client-self")
+			_, _ = w.Write(clientStateJSON(t, 0))
+		case r.Method == http.MethodPost && r.URL.Path == "/peers/client":
+			record("client")
+			var reg peerauth.ClientRegistration
+			_ = json.NewDecoder(r.Body).Decode(&reg)
+			_, _ = w.Write(clientEndpointJSON(t, peerID, pub, reg.ExpectedRevision+1))
+		case r.Method == http.MethodGet && r.URL.Path == "/peers/directory":
+			record("directory")
+			_, _ = w.Write(dirRaw)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	return ts, dir
+}
+
+// prepare 必须发生在登记+首目录成功之后，且绑定刚刷新目录中的中心 infra 身份；
+// 客户端只做一次有界尝试（无本地计数重试）。
+func TestClientEnableP2PPreparesAfterDirectory(t *testing.T) {
+	peerID, pub := testPeerIdentity(t)
+	var events []string
+	var eventsMu sync.Mutex
+	ts, dir := newEnableP2PServer(t, peerID, pub, &events, &eventsMu)
+	defer ts.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(ts.Certificate())
+	c, err := NewSecure(ts.URL, &tls.Config{RootCAs: pool}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := &stubPeerRuntime{peerID: peerID, pubKey: pub}
+	// prepare 事件与服务器侧请求记入同一序表，证明 prepare 在首目录成功之后。
+	rt.prepareHook = func(_ context.Context, _ peerauth.Infrastructure) error {
+		eventsMu.Lock()
+		events = append(events, "prepare")
+		eventsMu.Unlock()
+		return nil
+	}
+	if err := c.SetSession("token-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.UseSpace(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EnableP2P(context.Background(), rt); err != nil {
+		t.Fatalf("EnableP2P: %v", err)
+	}
+	defer func() { _ = c.CloseP2P() }()
+
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	want := []string{"client-self", "client", "directory", "prepare"}
+	if len(events) != len(want) || events[len(events)-1] != "prepare" {
+		t.Fatalf("事件序 = %v, want 以 prepare 收尾的 %v", events, want)
+	}
+	for i, ev := range want {
+		if events[i] != ev {
+			t.Fatalf("事件序 = %v, want %v", events, want)
+		}
+	}
+	if rt.prepareCalls != 1 {
+		t.Fatalf("prepare 应恰好一次，got %d", rt.prepareCalls)
+	}
+	if rt.prepareInfra.PeerID != dir.Infrastructure.PeerID {
+		t.Fatalf("prepare 必须绑定目录 infra 身份: got %q want %q", rt.prepareInfra.PeerID, dir.Infrastructure.PeerID)
+	}
+}
+
+// prepare 失败（含暂时性）与登记/目录失败同样中止 EnableP2P 并原样恢复
+// transport；客户端不做多次重试（prepareCalls==1），整体重试安全。
+func TestClientEnableP2PPrepareFailureAbortsAndRestores(t *testing.T) {
+	peerID, pub := testPeerIdentity(t)
+	var events []string
+	var eventsMu sync.Mutex
+	ts, _ := newEnableP2PServer(t, peerID, pub, &events, &eventsMu)
+	defer ts.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(ts.Certificate())
+	c, err := NewSecure(ts.URL, &tls.Config{RootCAs: pool}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetSession("token-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.UseSpace(1); err != nil {
+		t.Fatal(err)
+	}
+	rt := &stubPeerRuntime{peerID: peerID, pubKey: pub, prepareErrors: []error{errors.New("center unreachable")}}
+
+	err = c.EnableP2P(context.Background(), rt)
+	if err == nil || !strings.Contains(err.Error(), "client P2P infrastructure") {
+		t.Fatalf("prepare 失败必须中止 EnableP2P，got %v", err)
+	}
+	if rt.prepareCalls != 1 {
+		t.Fatalf("客户端不做多次重试，prepare calls=%d", rt.prepareCalls)
+	}
+	if c.p2p != nil {
+		t.Fatal("失败后 c.p2p 应被清空")
+	}
+	if _, ok := c.secTransport.base.(*http.Transport); !ok {
+		t.Fatalf("失败后 base 应恢复为原始 *http.Transport，got %T", c.secTransport.base)
+	}
+	if c.secTransport.peerID != nil || c.secTransport.ensureRegistered != nil {
+		t.Fatal("失败后 peerID/ensureRegistered 钩子应被清除（可重试）")
+	}
+
+	// 恢复后整体重试安全：prepare 成功 → EnableP2P 成功，后续登记 fail-closed。
+	rt.prepareErrors = nil
+	if err := c.EnableP2P(context.Background(), rt); err != nil {
+		t.Fatalf("恢复后 EnableP2P 应成功: %v", err)
+	}
+	if err := c.CloseP2P(); err != nil {
+		t.Fatalf("CloseP2P: %v", err)
+	}
+	if err := c.secTransport.ensureRegistered(context.Background(), "token-a", 1, true); !errors.Is(err, errClientP2PClosed) {
+		t.Fatalf("CloseP2P 后 ensureRegistered 应拒绝，got %v", err)
+	}
+}
+
+// prepare 在途时调用方 ctx 取消（真在途屏障）：启用立刻中止并恢复 transport，
+// 绝不悬挂，也不再有下一次尝试。
+func TestClientEnableP2PPrepareCancelledByCallerCtx(t *testing.T) {
+	peerID, pub := testPeerIdentity(t)
+	var events []string
+	var eventsMu sync.Mutex
+	ts, _ := newEnableP2PServer(t, peerID, pub, &events, &eventsMu)
+	defer ts.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(ts.Certificate())
+	c, err := NewSecure(ts.URL, &tls.Config{RootCAs: pool}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetSession("token-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.UseSpace(1); err != nil {
+		t.Fatal(err)
+	}
+	prepareStarted := make(chan struct{})
+	var once sync.Once
+	rt := &stubPeerRuntime{peerID: peerID, pubKey: pub}
+	rt.prepareHook = func(ctx context.Context, _ peerauth.Infrastructure) error {
+		once.Do(func() { close(prepareStarted) })
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+			return errors.New("prepare was not cancelled by the caller ctx")
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	enableDone := make(chan error, 1)
+	go func() { enableDone <- c.EnableP2P(ctx, rt) }()
+	<-prepareStarted
+	cancel()
+	select {
+	case err := <-enableDone:
+		if err == nil || !strings.Contains(err.Error(), "client P2P infrastructure") {
+			t.Fatalf("调用方 ctx 取消必须中止 EnableP2P，got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后 EnableP2P 未及时返回（prepare 未随 ctx 中止）")
+	}
+	if rt.prepareCalls != 1 {
+		t.Fatalf("取消后不得开始下一次尝试: %d", rt.prepareCalls)
+	}
+	if c.p2p != nil {
+		t.Fatal("失败后 c.p2p 应被清空")
+	}
+	if _, ok := c.secTransport.base.(*http.Transport); !ok {
+		t.Fatalf("失败后 base 应恢复为原始 *http.Transport，got %T", c.secTransport.base)
+	}
+}
+
+// 稳态 loop：每个 tick 的 directory 步成功后用当前 infra 重 prepare（防中心重启
+// 丢 identified 缓存），且被单 tick ctx 界定。channel 传递 prepare 的 ctx deadline
+// 提供 happens-before，避免与 loop goroutine 的数据竞态。
+func TestClientRefreshCyclePreparesCurrentInfraBounded(t *testing.T) {
+	peerID, pub := testPeerIdentity(t)
+	var events []string
+	var eventsMu sync.Mutex
+	ts, dir := newEnableP2PServer(t, peerID, pub, &events, &eventsMu)
+	defer ts.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(ts.Certificate())
+	c, err := NewSecure(ts.URL, &tls.Config{RootCAs: pool}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := &stubPeerRuntime{peerID: peerID, pubKey: pub}
+	prepareDeadlines := make(chan time.Time, 8)
+	rt.prepareHook = func(ctx context.Context, _ peerauth.Infrastructure) error {
+		dl, _ := ctx.Deadline()
+		prepareDeadlines <- dl
+		return nil
+	}
+	if err := c.SetSession("token-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.UseSpace(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EnableP2P(context.Background(), rt); err != nil {
+		t.Fatalf("EnableP2P: %v", err)
+	}
+	defer func() { _ = c.CloseP2P() }()
+	first := <-prepareDeadlines // EnableP2P 内的 prepare
+	if first.IsZero() {
+		t.Fatal("EnableP2P 的 prepare 必须有界（attempt deadline）")
+	}
+
+	// 唤醒 loop：refreshCycle 在 directory 步成功后重 prepare。
+	c.p2pSessionChanged()
+	select {
+	case dl := <-prepareDeadlines:
+		if dl.IsZero() || time.Until(dl) > clientPeerRefreshTimeout+250*time.Millisecond {
+			t.Fatalf("loop prepare 必须被单 tick 界定（<= %v）: %v", clientPeerRefreshTimeout, dl)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("loop 未在 directory 成功后重 prepare")
+	}
+	// channel 接收提供 happens-before：此刻读取 stub 字段无竞态。
+	if rt.prepareCalls != 2 {
+		t.Fatalf("prepare calls = %d, want 2", rt.prepareCalls)
+	}
+	if rt.prepareInfra.PeerID != dir.Infrastructure.PeerID {
+		t.Fatalf("loop prepare 必须用当前目录 infra: got %q want %q", rt.prepareInfra.PeerID, dir.Infrastructure.PeerID)
+	}
+}
+
+// ---- 9. 控制请求与 proof 绑定构造时固定的 origin：改写 MasterURL 不漂移 ----
 
 func TestClientPeerControlPinnedToConstructionOrigin(t *testing.T) {
 	peerID, pub := testPeerIdentity(t)

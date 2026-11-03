@@ -4,7 +4,7 @@
 
 内置 P2P 是显式启用的安全数据面，不替代文件模型、内容加密或保存确认规则。未配置 `-p2p` 的旧 HTTPS/HTTP 使用方式保持原样；已初始化 P2P 的 Master 数据库重启时必须继续启用 P2P，不允许静默降级。
 
-本地验收由 `integration/peer` 的真实 Master、设备、客户端、TLS 与 peer runtime 组合覆盖；测试名称和执行结果见 [本批验收记录](P2P_ACCEPTANCE.md)。普通 `direct` 仅表示没有经过 CircuitRelay，不能据此判断连接是否经过 EasyTier、Tailscale 或其它 overlay。本批代码接线不等于真实公网打洞验收，不替换正式集群、不拆除 EasyTier、不迁移正式数据。
+本地验收由 `integration/peer` 的真实 Master、设备、客户端、TLS 与 peer runtime 组合覆盖；测试名称和执行结果见 [分阶段验收记录](P2P_ACCEPTANCE.md)。普通 `direct` 仅表示没有经过 CircuitRelay，不能据此判断连接是否经过 EasyTier、Tailscale 或其它 overlay。2026-11-02 隔离 NAS 已取得自动公网候选、一次双侧 QUIC DCUtR 成功及后续同连接 stream、小块/1 MiB 双副本完整读写和读中断故障转移；8 MiB 多副本稳定性仍未通过，不能将本批描述为完整公网验收完成。没有替换其它测试部署、拆除 EasyTier 或迁移数据。
 
 ## 身份、地址与授权
 
@@ -20,6 +20,16 @@
 `NodeInfo.Addr` 继续是 HTTPS、Host 和票据受众使用的逻辑 `host:port`。peer multiaddr 另行发布、续期与更新；家宽端口或外网地址变化不改对象 ID、文件代次或设备身份。
 
 节点地址发布签名绑定 Master origin、数字 NodeID、PeerID、绑定修订号、预期地址修订号、操作 ID、完整地址集合与 `NotAfter`。租期最多两分钟，同操作回放不延长原有效期。目录只从受信任的 HTTPS Master 获取，不使用公开 DHT 作为授权来源。
+
+### 第三方边缘节点的自动连接
+
+节点可能随时离线，加入系统不要求节点主人修改路由器 NAT、端口映射或 DNS。控制面连接一个固定、公网可达且证书匹配的 Master origin；内置 peer 连接自行观察公网候选、协调 DCUtR，不能直连时使用已授权 relay。并非所有 NAT 组合都可打洞，relay 是有界兜底而非绕过认证。
+
+普通节点和客户端不需要填写 `-p2p-announce`。当前基础设施的真实连接和 Identify 观测经 PeerID/公钥、授权租期、监听端口与传输类型校验后形成候选。观测不等于公网可达性确认：AutoNAT 验证回拨 nonce 和地址，DCUtR 可使用尚不能接受普通入站拨号的映射。候选随连接断开、授权失效或基础设施绑定变化失效；地址更新不更换设备/内容身份。
+
+可达性探测采用已登记身份，但有独立的 dial-only 连接池，不发布空 Identify 地址/协议记录，不提供对象服务；完成探测关闭连接不能中断其它数据流。未经登记的 peer 不因此获准连接，探测仍有请求方授权、nonce、速率、资源和放大防护。
+
+**不要把 EasyTier 虚拟 IP、固定家宽公网 IP 或 NAS 私网地址手填成自动连接配置。** 私网地址只在显式 local/LAN 模式中使用，同为 `192.168.0.x` 不证明同局域网。管理时用 EasyTier CLI 或 SSH 发现在线机器，与正式对象流的传输路径是两回事。
 
 ## 实际请求路径
 
@@ -91,11 +101,17 @@ atoll mount -master https://master.example:9420 -p2p \
 
 ### 公布地址
 
-- `-p2p-listen` 支持重复或逗号分隔的 TCP、QUIC multiaddr，监听可以使用端口 0。
-- `-p2p-announce` 显式覆盖公布地址，适用于已知公网映射；发布地址不能使用端口 0。
-- `-p2p-public-only` 排除私网、回环、CGNAT 和未经解析验证的 DNS peer 地址；它不是对网络运营商路径或 overlay 的普遍证明。
+- `-p2p-listen` 支持重复或逗号分隔的 TCP、QUIC multiaddr，监听可以使用端口 0。CLI 默认同时监听 TCP 与 QUIC；显式填写时覆盖默认集合。
+- `-p2p-announce` 显式覆盖公布地址，适用于操作者确定的基础设施公网地址；普通 NAS/客户端通常不设置。发布地址不能使用端口 0，该覆盖不等于自动发现。
+- `-p2p-public-only` 默认开启，排除私网、回环、CGNAT 和未经解析验证的 DNS peer 地址。明确的隔离本地/LAN 测试使用 `-p2p-public-only=false`；它不是对网络运营商路径或所有 overlay 的普遍证明。
 - 每个地址集合最多 16 项、每项最多 512 字节；目录最多 512 个端点，响应读取上限 8 MiB。登记、发布和释放请求仍为独立的 64 KiB 上限。
-- 发现缓存和后台续期有界，连接失败触发有限重新发现；节点定期刷新中继预约，不仅等原预约的到期时间。
+- 发现缓存和后台续期有界，连接失败触发有限重新发现；节点定期刷新中继预约，不仅等原预约的到期时间。首次中心连接和预约暂时失败有有限重试，授权或配置错误立即拒绝；请求期限和关停取消也约束已打开的预约流。
+
+### 私有诊断
+
+`-p2p-diagnostics FILE` 显式启用私有诊断，目标必须是尚不存在的新文件，父目录由操作者准备。程序收尾只新建 0600 JSON，不覆盖现有文件，最多保留 8192 个事件和 4 MiB，超限计入 `dropped`；写出失败会使命令返回失败。默认不开启诊断。
+
+记录分为 runtime、HTTP 和 CLI 三层：候选/AutoNAT/DCUtR、具体请求使用的 PeerID 与连接/stream/地址/路径、最后的文件操作结果。实际 `path`、`fallback`、`fallback_upgraded` 和内容成功不得合并。HTTP 正文 EOF 不是 CRC、AEAD 或 Master Done 的证明；仅 CLI 最终成功加完整回读/权威记录才能证明内容验收。控制请求不会继承对象路径要求或对象 reporter，不记录 query、正文、认证材料或原始错误文本。
 
 ## 元数据与升级
 

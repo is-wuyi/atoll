@@ -382,8 +382,12 @@ func TestClientEnableP2PFailureKeepsIdentityWire(t *testing.T) {
 		t.Fatalf("explicit identity file should have been created by the runtime: %v", statErr)
 	}
 	// closeClientP2P 必须容忍 nil 组合，绝不 panic。
-	closeClientP2P(nil, nil)
-	closeClientP2P(cl, nil)
+	if err := closeClientP2P(nil, nil); err != nil {
+		t.Fatalf("nil close: %v", err)
+	}
+	if err := closeClientP2P(cl, nil); err != nil {
+		t.Fatalf("client-only close: %v", err)
+	}
 }
 
 // 编译面守卫：clientEnableP2P/closeClientP2P 只允许依赖这里声明的最小 client

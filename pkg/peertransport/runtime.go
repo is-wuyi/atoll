@@ -1,6 +1,7 @@
 package peertransport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,7 +11,9 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	ma "github.com/multiformats/go-multiaddr"
 
 	"atoll/pkg/peerauth"
@@ -47,9 +50,12 @@ type Runtime struct {
 	cfg      Config
 	mainHost host.Host
 	auth     *protocolGate
+	observed *trustedObservations
+	events   *runtimeEvents
 
 	closeOnce sync.Once
 	closeErr  error
+	opWG      sync.WaitGroup
 
 	// lifeMu guards the lifecycle: the closed flag, the listener pointer and
 	// the relay host / relay service sets. Creation of a listener, relay host
@@ -106,14 +112,135 @@ func New(ctx context.Context, cfg Config) (*Runtime, error) {
 	}
 	r.ident = ident
 	r.id = ident.id
+	r.events = &runtimeEvents{observe: cfg.Observe}
+	if cfg.Observe != nil {
+		r.cfg.Observe = r.events.emit
+	}
+	r.observed = newTrustedObservations(rctx, r.auth, cfg.PublicOnly, r.cfg.Observe)
 
-	mainHost, err := newMainHost(rctx, ident.priv, listen, announce, cfg.PublicOnly, r.auth, cfg.MaxConnections)
+	mainHost, err := newMainHost(rctx, ident.priv, listen, announce, cfg.PublicOnly, r.auth, cfg.MaxConnections, r.observed, r.cfg.Observe)
 	if err != nil {
 		cancel()
+		r.events.close()
 		return nil, err
 	}
 	r.mainHost = mainHost
 	return r, nil
+}
+
+// Count public operations before shutdown can start waiting. Their contexts
+// follow runtime cancellation, while returned streams keep their own lifetime.
+func (r *Runtime) operationContext(ctx context.Context) (context.Context, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.lifeMu.Lock()
+	if r.closed {
+		r.lifeMu.Unlock()
+		return nil, nil, errRuntimeClosed
+	}
+	if err := ctx.Err(); err != nil {
+		r.lifeMu.Unlock()
+		return nil, nil, err
+	}
+	r.opWG.Add(1)
+	r.lifeMu.Unlock()
+	operation, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(r.ctx, cancel)
+	return operation, func() {
+		stop()
+		cancel()
+		r.opWG.Done()
+	}, nil
+}
+
+// PrepareInfrastructure establishes only a verified control peer connection.
+// Identify completion is not a successful hole punch or a data receipt.
+func (r *Runtime) PrepareInfrastructure(ctx context.Context, infra peerauth.Infrastructure) error {
+	operation, finish, err := r.operationContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	ctx = operation
+	ai, err := infraAddrInfo(infra)
+	if err != nil || len(ai.Addrs) == 0 {
+		return ErrInfrastructureInvalid
+	}
+	if r.cfg.PublicOnly {
+		addresses, normalizeErr := peerauth.NormalizeAddresses(infra.Addresses, true)
+		if normalizeErr != nil || len(addresses) == 0 {
+			return ErrInfrastructureInvalid
+		}
+	}
+	if !r.auth.authorize(ctx, infra.PeerID) {
+		return ErrPeerUnauthorized
+	}
+	r.observed.mu.Lock()
+	configured := r.observed.infra
+	valid := time.Now().Before(r.observed.until)
+	r.observed.mu.Unlock()
+	if configured.PeerID != infra.PeerID || !bytes.Equal(configured.PublicKey, infra.PublicKey) || !valid {
+		return ErrInfrastructureInvalid
+	}
+	pctx, cancel := context.WithTimeout(ctx, infrastructurePrepareTimeout)
+	stop := context.AfterFunc(r.ctx, cancel)
+	defer func() { stop(); cancel() }()
+	pctx = network.WithForceDirectDial(pctx, "atoll-infrastructure")
+	if err := r.mainHost.Connect(pctx, ai); err != nil {
+		return fmt.Errorf("peertransport: infrastructure connect: %w", err)
+	}
+	// A currently open authenticated center connection is sufficient for
+	// bootstrap. Probe callbacks use the same identity but are inbound and
+	// short-lived, so they must not hold up connection preparation.
+	var prepared network.Conn
+	for _, conn := range r.mainHost.Network().ConnsToPeer(ai.ID) {
+		if conn.IsClosed() || hasCircuitComponent(conn.RemoteMultiaddr()) || conn.Stat().Direction != network.DirOutbound {
+			continue
+		}
+		if err := verifyStreamPeer(conn, ai.ID, infra.PublicKey); err != nil {
+			return fmt.Errorf("%w: infrastructure identity mismatch", ErrInfrastructureInvalid)
+		}
+		if err := r.observed.waitIdentify(pctx, conn); err != nil {
+			return fmt.Errorf("peertransport: infrastructure identify: %w", err)
+		}
+		prepared = conn
+		break
+	}
+	if prepared == nil {
+		return errors.New("peertransport: no direct infrastructure connection")
+	}
+	if err := r.waitTraversalReady(pctx); err != nil {
+		return err
+	}
+	if !r.auth.authorize(pctx, infra.PeerID) {
+		return ErrPeerUnauthorized
+	}
+	return nil
+}
+
+// The library installs the DCUtR handler after seeing a public candidate.
+// Waiting for that handler avoids losing the first inbound relay notification.
+func (r *Runtime) waitTraversalReady(ctx context.Context) error {
+	if len(r.observed.Addrs(1)) == 0 {
+		return nil
+	}
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		for _, protocol := range r.mainHost.Mux().Protocols() {
+			if protocol == holepunch.Protocol {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("peertransport: traversal prepare: %w", ctx.Err())
+		case <-r.ctx.Done():
+			return errRuntimeClosed
+		case <-ticker.C:
+		}
+	}
 }
 
 // ---- peerauth.Identity ----
@@ -200,6 +327,7 @@ func (r *Runtime) SetDirectory(d peerauth.Directory) error {
 		return err
 	}
 	r.auth.setDirectory(d)
+	r.observed.setInfrastructure(d.Infrastructure)
 	return nil
 }
 
@@ -284,10 +412,13 @@ func (r *Runtime) shutdown() error {
 	for _, h := range hosts {
 		_ = h.Close()
 	}
+	var closeErr error
 	if r.mainHost != nil {
-		return r.mainHost.Close()
+		closeErr = r.mainHost.Close()
 	}
-	return nil
+	r.opWG.Wait()
+	r.events.close()
+	return closeErr
 }
 
 // relayHostFor returns the lazy relay-dial host for a given relay. It is

@@ -1,0 +1,526 @@
+{
+  "date": "2026-11-02",
+  "scope": "automatic public production P2P pre-acceptance; isolated third-party NAS",
+  "baseline": "73dc7c2e71a7d2c3ac6b4e5fa0c2a0d27c9c58eb",
+  "code_snapshot": "7aa598ebbf15b028465438549fe3dbf69dc97baf",
+  "developer_branch_batch_committed": false,
+  "full_batch_accepted": false,
+  "linux": {
+    "runs": [
+      {
+        "run_id": 41374454040,
+        "head_sha": "7aa598ebbf15b028465438549fe3dbf69dc97baf",
+        "result": "success",
+        "note": "first green full run before ownership fix"
+      },
+      {
+        "run_id": 41617238306,
+        "head_sha": "9af25bfe9855a6a89e97cfdeb8c226fc92fd4e21",
+        "result": "success",
+        "note": "ownership fix + persisted-graph test + relay retry evidence"
+      },
+      {
+        "run_id": 41621258482,
+        "head_sha": "d2eed36980045ba8dd881eaaae9c6fe7cd275921",
+        "result": "success",
+        "note": "final tree incl. backup fixture alive-window fix"
+      }
+    ],
+    "final_head_sha": "d2eed36980045ba8dd881eaaae9c6fe7cd275921",
+    "all_gates_exit_zero": true,
+    "data_races": 0
+  },
+  "darwin": {
+    "core_and_regression_passed": true,
+    "cli_full_race_exit": 0,
+    "peer_full_race_exit": 0,
+    "final_loopback_peer_race_exit": 0,
+    "final_loopback_peer_package_seconds": 253.125,
+    "full_root_exit": 0,
+    "full_root_seconds": 1415.503,
+    "full_root_data_races": 0,
+    "full_root_remaining_failures": [
+      "TestPlannedWriteRecoverySlowProgressOutlivesLegacyTimeout: no feasible write layout",
+      "TestPeerNATRestartSameIdentityCachedRediscovery: directory refresh deadline exceeded (wildcard fixture; later loopback full peer package passed)"
+    ],
+    "root_vet_exit": 0,
+    "prototype_peertransport_race_exit": 0,
+    "prototype_production_race_exit": 0,
+    "final_code_full_root_rerun": false,
+    "node_receipt_test_flake": {
+      "test": "TestWriteEpochHappyPath",
+      "symptom": "verified receipts = 2, want 1",
+      "cause": "post-write replication re-reports an already stored object; test snapshot raced the goroutine",
+      "baseline_reproduction": "2/6 failures on pre-fix snapshot",
+      "fix": "test now requires >=1 receipt, all matching object and epoch",
+      "post_fix_runs": "15/15 passed"
+    },
+    "full_root_note": "final tree: go test -race -p 1 ./... exit 0; go vet exit 0; prototype modules race exit 0",
+    "metabackup_fixture_flake": {
+      "test": "TestRecoverRebuildMultiChunkOrdering",
+      "symptom": "metabackup: no live nodes",
+      "cause": "fixture alive window was 1 minute; building 200 files on slow SMB disk exceeded it, so BackupOnce correctly refused",
+      "fix": "fixture alive window 30 minutes; standalone 3/3 and full master package -race passed"
+    }
+  },
+  "third_party_constraint": {
+    "no_operator_NAT_changes": true,
+    "no_DNS_changes": true,
+    "no_node_announce": true,
+    "easytier_used_only_for_management": true,
+    "fixed_public_center": true
+  },
+  "nas_content_checks": [
+    {
+      "name": "normal256",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 35813558279,
+          "ok": true,
+          "op": "put"
+        },
+        {
+          "match": true,
+          "ok": true,
+          "op": "get"
+        }
+      ],
+      "object_response_count": 3,
+      "paths": [
+        "circuit",
+        "direct"
+      ],
+      "fallback_values": [
+        false,
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "GET",
+          "path": "direct",
+          "status": 200,
+          "error_kind": ""
+        }
+      ],
+      "complete_get_and_match": true,
+      "evidence_sha256": "bc141cfb43877571ad7cc1f21d1147a2d28f81931b00e88307e0d97388ae9fe8",
+      "failed_holepunch_events": 0
+    },
+    {
+      "name": "strictrelay256",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 23887811773,
+          "ok": true,
+          "op": "put"
+        },
+        {
+          "match": true,
+          "ok": true,
+          "op": "get"
+        }
+      ],
+      "object_response_count": 3,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        false
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "GET",
+          "path": "circuit",
+          "status": 200,
+          "error_kind": ""
+        }
+      ],
+      "complete_get_and_match": true,
+      "evidence_sha256": "e32d31820c0b87c484a00342f8c3c0c321111cb7d7f09a1c372d8477f63d12bd",
+      "failed_holepunch_events": 0
+    },
+    {
+      "name": "strictrelay1MiB",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 73288425050,
+          "ok": true,
+          "op": "put"
+        },
+        {
+          "match": true,
+          "ok": true,
+          "op": "get"
+        }
+      ],
+      "object_response_count": 3,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        false
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "GET",
+          "path": "circuit",
+          "status": 200,
+          "error_kind": ""
+        }
+      ],
+      "complete_get_and_match": true,
+      "evidence_sha256": "118b590b68ae3dbe289baaa9d6cd710e06a14b82f8954f02a5b87b6bbeb254cc",
+      "failed_holepunch_events": 0
+    },
+    {
+      "name": "normal8MiB",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 96735833478,
+          "ok": false,
+          "op": "put"
+        }
+      ],
+      "object_response_count": 2,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 0,
+          "error_kind": "canceled"
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 0,
+          "error_kind": "canceled"
+        }
+      ],
+      "complete_get_and_match": false,
+      "evidence_sha256": "0d8b42ff73ce8ca122baab6e0fb86895aef58e11a97d78859ab412c292920a72",
+      "failed_holepunch_events": 3
+    },
+    {
+      "name": "crossnas8MiB",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 99726766933,
+          "ok": false,
+          "op": "put"
+        }
+      ],
+      "object_response_count": 2,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 0,
+          "error_kind": "canceled"
+        }
+      ],
+      "complete_get_and_match": false,
+      "evidence_sha256": "c72a3bf1442dc409b46c936013d2f2d11accbddf8043a9c804863a817417edb1",
+      "failed_holepunch_events": 0
+    },
+    {
+      "name": "crossnas256",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 24089786882,
+          "ok": true,
+          "op": "put"
+        },
+        {
+          "match": true,
+          "ok": true,
+          "op": "get"
+        }
+      ],
+      "object_response_count": 3,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "GET",
+          "path": "circuit",
+          "status": 200,
+          "error_kind": ""
+        }
+      ],
+      "complete_get_and_match": true,
+      "evidence_sha256": "5f8eb211b497542833609b45241c8819af13c26bb5afca7857ac626f6a4a13ed",
+      "failed_holepunch_events": 1
+    },
+    {
+      "name": "crossnas8MiB-bounded",
+      "operation_outcomes": [
+        {
+          "elapsed_ns": 599635524108,
+          "ok": false,
+          "op": "put"
+        }
+      ],
+      "object_response_count": 3,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 201,
+          "error_kind": ""
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 0,
+          "error_kind": "read"
+        },
+        {
+          "method": "PUT",
+          "path": "circuit",
+          "status": 0,
+          "error_kind": "canceled"
+        }
+      ],
+      "complete_get_and_match": false,
+      "evidence_sha256": "b0cba26575eb217ddae23c0bdaa13e60f36d759c805fb660da3fc6b8668a59ad",
+      "failed_holepunch_events": 9
+    },
+    {
+      "name": "getloss1MiB",
+      "operation_outcomes": [
+        {
+          "match": true,
+          "ok": true,
+          "op": "get"
+        }
+      ],
+      "object_response_count": 2,
+      "paths": [
+        "circuit"
+      ],
+      "fallback_values": [
+        true
+      ],
+      "response_outcomes": [
+        {
+          "method": "GET",
+          "path": "circuit",
+          "status": 200,
+          "error_kind": "read"
+        },
+        {
+          "method": "GET",
+          "path": "circuit",
+          "status": 200,
+          "error_kind": ""
+        }
+      ],
+      "complete_get_and_match": true,
+      "evidence_sha256": "f785a06d8c5b32568bb3dd68eb89f2d1078ac0d63ae5d6963df010e3be10cd50",
+      "failed_holepunch_events": 0
+    }
+  ],
+  "nas_DCutR_confirmations": [
+    {
+      "node": "29038",
+      "local_peer_id": "12D3KooWS34Yj8n7oz5Mzqs1wd5Sj5twS9WS2xBCSLxZGF3HzVsi",
+      "remote_peer_id": "12D3KooWCMriVFSvkSJ3TECvyaVvJwSt642r3DLupJJv5oWxusVn",
+      "time": "2026-11-02T01:38:12.882485844Z",
+      "connection_id": "12D3KooWCM-5",
+      "local_address": "/ip4/0.0.0.0/udp/42577/quic-v1",
+      "remote_address": "/ip4/161.142.150.94/udp/24558/quic-v1",
+      "success": true,
+      "later_stream_dials_same_connection": 7,
+      "does_not_prove_specific_object_success": true
+    },
+    {
+      "node": "29663",
+      "local_peer_id": "12D3KooWCMriVFSvkSJ3TECvyaVvJwSt642r3DLupJJv5oWxusVn",
+      "remote_peer_id": "12D3KooWS34Yj8n7oz5Mzqs1wd5Sj5twS9WS2xBCSLxZGF3HzVsi",
+      "time": "2026-11-02T01:37:59.574235686Z",
+      "connection_id": "12D3KooWS3-5",
+      "local_address": "/ip4/0.0.0.0/udp/57692/quic-v1",
+      "remote_address": "/ip4/49.76.119.132/udp/3445/quic-v1",
+      "success": true,
+      "later_stream_dials_same_connection": 7,
+      "does_not_prove_specific_object_success": true
+    }
+  ],
+  "independent_ciphertext_verification": [
+    {
+      "aead_open_and_bytes_match": true,
+      "ciphertext_sha256": "164eaaecea33a560d53a4aea077852e997d458a84cdae7e41860580aee7cad50",
+      "crc32c": 595829710,
+      "node": "29038",
+      "object_id": 1099511628032,
+      "stored_bytes": 262276,
+      "tamper_rejected": true
+    },
+    {
+      "aead_open_and_bytes_match": true,
+      "ciphertext_sha256": "164eaaecea33a560d53a4aea077852e997d458a84cdae7e41860580aee7cad50",
+      "crc32c": 595829710,
+      "node": "29663",
+      "object_id": 1099511628032,
+      "stored_bytes": 262276,
+      "tamper_rejected": true
+    }
+  ],
+  "read_node_loss": {
+    "bytes_before_stop": 512,
+    "victim": "29663",
+    "barrier": "client first positive byte; server may have buffered more",
+    "failed_first_response_proven": true,
+    "survivor_response_and_complete_readback_proven": true,
+    "distinct_request_and_connection_proven": true
+  },
+  "large_payload": {
+    "accepted": false,
+    "size": 8388608,
+    "put_after_fix": {
+      "completed": true,
+      "seconds": 442.19,
+      "replicas": 2,
+      "path": "circuit",
+      "note": "isolated public NAS, actual CLI inside NAS"
+    },
+    "get_after_put": {
+      "completed": false,
+      "seconds": 92.94,
+      "attempts": 2,
+      "failure": "both replicas returned headers then read context deadline exceeded",
+      "read_deadline_seconds": 46,
+      "formula": "30s + size/512KiB seconds, capped 150s",
+      "interpretation": "fixed total read deadline does not scale to slow WAN; product limitation pending design fix, production timeout not loosened"
+    },
+    "invalidated_runs": [
+      {
+        "date": "2026-11-03",
+        "reason": "runtime firewall TTL 7200s had expired; control plane unreachable from NAS (i/o timeout to 193.134.209.37:29600)",
+        "result": "CLI PUT exit 124 at 900s outer guard - not product evidence"
+      }
+    ],
+    "earlier_20261102_failures_retained": true
+  },
+  "cleanup": {
+    "isolated_directories_removed": true,
+    "runtime_firewall_rules_removed": true,
+    "permanent_firewall_untouched": true,
+    "easytier_untouched": true,
+    "verified_after": "center directory and 29600/tcp,29602/tcp,29603/udp absent; both NAS directories absent",
+    "master_db_archived_privately": true
+  },
+  "limitations": [
+    "Not all NAT combinations or TCP public punching tested",
+    "NAS DCUtR connection success and later streams are correlated; no default node per-object HTTP observer, so do not claim a specific successful payload from runtime dial alone",
+    "8MiB multi-replica WAN stability not accepted",
+    "Darwin full-root stability not accepted",
+    "No kernel FUSE, unrelated deployments, main merge or data migration"
+  ],
+  "evidence_private": true,
+  "updated": "2026-11-03",
+  "ownership_fix_20261103": {
+    "defect": "active planned recovery write received unplanned node pushes and scanner pulls, competing with the client direct upload on the same slow link",
+    "fix": [
+      "master/integrity.go: suppress unplanned Targets while WriteProgress is active",
+      "master/scanner.go: skip staging chunks with WriteEpoch>0 in probe and repair loops"
+    ],
+    "deterministic_evidence": {
+      "new_tests": [
+        "TestRecoveryReplicationPlanDefersUnplannedPushUntilPublication",
+        "TestRecoveryScannerDoesNotRaceActiveWrite",
+        "TestRecoveryExplicitTransferGraphRetainsNodeLegs",
+        "TestPreRecoveryStagingRetainsReplicaFallback",
+        "TestRecoveryDirectWriteHasSingleOwnerDuringSlowReceive",
+        "TestPlannedClientOnlyUploadsIngressAndRetainsCommitGate(rewritten to persisted graph)"
+      ],
+      "focused_race_passed": true,
+      "reverse_control": {
+        "original_code": "TestRecoveryDirectWriteHasSingleOwnerDuringSlowReceive failed with duplicate data paths: pull=1",
+        "dev_owner_fix_removed": true
+      }
+    },
+    "relay_evidence_fix": {
+      "test": "TestPeerNATRelayRetryPreservesCiphertextAndRequestEvidence",
+      "asserted": "one real failed response followed by one completed response for the same immutable object; completed response must match accepted dial connection, failed response only the authenticated target",
+      "note": "net/http may re-dial before a request is written"
+    }
+  },
+  "acceptance_summary": "All local and Linux gates pass. One product limitation remains documented: 8 MiB read over the slow relay path fails at the fixed 46 s client read deadline even though the write completed. Not fixed in this batch; production timeouts were not loosened."
+}

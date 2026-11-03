@@ -278,9 +278,10 @@ func csecExitCode(err error) int {
 // 负向测试中 CLI 可能意外启动 server 挂死：30s context 超时 + WaitDelay 确保不漏 child。
 func csecCLI(t *testing.T, env []string, logNow bool, args ...string) csecResult {
 	t.Helper()
+	bin := csecBuild(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, csecBuild(t), args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = env
 	cmd.WaitDelay = 2 * time.Second // context 取消后等待子进程退出，超时则 Kill
 	var out, errb bytes.Buffer
