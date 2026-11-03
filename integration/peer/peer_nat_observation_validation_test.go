@@ -42,6 +42,17 @@ func TestRelayObservationValidationKeepsRetriesAndRejectsFalseSuccess(t *testing
 	if err := validateRelayOnlyObservations(redialed, "node.test:9421", "peer-node", []uint64{42}); err != nil {
 		t.Fatalf("failed response after a transport re-dial was rejected: %v", err)
 	}
+	// A transport re-dial may produce a second accepted dial for the same
+	// request; the completed response must match the later one.
+	late := relayObservationPair("written", http.MethodPut, path, http.StatusCreated, "")
+	late[0].ConnectionID, late[0].StreamID, late[0].RemoteAddress = "conn-late", "stream-late", "/ip4/127.0.0.1/tcp/11/p2p/relay/p2p-circuit"
+	late[1].ConnectionID, late[1].StreamID, late[1].RemoteAddress = "conn-late", "stream-late", "/ip4/127.0.0.1/tcp/11/p2p/relay/p2p-circuit"
+	redialSuccess := append([]peerhttp.Observation(nil), valid[:3]...)
+	redialSuccess = append(redialSuccess, late...)
+	redialSuccess = append(redialSuccess, valid[4:]...)
+	if err := validateRelayOnlyObservations(redialSuccess, "node.test:9421", "peer-node", []uint64{42}); err != nil {
+		t.Fatalf("re-dialed request with a matching completed response was rejected: %v", err)
+	}
 	for _, tc := range []struct {
 		name   string
 		change func([]peerhttp.Observation) []peerhttp.Observation
@@ -71,6 +82,9 @@ func TestRelayObservationValidationKeepsRetriesAndRejectsFalseSuccess(t *testing
 			return in
 		}},
 		{"wrong object", func(in []peerhttp.Observation) []peerhttp.Observation { in[3].RequestPath = "/objects/43"; return in }},
+		{"identical dial twice", func(in []peerhttp.Observation) []peerhttp.Observation {
+			return append(append([]peerhttp.Observation(nil), in[:3]...), append([]peerhttp.Observation{in[2]}, in[3:]...)...)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			input := append([]peerhttp.Observation(nil), valid...)

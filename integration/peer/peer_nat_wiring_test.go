@@ -184,7 +184,7 @@ func validateRelayOnlyObservations(obs []peerhttp.Observation, target, peerID st
 	if len(expected) == 0 {
 		return fmt.Errorf("no authoritative objects to verify")
 	}
-	dials := map[string]peerhttp.Observation{}
+	dials := map[string][]peerhttp.Observation{}
 	responses := map[string]bool{}
 	attempts := map[string]int{}
 	successes := map[string]int{}
@@ -201,10 +201,14 @@ func validateRelayOnlyObservations(obs []peerhttp.Observation, target, peerID st
 			return fmt.Errorf("normal relay request omitted fallback: %+v", o)
 		}
 		if o.Phase == peerhttp.PhaseDial {
-			if _, exists := dials[o.RequestID]; exists {
-				return fmt.Errorf("duplicate request dial: %+v", o)
+			// net/http may re-dial after a connection is closed before the request
+			// is written; every attempt for one request still shares its ID.
+			for _, prior := range dials[o.RequestID] {
+				if prior.ConnectionID != "" && prior.ConnectionID == o.ConnectionID && prior.StreamID == o.StreamID {
+					return fmt.Errorf("identical dial reported twice: %+v", o)
+				}
 			}
-			dials[o.RequestID] = o
+			dials[o.RequestID] = append(dials[o.RequestID], o)
 			attempts[key]++
 			if attempts[key] > 3 {
 				return fmt.Errorf("object request exceeded its retry bound: %s", key)
@@ -217,15 +221,17 @@ func validateRelayOnlyObservations(obs []peerhttp.Observation, target, peerID st
 				continue
 			}
 		} else if o.Phase == peerhttp.PhaseResponse {
-			dial, ok := dials[o.RequestID]
-			if !ok || dial.ErrorKind != peerhttp.ErrorNone || responses[o.RequestID] || dial.Method != o.Method || dial.RequestPath != o.RequestPath {
+			var serving *peerhttp.Observation
+			for i := range dials[o.RequestID] {
+				if dials[o.RequestID][i].ErrorKind == peerhttp.ErrorNone {
+					serving = &dials[o.RequestID][i]
+				}
+			}
+			if serving == nil || responses[o.RequestID] || serving.Method != o.Method || serving.RequestPath != o.RequestPath {
 				return fmt.Errorf("response was not bound to its accepted dial: %+v", o)
 			}
-			// net/http may close and re-dial a connection before the request is
-			// written, so a failed response only has to prove it came from the
-			// authenticated target. A completed response must match the dial's
-			// exact connection, stream and address facts.
-			if o.ErrorKind == peerhttp.ErrorNone && (dial.ConnectionID != o.ConnectionID || dial.StreamID != o.StreamID || dial.RemoteAddress != o.RemoteAddress) {
+			// A completed response must match the dial that served it exactly.
+			if o.ErrorKind == peerhttp.ErrorNone && (serving.ConnectionID != o.ConnectionID || serving.StreamID != o.StreamID || serving.RemoteAddress != o.RemoteAddress) {
 				return fmt.Errorf("completed response was not bound to its accepted dial: %+v", o)
 			}
 			responses[o.RequestID] = true
@@ -260,8 +266,14 @@ func validateRelayOnlyObservations(obs []peerhttp.Observation, target, peerID st
 			return fmt.Errorf("object request never completed after its last failure: %s successes=%d", key, successes[key])
 		}
 	}
-	for id, dial := range dials {
-		if dial.ErrorKind == peerhttp.ErrorNone && !responses[id] {
+	for id, attempts := range dials {
+		accepted := false
+		for _, dial := range attempts {
+			if dial.ErrorKind == peerhttp.ErrorNone {
+				accepted = true
+			}
+		}
+		if accepted && !responses[id] {
 			return fmt.Errorf("accepted request has no response outcome: %s", id)
 		}
 	}
