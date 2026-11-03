@@ -35,7 +35,15 @@
     "root_vet_exit": 0,
     "prototype_peertransport_race_exit": 0,
     "prototype_production_race_exit": 0,
-    "final_code_full_root_rerun": false
+    "final_code_full_root_rerun": false,
+    "node_receipt_test_flake": {
+      "test": "TestWriteEpochHappyPath",
+      "symptom": "verified receipts = 2, want 1",
+      "cause": "post-write replication re-reports an already stored object; test snapshot raced the goroutine",
+      "baseline_reproduction": "2/6 failures on pre-fix snapshot",
+      "fix": "test now requires >=1 receipt, all matching object and epoch",
+      "post_fix_runs": "15/15 passed"
+    }
   },
   "third_party_constraint": {
     "no_operator_NAT_changes": true,
@@ -427,13 +435,30 @@
   "large_payload": {
     "accepted": false,
     "size": 8388608,
-    "original_CLI_guard_seconds": 300,
-    "original_CLI_exit": 124,
-    "diagnostic_100s_runs_completed_operation": false,
-    "diagnostic_600s_run_completed_operation": false,
-    "do_not_treat_process_exit_zero_as_operation_success": true,
-    "one_completed_replica_does_not_satisfy_confirmation_set": true,
-    "production_timeouts_unchanged": true
+    "put_after_fix": {
+      "completed": true,
+      "seconds": 442.19,
+      "replicas": 2,
+      "path": "circuit",
+      "note": "isolated public NAS, actual CLI inside NAS"
+    },
+    "get_after_put": {
+      "completed": false,
+      "seconds": 92.94,
+      "attempts": 2,
+      "failure": "both replicas returned headers then read context deadline exceeded",
+      "read_deadline_seconds": 46,
+      "formula": "30s + size/512KiB seconds, capped 150s",
+      "interpretation": "fixed total read deadline does not scale to slow WAN; product limitation pending design fix, production timeout not loosened"
+    },
+    "invalidated_runs": [
+      {
+        "date": "2026-11-03",
+        "reason": "runtime firewall TTL 7200s had expired; control plane unreachable from NAS (i/o timeout to 193.134.209.37:29600)",
+        "result": "CLI PUT exit 124 at 900s outer guard - not product evidence"
+      }
+    ],
+    "earlier_20261102_failures_retained": true
   },
   "cleanup": {
     "run_id": "p2p-nas-auto-20261102-6x9ew1uw",
@@ -449,5 +474,33 @@
     "Darwin full-root stability not accepted",
     "No kernel FUSE, unrelated deployments, main merge or data migration"
   ],
-  "evidence_private": true
+  "evidence_private": true,
+  "updated": "2026-11-03",
+  "ownership_fix_20261103": {
+    "defect": "active planned recovery write received unplanned node pushes and scanner pulls, competing with the client direct upload on the same slow link",
+    "fix": [
+      "master/integrity.go: suppress unplanned Targets while WriteProgress is active",
+      "master/scanner.go: skip staging chunks with WriteEpoch>0 in probe and repair loops"
+    ],
+    "deterministic_evidence": {
+      "new_tests": [
+        "TestRecoveryReplicationPlanDefersUnplannedPushUntilPublication",
+        "TestRecoveryScannerDoesNotRaceActiveWrite",
+        "TestRecoveryExplicitTransferGraphRetainsNodeLegs",
+        "TestPreRecoveryStagingRetainsReplicaFallback",
+        "TestRecoveryDirectWriteHasSingleOwnerDuringSlowReceive",
+        "TestPlannedClientOnlyUploadsIngressAndRetainsCommitGate(rewritten to persisted graph)"
+      ],
+      "focused_race_passed": true,
+      "reverse_control": {
+        "original_code": "TestRecoveryDirectWriteHasSingleOwnerDuringSlowReceive failed with duplicate data paths: pull=1",
+        "dev_owner_fix_removed": true
+      }
+    },
+    "relay_evidence_fix": {
+      "test": "TestPeerNATRelayRetryPreservesCiphertextAndRequestEvidence",
+      "asserted": "one real failed response followed by one completed response for the same immutable object; completed response must match accepted dial connection, failed response only the authenticated target",
+      "note": "net/http may re-dial before a request is written"
+    }
+  }
 }

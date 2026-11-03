@@ -34,6 +34,14 @@ func TestRelayObservationValidationKeepsRetriesAndRejectsFalseSuccess(t *testing
 	if err := validateRelayOnlyObservations(valid, "node.test:9421", "peer-node", []uint64{42}); err != nil {
 		t.Fatalf("bound failed attempt followed by verified success was rejected: %v", err)
 	}
+	// A read failure may follow a transport re-dial: the failed response still
+	// proves it came from the authenticated target, while the final success must
+	// match an accepted dial exactly.
+	redialed := append([]peerhttp.Observation(nil), valid...)
+	redialed[1].ConnectionID, redialed[1].StreamID, redialed[1].RemoteAddress = "conn-retried", "stream-retried", "/ip4/127.0.0.1/tcp/9/p2p/relay/p2p-circuit"
+	if err := validateRelayOnlyObservations(redialed, "node.test:9421", "peer-node", []uint64{42}); err != nil {
+		t.Fatalf("failed response after a transport re-dial was rejected: %v", err)
+	}
 	for _, tc := range []struct {
 		name   string
 		change func([]peerhttp.Observation) []peerhttp.Observation

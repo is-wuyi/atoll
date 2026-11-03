@@ -218,8 +218,15 @@ func validateRelayOnlyObservations(obs []peerhttp.Observation, target, peerID st
 			}
 		} else if o.Phase == peerhttp.PhaseResponse {
 			dial, ok := dials[o.RequestID]
-			if !ok || dial.ErrorKind != peerhttp.ErrorNone || responses[o.RequestID] || dial.Method != o.Method || dial.RequestPath != o.RequestPath || dial.ConnectionID != o.ConnectionID || dial.StreamID != o.StreamID || dial.RemoteAddress != o.RemoteAddress {
+			if !ok || dial.ErrorKind != peerhttp.ErrorNone || responses[o.RequestID] || dial.Method != o.Method || dial.RequestPath != o.RequestPath {
 				return fmt.Errorf("response was not bound to its accepted dial: %+v", o)
+			}
+			// net/http may close and re-dial a connection before the request is
+			// written, so a failed response only has to prove it came from the
+			// authenticated target. A completed response must match the dial's
+			// exact connection, stream and address facts.
+			if o.ErrorKind == peerhttp.ErrorNone && (dial.ConnectionID != o.ConnectionID || dial.StreamID != o.StreamID || dial.RemoteAddress != o.RemoteAddress) {
+				return fmt.Errorf("completed response was not bound to its accepted dial: %+v", o)
 			}
 			responses[o.RequestID] = true
 		} else {
