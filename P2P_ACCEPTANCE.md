@@ -1,30 +1,59 @@
 # 内置 P2P：分阶段本地、Linux CI 与隔离公网验收
 
-## 当前批次状态（2026-11-03）
+## 当前批次状态（2026-11-09）
+
+当前进行候选观测与实际 TCP 中继连接分离，基线 `4aadbe837e760bf75e52144d5696de4e80403a44`。中心恢复 TCP+QUIC 默认，主 host 保留 TCP/QUIC 直连及原生 DCUtR；独立同身份 QUIC 观测借主 UDP 监听套接字，中继按具体 TCP 连接开流。实现尚未提交开发分支；r5 的 macOS 全根 race/vet、两个独立模块和 Linux CI 四项均通过，但跨 NAS 暴露了真实 HTTP 期限接线及辅助 QUIC 公网过滤缺口。两项已修，新增回归通过，正在冻结 r6 重跑全量与真机。自动认证观测→持久化调度图→真实复制对象流→两份 Done→完整回读已有本地组件证据；本批公网交付尚未验收。
+
+### 本批固定快照回归
+
+- `p2p-split-r1-jd7nppnk`：真实 TCP/QUIC 接线能够构造，但本地模式把回环候选当作应等待的公网 DCUtR 地址，准备超时；定点 race 退出 1。修复只在等待条件中区分公网候选，不提高期限、不将回环标为 Public。
+- `p2p-split-r2-iphg1ytd`，清单 SHA-256 `07ab0082fef2f25c6906fc953cc781919ff31596d1db454ac7c7c5c3190afaab`：14 项定点测试连续三轮 race 退出 0；真实 TCP 预约、主 UDP 同端口 QUIC 观测、辅助 host 关闭后 QUIC 直传、旧 QUIC-only 连接池拒绝且不关闭均通过。`peertransport/peerhttp/peerauth/cmd/atoll` 整包 race 退出 0（107.933 秒）。
+- `p2p-split-r3-xdnug5rk`：新增真实 caller→center TCP hop 与 center→target TCP stop，加实际 connection/stream/transport 事件；空/截断/超长、DNS/circuit/零端口观测拒绝，首帧读取不合并后续大记录，失败观测不删除有效候选，Close 取消并 join 等待流。相关定点测试连续三轮 race 退出 0（35.985 秒）。这是 loopback 组件证据，不证明公网打洞或逐对象吞吐。
+- `p2p-split-r4-xj1nw8z9` / `p2p-split-r5-wgknh_z7` 均退出 1：前者的新节点探测夹具没有控制面设备会话，后者在 TCP Identify 写响应后立刻 Reset，导致 QUIC 等待屏障未到达。两次失败保留，夹具修正为独立验证 TLS 控制请求及完成后 Close；不修改生产认证/超时。
+- `p2p-split-r6-thklnogw`，清单 `652de759561ea31a38050971e5c2ed771d044d20a341e2ad313252df5138f56d`：连接/握手取消、成功 tunnel 在 dial ctx 取消后仍双向传 payload、续期新 Identify、候选隔离和客户端/节点未知失败探测连续三轮 race 退出 0（60.779 秒）；相关传输/client/node/master/CLI 整包 race 退出 0（579.384 秒），相关 vet 退出 0且清单未变。
+- 增加 Identify 内存配额时曾错误地先 `SetService` 后 `SetProtocol`，真实 StartP2P 回归报 `stream scope not attached to a protocol`。修正顺序后 `p2p-split-scope-order-gdoug8c6` 定点三轮 race 退出 0（22.602 秒）；不能用修前 r6 的通过覆盖这个后续改动。
+- `p2p-split-feedback-r1-t_gjft46`：追加响应 observer 不替换原诊断；确认成功、正确 stored size 和完整响应之后才计应用层确认吞吐，未知路径不猜测，payload 采样不被健康探测延长，客户端缓存按服务端 TTL 截止。定点三轮 race 退出 0（45.172 秒），peerhttp/client 整包两轮 race 退出 0（199.244 秒）且清单未变。
+- `p2p-split-pre-final-7lnw_0_5`：peerhttp/client/master 整包 race 退出 0（457.658 秒），清单未变。未纳入正在完善的自动认证观测闭环与节点 payload 反馈测试，**不是最终整批快照**。
+- `p2p-split-final-20261109-r4`：广泛 recovery/对象闭环两轮 race 退出 1（768.837 秒），旧慢进度夹具首轮在 80ms idle 窗口得到 422，第二轮通过；此夹具未启用 transfer planning，新测量接线是 no-op。相同源码随后单独三轮通过，但不据此擦掉首次失败，也未证明只有 fsync 导致。没有改 Sync、确认数、生产期限或该断言。
+- 最终生产快照 `p2p-split-final-20261109-r5`，清单 SHA-256 `8f504278e3ec688b2dab4154de639dd1ae8a8d44ad10b5676aef26b44876f487`：普通直拨使用原调用期限内的共享子预算，静默 direct 候选不再耗尽 relay 兜底时间；修前确定性失败和修后三轮 race 通过均保留，总调用/strict-path 期限不变。全根 `go test -race -p 1 ./... -count=1 -timeout=20m` 退出 0（1330.977 秒），全根 vet 退出 0；两独立原型 race 退出 0，production 原型显式 `-tags integration`。所有执行后清单一致，Darwin/Linux CLI 构建均通过。
+- [Linux 四项验证 42512880074](https://github.com/is-wuyi/atoll/actions/runs/42512880074) 对应 `ci/p2p-validation-20261109-split` 预验收提交 `0ff0362f7549c7c8051d2e86ff3b4ec2c165d358`；commit tree 与 r5 固定清单逐文件一致，下载诊断的四个 `.exit` 均为 0。此提交不是开发分支最终验收或现网部署。
+
+### 本批跨 NAS 失败与后续接线缺口（2026-11-09）
+
+- 中心当前 EasyTier CLI 清单里 29663 已离线，改用当时在线的 29078、29156；mesh 地址仅用于管理 SSH，不进入对象 URL 或 peer 公布配置。
+- 首轮 `split-20261109-7cd7833ce37a95a9` 未进入对象传输：Python/OpenSSL 严格校验拒绝测试 CA 缺少 `keyUsage`；补齐同测试密钥的 CA 扩展后原叶证书严格验证成功，未关闭认证。节点启动又因 NAS `/tmp` 挂载 `noexec` 被拒；未改 NAS 挂载或登录目录。该轮是编排失败，不计 P2P 性能。
+- 第二轮 `split-20261109-79f401a2cc9b730c` 使用既有可写、可执行的 NAS `/volume1/@tmp` 下独立 owner 目录。两台安全登记、自动 TCP 公网候选和实际 TCP 预约/两端 relay 控制流均有记录；同身份辅助 QUIC 观测却在约 3–4ms 立即失败，未取得 QUIC 候选，不据 UDP 缓冲警告归因。
+- 初始节点互探收到真实 circuit 成功，后来多次 3 秒探测先超时，runtime 在约 3.085 秒才复用同 circuit 连接开流。主审核对 Go 1.26.7 `net/http/transport.go:1524–1529`：拨号上下文保留 values 但以 `context.WithoutCancel` 剥离原请求 Deadline；此前仅依赖拨号 ctx 的直拨子预算不能为真实短请求留兜底时间。这是后续接线缺口，r5 的纯 runtime 预算回归未覆盖实际 HTTP 的这一契约。
+- 8 MiB 加密计划写入在 10.182 秒返回 `422 no feasible write plan`，未取得对象计划、未发送对象 payload、未产生保存确认；失败保留，不计算吞吐。拒绝规划避免将未知/失败路径当作安全可用路径，但不代表传输已通过。
+- 两轮目录、进程和临时 runtime 规则都已精确清理并查询确认。第二轮中心退出后命令字段消失曾触发严格清理护栏，主审再读验证原 PID 不存在后完成；未绕过 PID 重用校验。没有替换其它部署、改 NAT/DNS、停 EasyTier 或迁移数据。
+- QUIC 即时拒绝的主审复现：辅助 host 错用只读黑洞检测器；新 host 初始 `Probing` 被只读模式视为 `Blocked`，公网 UDP 在实际拨号前被剔除且永远无法采样。`127.0.0.1` 不走此过滤，旧测试空过了这条政策。新增实际辅助 swarm 的 `CanDial` 验证（不向外部地址发包）修前退出 1；移除只读误用、保留默认学习器/授权后，公网 IPv4/IPv6、共享套接字与 TCP 两跳相关三轮 race 退出 0（6.686 秒）。
+- HTTP 主审复现与修后：原请求的绝对期限/取消通过私有 context value 送入建立阶段，resolver、peer/ordinary 拨号与真实 TLS 握手共同受限；已建立流不绑定旧请求。控制请求清除私有数据 bounds，TLS 原配置的更短握手期限仍保留。修前真实 HTTP 回归失败；修后 peerhttp 整包三轮 race 退出 0（15.996 秒），真实 HTTP 三秒内静默 direct→relay 完整响应及第二次已连接/打洞路径复用三轮通过（23.062 秒）。首次测试错误地要求第二次也必须 fallback，随后改为核验当次实际 peer stream：首个请求必须 fallback，后续可复用已完成直连而不伪造 fallback；原失败保留。生产总期限、保存条件和内容字节未改。
+
+快照和日志在本地私有 `.atoll-realtests` 目录保存，测试期间不修改 source；源码工作树位于 SMB，构建不在 SMB 原树执行。
+
+## 2026-11-03 自动公网批次历史
 
 自动公网接线已实现，隔离第三方 NAS 无手填 announce、无 NAT/DNS 修改：已确认自动公网候选、双侧 QUIC DCUtR 成功与后续同连接 stream、256 KiB/1 MiB 双副本 AEAD 完整读写，以及读中真实节点退出后的故障转移。
 
 2026-11-03 又修复并验证了一个真实的大文件放大缺陷：活动计划写入期间，Master 仍把同一对象下发给后台节点复制，修复扫描也会向正在上传的副本触发 pull，与客户端直写争用同一慢链路。修复后 8 MiB 双副本上传首次在隔离公网完成（442 秒，两副本确认）；但同一文件的回读在两个副本上都在客户端固定 46 秒读取总期限处超时。**该读期限问题尚未修复，完整自动公网批次仍未验收。**
 
-另有一条 8 MiB 复测在中心运行态防火墙规则（TTL 7200 秒）到期后进行，控制面已不可达，因此该轮 900 秒超时是夹具失效，不计为产品失败。
+另有一条 8 MiB 复测的迟到日志显示中心运行态防火墙规则已到期、控制面不可达。日志尾部时间不等于上传开始时间，缺少请求开始时的规则查询；此前直接将 900 秒超时判为“TTL 已到期的夹具失效”证据不足，撤回该归因，失败记录保留。
 
-本轮源码仅在 `ci/p2p-validation-20261102-auto` 留有预验收提交，开发分支仍保留未提交实现。两个 NAS 和中心的隔离目录、进程及运行态防火墙规则均已核对清理；未替换其它测试部署、拆除 EasyTier、迁移数据或合并 main。
+历史预验收提交和其失败保留；随后实现已提交并推送开发分支 `62fc4dc`，TCP-only 中心默认已提交 `4aadbe8`。这些 Git 交付事实不等于完整公网验收通过；当前分离接线尚未提交。旧两个 NAS 和中心的隔离目录、进程及运行态防火墙规则均已核对清理；本批尚未创建新远端资源，未拆除 EasyTier、迁移数据或合并 main。
 
-## 2026-11-08 中继传输更正：默认 TCP
+## 2026-11-08 TCP 中继对照与此前结论更正
 
-此前 8 MiB 慢的问题被误归因于读取期限。隔离实验（同一集群、同一路径）确认根因是 QUIC 中继在第三方 NAS 上停摆：
+既有隔离对照中 TCP 中继明显快于受测 QUIC 中继，但各轮含重启、缓冲/副本条件与路径差异，并非完整单变量实验。此前“416 KiB UDP 缓冲就是全部根因”“排除带宽/读取期限”的绝对结论撤回；QUIC 直连吞吐尚无可信跨独立 NAS 证据。
 
-- QUIC 中继（默认 2 KiB 拷贝缓冲）：8 MiB 双副本写入 **991 秒未完成**，客户端正文约 13 KB/s（每 10 秒 128 KiB）；
-- QUIC 中继缓冲 128 KiB：147 秒完成；1 MiB：280 秒失败（缓冲不是主因）；
-- **TCP 中继**：8 MiB 双副本写入 23.7 秒、读取 23.9 秒且 SHA-256 一致；
-- NAS 上 quic-go 每次启动报 `failed to sufficiently increase receive buffer size (got 416 KiB, wanted 7168 KiB)`；EasyTier 自身走 UDP 正常，说明不是运营商全面封 UDP，而是 quic-go 在受限 UDP 缓冲/丢包下的重传崩溃；
-- 本机 loopback 对照：直连 726 MB/s、中继 238 MB/s，2 KiB 缓冲在零 RTT 下不构成限制。
+- QUIC 中继默认缓冲：8 MiB 双副本写入约 991 秒未完成。计量采样是读事件触发且混合两个未标明请求的计数器，不能从其序列得出逐流每十秒 128 KiB、精确 13 KB/s 或线上的有效吞吐。
+- QUIC 中继缓冲 128 KiB 一轮约 147 秒完成，1 MiB 一轮约 280 秒失败。保留两次结果，不据此排除缓冲或宣判其为唯一主因。
+- TCP 中继对照：8 MiB 写入 23.7–36.6 秒、一次读取 23.9 秒且 SHA-256 一致。这些完成记录不证明 mixed TCP+QUIC 连接池下预约及两端 hop 自动选 TCP。
+- NAS 上有 `got 416 KiB, wanted 7168 KiB` 的 UDP 接收缓冲警告；EasyTier 的 UDP 正常，不能笼统断言运营商封 UDP，也不能由警告独自证明所有停顿/重传的原因。
+- 本机 loopback 对照是约 11.3 毫秒直传和 34.4 毫秒 circuit 的 8 MiB 传输；它只说明零 RTT 条件下的该实现表现，不外推 WAN 或 NAS。
 
-代码改为：中心默认只监听/公布 TCP；中继预约与严格中继拨号优先 TCP；显式 `-p2p-listen`/`-p2p-announce` 仍可恢复 QUIC 中心。代价是中心只公布 TCP 时 UDP 打洞候选消失；需要打洞时必须显式启用 QUIC 中心，并接受 QUIC 批量传输的风险。TCP 无法做 NAT 打洞，因此打洞保持“尽力而为的直连”，不作为保存或读取前提。
+历史 `4aadbe8` 把中心默认改成 TCP-only，并只按地址筛选 TCP；主审新回归已复现：已有 QUIC 连接仍被预约复用。这一默认也削弱 QUIC 自动候选，不符合直连优先目标，当前批次已改为候选观测与真实 TCP hop 分离。**TCP 本身支持 simultaneous-open NAT 打洞，libp2p DCUtR 支持 TCP 和 QUIC；“TCP 无法打洞”的旧表述错误。** 成功依赖 NAT/防火墙，不降低保存或读取安全条件。
 
-确定性回归：`preferTCP` 与 `circuitAddrInfo` 只选 TCP、QUIC-only 时回退；中心默认监听为 TCP、显式覆盖生效。`pkg/peertransport`、`cmd/atoll`、`integration/peer` 整包 `-race` 通过，vet 通过。
-
-真机复测（新二进制，中心 TCP-only，29663 单节点在线，performance 单副本）：8 MiB 写入 **3.4 秒**，读取 **7.6 秒**且 SHA-256 一致。29038 本轮离线，属于正常的节点离线条件。
+历史真机新二进制 TCP-only 中心、29663 单节点、performance 单副本复测：8 MiB 写入 **3.4 秒**、读取 **7.6 秒**且 SHA-256 一致。29038 当时离线；不同副本条件的这次结果不能代替双 NAS 确认与自动直连闭环验收。
 
 ## 2026-10-31 最小接线历史结论
 

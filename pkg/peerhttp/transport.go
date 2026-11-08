@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Path names the path a request actually took.
@@ -195,7 +196,45 @@ const (
 	reporterKey
 	requestIDKey
 	metaKey
+	responseReporterKey
+	dialBoundsKey
 )
+
+type dialBounds struct {
+	deadline    time.Time
+	hasDeadline bool
+	parent      context.Context
+}
+
+func withDialBounds(ctx context.Context) context.Context {
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline && ctx.Done() == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, dialBoundsKey, &dialBounds{deadline: deadline, hasDeadline: hasDeadline, parent: ctx})
+}
+
+func dialBoundsContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	bounds, _ := ctx.Value(dialBoundsKey).(*dialBounds)
+	if bounds == nil {
+		return ctx, func() {}
+	}
+	var dial context.Context
+	var cancel context.CancelFunc
+	if bounds.hasDeadline {
+		dial, cancel = context.WithDeadline(ctx, bounds.deadline)
+	} else {
+		dial, cancel = context.WithCancel(ctx)
+	}
+	stop := context.AfterFunc(bounds.parent, cancel)
+	if bounds.parent.Err() != nil {
+		cancel()
+	}
+	return dial, func() {
+		stop()
+		cancel()
+	}
+}
 
 // WithPath records the path a request requires. PathDirect and PathRelay pin a
 // peer path and fail closed when it cannot be met. PathHTTPS pins an ordinary
@@ -215,6 +254,8 @@ func ControlContext(ctx context.Context) context.Context {
 	// A control request can be derived from a data dial context, which carries
 	// the private meta of the data request; drop it explicitly.
 	ctx = context.WithValue(ctx, metaKey, (*requestMeta)(nil))
+	ctx = context.WithValue(ctx, dialBoundsKey, (*dialBounds)(nil))
+	ctx = context.WithValue(ctx, responseReporterKey, (*Reporter)(nil))
 	return WithReporter(ctx, &Reporter{})
 }
 
@@ -363,6 +404,39 @@ func WithReporter(ctx context.Context, r *Reporter) context.Context {
 	return context.WithValue(ctx, reporterKey, r)
 }
 
+// WithResponseReporter adds a serving-response observer without replacing the
+// caller's diagnostic reporter. It receives no dial attempts or control traffic.
+func WithResponseReporter(ctx context.Context, observe func(Observation)) context.Context {
+	previous, _ := ctx.Value(responseReporterKey).(*Reporter)
+	return context.WithValue(ctx, responseReporterKey, &Reporter{Observe: func(observation Observation) {
+		if previous != nil && previous.Observe != nil {
+			previous.Observe(observation)
+		}
+		if observe != nil {
+			observe(observation)
+		}
+	}})
+}
+
+func responseReporterFrom(ctx context.Context) *Reporter {
+	r, _ := ctx.Value(responseReporterKey).(*Reporter)
+	return r
+}
+
+func (t *Transport) requestReporter(ctx context.Context) *Reporter {
+	primary := t.observer(ctx)
+	response, _ := ctx.Value(responseReporterKey).(*Reporter)
+	if response == nil || response.Observe == nil {
+		return primary
+	}
+	return &Reporter{Observe: func(observation Observation) {
+		t.reportTo(reporterFrom(ctx), observation)
+		if observation.Phase == PhaseResponse && !observation.Master {
+			response.Observe(observation)
+		}
+	}}
+}
+
 func reporterFrom(ctx context.Context) *Reporter {
 	r, _ := ctx.Value(reporterKey).(*Reporter)
 	return r
@@ -447,6 +521,7 @@ func NewTransport(base *http.Transport, options ...Option) (*Transport, error) {
 	// No pooling: pooled connections cannot report the path they took.
 	p.DisableKeepAlives = true
 	p.DialContext = t.peerDial
+	p.DialTLSContext = t.dialPeerTLS
 	t.peer = p
 	return t, nil
 }
@@ -515,10 +590,16 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("peerhttp: peer URL %s must not carry userinfo", target)
 	}
 
-	// Without an observer the request stays fully uninstrumented: no meta, no
-	// trace, no body wrapper — the same request net/http would make alone.
-	if t.observer(req.Context()) == nil {
+	// net/http strips dial cancellation and deadlines but keeps values. Restore
+	// the request bounds only while establishing a peer connection and TLS.
+	req = req.WithContext(withDialBounds(req.Context()))
+	// Without an observer no diagnostic meta, trace or body wrapper is added.
+	reporter := t.requestReporter(req.Context())
+	if reporter == nil {
 		return t.peer.RoundTrip(req)
+	}
+	if responseReporterFrom(req.Context()) != nil {
+		req = req.WithContext(WithReporter(req.Context(), reporter))
 	}
 
 	meta := &requestMeta{
@@ -562,14 +643,49 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return res, nil
 }
 
-// peerDial is the DialContext installed on the peer transport. net/http calls it
-// as dial(ctx, "tcp", "host:port") with the scheme's default port filled in, and
-// then wraps the returned connection in a real tls.Client for https requests.
-//
-// Every attempt is reported: an accepted connection is not transfer evidence,
-// and a failed connection is reported with a bounded ErrorKind instead of the
-// raw error, which stays on the returned error for the caller.
+// peerDial is the DialContext installed on the peer transport. Every attempt
+// is reported; accepting a connection is not transfer evidence.
 func (t *Transport) peerDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	ctx, cancel := dialBoundsContext(ctx)
+	defer cancel()
+	return t.openPeer(ctx, network, addr)
+}
+
+func (t *Transport) dialPeerTLS(ctx context.Context, network, addr string) (net.Conn, error) {
+	ctx, cancel := dialBoundsContext(ctx)
+	defer cancel()
+	conn, err := t.openPeer(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	config := &tls.Config{}
+	if t.peer.TLSClientConfig != nil {
+		config = t.peer.TLSClientConfig.Clone()
+	}
+	if config.ServerName == "" {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		config.ServerName = host
+	}
+	config.NextProtos = nil
+	secured := tls.Client(conn, config)
+	handshake := ctx
+	if timeout := t.peer.TLSHandshakeTimeout; timeout > 0 {
+		var stop context.CancelFunc
+		handshake, stop = context.WithTimeout(ctx, timeout)
+		defer stop()
+	}
+	if err := secured.HandshakeContext(handshake); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return secured, nil
+}
+
+func (t *Transport) openPeer(ctx context.Context, network, addr string) (net.Conn, error) {
 	conn, pd, err := t.dialConn(ctx, network, addr)
 	if err != nil {
 		kind := ErrorUnknown
@@ -628,7 +744,7 @@ func (t *Transport) dialConn(ctx context.Context, network, addr string) (net.Con
 	if err != nil {
 		return nil, PeerDial{Path: PathUnknown}, &dialFailure{
 			err:  fmt.Errorf("peerhttp: resolve %s: %w", addr, err),
-			kind: ErrorResolve,
+			kind: resolveKind(err),
 		}
 	}
 	if dial == nil {
@@ -855,6 +971,13 @@ func connectKind(err error) string {
 		return k
 	}
 	return ErrorConnect
+}
+
+func resolveKind(err error) string {
+	if kind := classifyError(err); kind == ErrorCanceled || kind == ErrorTimeout {
+		return kind
+	}
+	return ErrorResolve
 }
 
 // readKind classifies a response body failure the same way for reads.

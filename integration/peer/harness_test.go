@@ -155,6 +155,10 @@ type masterOpts struct {
 	contentKEK       *contentcrypto.KEK
 	transferPlanning bool
 	maxReplicas      int
+	// handlerWrapper is test-only; it wraps the real Master handler after
+	// peertrace. A test may copy non-secret request facts but must not read or
+	// record Authorization/device tokens.
+	handlerWrapper func(http.Handler) http.Handler
 }
 
 // newPeerMaster builds a verified-TLS Master with security, write planning and
@@ -225,6 +229,9 @@ func newPeerMasterOpts(t *testing.T, pki *testPKI, o masterOpts) *peerMaster {
 
 	ctx, cancel := context.WithCancel(diagnostics.context(context.Background()))
 	handler := peertrace.Handler(srv.Handler(), diagnostics.observe)
+	if o.handlerWrapper != nil {
+		handler = o.handlerWrapper(handler)
+	}
 	srv.AttachSecureTransports()
 	srv.StartSecurity(ctx)
 	t.Cleanup(srv.WaitSecurity)
@@ -475,6 +482,10 @@ type nodeOpts struct {
 	ledger             *nodeLedger
 	handlerWrapper     func(http.Handler) http.Handler
 	hideTransportAddrs bool
+	// receiverConnContext is test-only: it receives the actual accepted net.Conn
+	// of the peer listener (after the runtime's source-peer extraction) so a
+	// test can bind handler requests to their real stream/connection facts.
+	receiverConnContext func(context.Context, net.Conn) context.Context
 }
 
 // hiddenAddrsRuntime 是仅测试的 RuntimeAPI 包装：嵌入真实 Runtime、只覆写
@@ -597,7 +608,13 @@ func (m *peerMaster) startNodeOn(dataDir, invite string, o nodeOpts, dataLn net.
 	if err != nil {
 		m.t.Fatalf("peer listener: %v", err)
 	}
-	pn.peerHTTP = &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, ConnContext: rt.ConnContext}
+	peerConnContext := rt.ConnContext
+	if o.receiverConnContext != nil {
+		peerConnContext = func(ctx context.Context, conn net.Conn) context.Context {
+			return o.receiverConnContext(rt.ConnContext(ctx, conn), conn)
+		}
+	}
+	pn.peerHTTP = &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, ConnContext: peerConnContext}
 	go func() { _ = pn.peerHTTP.ServeTLS(peerLn, peerCertFile, peerKeyFile) }()
 
 	m.t.Cleanup(func() { m.closeNode(pn) })

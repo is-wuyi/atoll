@@ -269,6 +269,8 @@ func (c *Client) uploadPlannedChunkAEAD(ctx context.Context, u types.WriteUpload
 			encoding, upload = types.AeadRecordEncoding, sealed
 		}
 	}
+	generation := c.transferGeneration()
+	planCtx := ctx
 	request := types.PlanWriteChunkRequest{WriteBinding: plannedBinding(u), Index: index, LogicalSize: int64(len(data)), StoredSize: int64(len(upload)), Encoding: encoding, Checksum: types.CRC32C(upload)}
 	if c.transferEnabled {
 		network, err := c.observeWriteTransfer(ctx, u)
@@ -276,9 +278,10 @@ func (c *Client) uploadPlannedChunkAEAD(ctx context.Context, u types.WriteUpload
 			return err
 		}
 		request.Network = network
+		planCtx = context.WithValue(ctx, transferSubmissionKey{}, generation)
 	}
 	var out types.PlanWriteChunkResponse
-	if err := c.writeJSONRetry(ctx, "/writes/chunks", request, &out); err != nil {
+	if err := c.writeJSONRetry(planCtx, "/writes/chunks", request, &out); err != nil {
 		return err
 	}
 	if err := validatePlannedChunk(request, out); err != nil {
@@ -396,6 +399,9 @@ func (c *Client) putPlannedObjectWithRate(ctx context.Context, addr string, id u
 	var last error
 	for attempt := 0; attempt < 3; attempt++ {
 		putCtx, cancel := context.WithTimeout(ctx, c.ioTimeout(int64(len(data))))
+		putCtx, observed := c.observeTransferUpload(putCtx, addr, id)
+		started := time.Now()
+		status := 0
 		var reader io.Reader = bytes.NewReader(data)
 		if limiter != nil {
 			reader = limiter.Reader(putCtx, reader, rate)
@@ -407,6 +413,7 @@ func (c *Client) putPlannedObjectWithRate(ctx context.Context, addr string, id u
 			var resp *http.Response
 			resp, err = c.HTTP.Do(req)
 			if err == nil {
+				status = resp.StatusCode
 				err = statusError(resp)
 				if err == nil {
 					var result struct {
@@ -419,6 +426,9 @@ func (c *Client) putPlannedObjectWithRate(ctx context.Context, addr string, id u
 				}
 				resp.Body.Close()
 			}
+		}
+		if err == nil {
+			c.finishTransferUpload(observed, addr, int64(len(data)), started, status)
 		}
 		cancel()
 		if err == nil {
