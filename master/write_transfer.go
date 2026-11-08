@@ -12,6 +12,7 @@ import (
 
 	"atoll/internal/scheduler"
 	"atoll/master/meta"
+	"atoll/pkg/peerhttp"
 	"atoll/pkg/types"
 )
 
@@ -29,11 +30,20 @@ func supportsWriteTransfers(r *http.Request) bool {
 type transferLinkStore struct {
 	mu    sync.Mutex
 	links map[string]scheduler.LinkObservation
+	// measured retains the newest fresh payload measurement per direction/path
+	// even if a later zero-throughput failure becomes the visible link. Health
+	// probes may not clear measured payload evidence before its own TTL.
+	measured map[string]scheduler.LinkObservation
 }
 
 func (s *Server) transferObservationsAt(now time.Time) []scheduler.LinkObservation {
 	s.transferLinks.mu.Lock()
 	defer s.transferLinks.mu.Unlock()
+	for key, link := range s.transferLinks.measured {
+		if !now.Before(link.ValidUntil) {
+			delete(s.transferLinks.measured, key)
+		}
+	}
 	var links []scheduler.LinkObservation
 	for key, link := range s.transferLinks.links {
 		if !now.Before(link.ValidUntil) {
@@ -65,6 +75,14 @@ func (s *Server) RecordTransferObservation(observation types.TransferObservation
 			return err
 		}
 	}
+	if missingTransferPath(observation.Path) {
+		if !s.validMissingTransferFailure(observation, now) {
+			return errors.New("invalid or stale transfer observation")
+		}
+		// A failed probe is valid evidence, but it has no proven path and is
+		// therefore not stored as a selectable directional link.
+		return nil
+	}
 	link, err := s.transferLink(observation, now)
 	if err != nil {
 		return err
@@ -74,9 +92,17 @@ func (s *Server) RecordTransferObservation(observation types.TransferObservation
 	if s.transferLinks.links == nil {
 		s.transferLinks.links = map[string]scheduler.LinkObservation{}
 	}
+	if s.transferLinks.measured == nil {
+		s.transferLinks.measured = map[string]scheduler.LinkObservation{}
+	}
 	for key, existing := range s.transferLinks.links {
 		if !now.Before(existing.ValidUntil) {
 			delete(s.transferLinks.links, key)
+		}
+	}
+	for key, existing := range s.transferLinks.measured {
+		if !now.Before(existing.ValidUntil) {
+			delete(s.transferLinks.measured, key)
 		}
 	}
 	key := link.From + "\x00" + link.To + "\x00" + link.Path
@@ -85,28 +111,76 @@ func (s *Server) RecordTransferObservation(observation types.TransferObservation
 			return errors.New("directional observation limit exceeded")
 		}
 	}
+	if link.ThroughputBPS > 0 && len(s.transferLinks.measured) >= 4096 {
+		if _, exists := s.transferLinks.measured[key]; !exists {
+			return errors.New("measured directional observation limit exceeded")
+		}
+	}
 	if old, exists := s.transferLinks.links[key]; exists {
 		if link.ObservedAt.Before(old.ObservedAt) {
 			return errors.New("out-of-order transfer observation")
 		}
-		// A successful health probe carries no payload throughput and cannot erase a fresh transfer result.
-		if link.Available && link.ThroughputBPS == 0 && (!old.Available || old.ThroughputBPS > 0) {
+	}
+	// A successful health probe carries no payload throughput. Only a fresh
+	// measured payload result outranks it; a zero-throughput failure must be
+	// replaceable by a newer same-path success so recovery can rediscover a path.
+	if link.Available && link.ThroughputBPS == 0 {
+		if old, exists := s.transferLinks.links[key]; exists && old.ThroughputBPS > 0 {
+			return nil
+		}
+		if measured, exists := s.transferLinks.measured[key]; exists && measured.ThroughputBPS > 0 {
 			return nil
 		}
 	}
 	s.transferLinks.links[key] = link
+	if link.ThroughputBPS > 0 {
+		s.transferLinks.measured[key] = link
+	}
 	return nil
 }
 
-func (s *Server) transferLink(observation types.TransferObservation, now time.Time) (scheduler.LinkObservation, error) {
-	var out scheduler.LinkObservation
+// transferObservationLimits is the shared enablement/TTL contract used by
+// RecordTransferObservation and by client-supplied observations.
+func (s *Server) transferObservationLimits(observation types.TransferObservation) (bool, time.Duration) {
 	ttl := 30 * time.Second
 	enabled := s.autonomy != nil && s.autonomy.config.ProtectionFeedback && observation.FromNodeID != 0
 	if s.writePlanner != nil && s.writePlanner.config.TransferPlanning {
 		enabled = true
 		ttl = s.writePlanner.config.TransferObservationTTL
 	}
-	if !enabled || now.IsZero() || observation.ObservedAt.IsZero() || observation.ObservedAt.After(now.Add(time.Second)) || now.Sub(observation.ObservedAt) > ttl || math.IsNaN(observation.RTTMs) || math.IsInf(observation.RTTMs, 0) || observation.RTTMs < 0 || observation.ThroughputBPS > 1<<40 || (observation.Path != scheduler.TransferHTTP && observation.Path != scheduler.TransferHTTPS && observation.Path != scheduler.TransferDirect && observation.Path != scheduler.TransferRelay) {
+	return enabled, ttl
+}
+
+func validTransferObservationSample(observation types.TransferObservation, now time.Time, ttl time.Duration) bool {
+	return !now.IsZero() && !observation.ObservedAt.IsZero() && !observation.ObservedAt.After(now.Add(time.Second)) && now.Sub(observation.ObservedAt) <= ttl &&
+		!math.IsNaN(observation.RTTMs) && !math.IsInf(observation.RTTMs, 0) && observation.RTTMs >= 0 && observation.ThroughputBPS <= 1<<40
+}
+
+func validTransferPath(path string) bool {
+	return path == scheduler.TransferHTTP || path == scheduler.TransferHTTPS || path == scheduler.TransferDirect || path == scheduler.TransferRelay
+}
+
+// missingTransferPath recognizes a failed probe whose transport could not prove
+// the path it took. It must never be guessed from a successful observation.
+func missingTransferPath(path string) bool {
+	return path == "" || path == string(peerhttp.PathUnknown)
+}
+
+// validMissingTransferFailure accepts a failed probe whose transport could not
+// prove a path. It is evidence only: callers must not store or guess a path.
+func (s *Server) validMissingTransferFailure(observation types.TransferObservation, now time.Time) bool {
+	enabled, ttl := s.transferObservationLimits(observation)
+	return enabled && validTransferObservationSample(observation, now, ttl) && !observation.Available && observation.ThroughputBPS == 0
+}
+
+func transferNodeFresh(node types.NodeInfo, now time.Time, maxAge time.Duration) bool {
+	return !node.LastHeartbeat.IsZero() && !node.LastHeartbeat.After(now.Add(time.Second)) && now.Sub(node.LastHeartbeat) <= maxAge
+}
+
+func (s *Server) transferLink(observation types.TransferObservation, now time.Time) (scheduler.LinkObservation, error) {
+	var out scheduler.LinkObservation
+	enabled, ttl := s.transferObservationLimits(observation)
+	if !enabled || !validTransferObservationSample(observation, now, ttl) || !validTransferPath(observation.Path) {
 		return out, errors.New("invalid or stale transfer observation")
 	}
 	if s.security != nil && observation.Path == scheduler.TransferHTTP {
@@ -154,7 +228,11 @@ func (s *Server) handleWriteTransferNodes(w http.ResponseWriter, r *http.Request
 		writePlanningError(w, http.StatusServiceUnavailable, "write_unavailable", "transfer discovery limit exceeded")
 		return
 	}
-	writeJSON(w, http.StatusOK, types.WriteTransferNodes{Nodes: nodes})
+	ttl := uint64(30)
+	if s.writePlanner != nil {
+		ttl = uint64(s.writePlanner.config.TransferObservationTTL / time.Second)
+	}
+	writeJSON(w, http.StatusOK, types.WriteTransferNodes{Nodes: nodes, ObservationTTLSeconds: ttl})
 }
 
 func (s *Server) handleNodeTransferPeers(w http.ResponseWriter, r *http.Request) {
@@ -204,28 +282,50 @@ func (s *Server) writeTransferNetwork(client *types.WriteTransferObservation, sn
 	for _, profile := range snapshot.Profiles {
 		profiles[profile.NodeID] = profile
 	}
-	nodes := map[uint64]bool{}
+	known := map[uint64]bool{}
+	eligible := map[uint64]bool{}
+	endpointIDs := map[string]bool{"client": true}
 	loads, err := s.store.WriteTransferLoads(now)
 	if err != nil {
 		return nil, err
 	}
 	for _, node := range snapshot.Nodes {
+		known[node.ID] = true
+		// Offline or stale records are neither candidates nor budget-bearing
+		// endpoints. A stale record without a profile must not poison planning.
+		if !transferNodeFresh(node, now, s.nodeMaxAge) {
+			continue
+		}
 		profile := profiles[node.ID]
 		if profile.UploadBPS == 0 || profile.DownloadBPS == 0 || profile.MaxTransferConcurrency < 1 || profile.MaxTransferConcurrency > 32 {
 			return nil, errors.New("every eligible node needs finite transfer budgets")
 		}
-		nodes[node.ID] = true
+		eligible[node.ID] = true
+		endpointIDs[strconv.FormatUint(node.ID, 10)] = true
 		held := loads[node.ID]
 		n.Endpoints = append(n.Endpoints, scheduler.EndpointBandwidth{ID: strconv.FormatUint(node.ID, 10), UploadBPS: profile.UploadBPS, DownloadBPS: profile.DownloadBPS, InFlightUploadBPS: held.UploadBPS, InFlightDownloadBPS: held.DownloadBPS, MaxConcurrent: profile.MaxTransferConcurrency})
 	}
 	seen := map[string]bool{}
 	for _, observation := range client.Links {
-		if observation.FromNodeID != 0 || !nodes[observation.ToNodeID] {
+		if observation.FromNodeID != 0 || !known[observation.ToNodeID] {
 			return nil, errors.New("client may only report its own assigned-node links")
+		}
+		if missingTransferPath(observation.Path) {
+			if !s.validMissingTransferFailure(observation, now) {
+				return nil, errors.New("invalid or stale transfer observation")
+			}
+			// A failed probe is accepted as evidence, but an unknown/empty path is
+			// never guessed and never becomes a selectable network link.
+			continue
 		}
 		link, err := s.transferLink(observation, now)
 		if err != nil {
 			return nil, err
+		}
+		// Stale nodes are not selectable. Their valid links are ignored rather
+		// than allowed to fail a request that still has usable paths.
+		if !eligible[observation.ToNodeID] {
+			continue
 		}
 		key := link.From + "\x00" + link.To + "\x00" + link.Path
 		if seen[key] {
@@ -238,6 +338,9 @@ func (s *Server) writeTransferNetwork(client *types.WriteTransferObservation, sn
 	for key, link := range s.transferLinks.links {
 		if !now.Before(link.ValidUntil) {
 			delete(s.transferLinks.links, key)
+			continue
+		}
+		if !endpointIDs[link.From] || !endpointIDs[link.To] {
 			continue
 		}
 		n.Links = append(n.Links, link)

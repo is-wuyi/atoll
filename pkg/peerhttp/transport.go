@@ -195,6 +195,7 @@ const (
 	reporterKey
 	requestIDKey
 	metaKey
+	responseReporterKey
 )
 
 // WithPath records the path a request requires. PathDirect and PathRelay pin a
@@ -215,6 +216,7 @@ func ControlContext(ctx context.Context) context.Context {
 	// A control request can be derived from a data dial context, which carries
 	// the private meta of the data request; drop it explicitly.
 	ctx = context.WithValue(ctx, metaKey, (*requestMeta)(nil))
+	ctx = context.WithValue(ctx, responseReporterKey, (*Reporter)(nil))
 	return WithReporter(ctx, &Reporter{})
 }
 
@@ -361,6 +363,39 @@ func newRequestID() string {
 // Transport's own reporter for that request only.
 func WithReporter(ctx context.Context, r *Reporter) context.Context {
 	return context.WithValue(ctx, reporterKey, r)
+}
+
+// WithResponseReporter adds a serving-response observer without replacing the
+// caller's diagnostic reporter. It receives no dial attempts or control traffic.
+func WithResponseReporter(ctx context.Context, observe func(Observation)) context.Context {
+	previous, _ := ctx.Value(responseReporterKey).(*Reporter)
+	return context.WithValue(ctx, responseReporterKey, &Reporter{Observe: func(observation Observation) {
+		if previous != nil && previous.Observe != nil {
+			previous.Observe(observation)
+		}
+		if observe != nil {
+			observe(observation)
+		}
+	}})
+}
+
+func responseReporterFrom(ctx context.Context) *Reporter {
+	r, _ := ctx.Value(responseReporterKey).(*Reporter)
+	return r
+}
+
+func (t *Transport) requestReporter(ctx context.Context) *Reporter {
+	primary := t.observer(ctx)
+	response, _ := ctx.Value(responseReporterKey).(*Reporter)
+	if response == nil || response.Observe == nil {
+		return primary
+	}
+	return &Reporter{Observe: func(observation Observation) {
+		t.reportTo(reporterFrom(ctx), observation)
+		if observation.Phase == PhaseResponse && !observation.Master {
+			response.Observe(observation)
+		}
+	}}
 }
 
 func reporterFrom(ctx context.Context) *Reporter {
@@ -517,8 +552,12 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// Without an observer the request stays fully uninstrumented: no meta, no
 	// trace, no body wrapper — the same request net/http would make alone.
-	if t.observer(req.Context()) == nil {
+	reporter := t.requestReporter(req.Context())
+	if reporter == nil {
 		return t.peer.RoundTrip(req)
+	}
+	if responseReporterFrom(req.Context()) != nil {
+		req = req.WithContext(WithReporter(req.Context(), reporter))
 	}
 
 	meta := &requestMeta{

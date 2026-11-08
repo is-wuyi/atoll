@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	relaypb "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/pb"
@@ -24,20 +25,13 @@ const (
 	relayReserveTimeout  = 20 * time.Second
 )
 
-// preferTCP returns the relay's TCP addresses when it publishes any. Third-party
-// NAS kernels cap the UDP receive buffer far below quic-go's request, and QUIC
-// relayed copies then collapse into retransmission stalls; TCP keeps relayed
-// bulk transfers at usable throughput. QUIC is still used for direct dials and
-// hole punching, which do not go through this helper.
+// Relay endpoints require TCP independently of the direct candidate set.
 func preferTCP(addrs []ma.Multiaddr) []ma.Multiaddr {
 	tcp := make([]ma.Multiaddr, 0, len(addrs))
 	for _, address := range addrs {
-		if _, err := address.ValueForProtocol(ma.P_TCP); err == nil {
+		if tcpAddress(address) {
 			tcp = append(tcp, address)
 		}
-	}
-	if len(tcp) == 0 {
-		return addrs
 	}
 	return tcp
 }
@@ -62,10 +56,21 @@ func (r *Runtime) ReserveRelay(ctx context.Context, infra peerauth.Infrastructur
 	}
 	rctx, cancel := context.WithTimeout(ctx, relayReserveTimeout)
 	defer cancel()
-	bounded := &reservationHost{Host: r.mainHost}
+	conn, err := r.prepareTCPInfrastructure(rctx, infra)
+	if err != nil {
+		return time.Time{}, err
+	}
+	selected := &connectionHost{Host: r.mainHost, observe: r.cfg.Observe, connection: func(ctx context.Context, remote peer.ID) (network.Conn, error) {
+		if remote != ai.ID || !r.auth.authorize(ctx, remote.String()) {
+			return nil, ErrPeerUnauthorized
+		}
+		if err := verifyStreamPeer(conn, ai.ID, infra.PublicKey); err != nil {
+			return nil, ErrInfrastructureInvalid
+		}
+		return conn, nil
+	}}
+	bounded := &reservationHost{Host: selected}
 	defer bounded.finish()
-	// The reservation connection is the one the relay later uses for inbound
-	// relayed streams to this peer, so prefer TCP here too.
 	ai.Addrs = preferTCP(ai.Addrs)
 	res, err := relayclient.Reserve(rctx, bounded, ai)
 	if err != nil {
@@ -108,7 +113,10 @@ func (r *Runtime) EnableRelay() error {
 	res.ReservationTTL = relayReservationTTL
 	res.MaxReservations = relayMaxReservations
 	res.MaxCircuits = relayMaxCircuits
-	svc, err := relay.New(r.mainHost,
+	selected := &connectionHost{Host: r.mainHost, observe: r.cfg.Observe, connection: func(ctx context.Context, remote peer.ID) (network.Conn, error) {
+		return selectedTCP(ctx, r.mainHost, r.auth, remote)
+	}}
+	svc, err := relay.New(selected,
 		relay.WithACL(&runtimeRelayACL{auth: r.auth}),
 		relay.WithResources(res),
 	)
@@ -127,12 +135,12 @@ type runtimeRelayACL struct {
 	auth *protocolGate
 }
 
-func (a *runtimeRelayACL) AllowReserve(p peer.ID, _ ma.Multiaddr) bool {
-	return a.auth.authorize(a.auth.ctx, p.String())
+func (a *runtimeRelayACL) AllowReserve(p peer.ID, address ma.Multiaddr) bool {
+	return tcpAddress(address) && a.auth.authorize(a.auth.ctx, p.String())
 }
 
-func (a *runtimeRelayACL) AllowConnect(src peer.ID, _ ma.Multiaddr, dest peer.ID) bool {
-	return a.auth.authorize(a.auth.ctx, src.String()) && a.auth.authorize(a.auth.ctx, dest.String())
+func (a *runtimeRelayACL) AllowConnect(src peer.ID, address ma.Multiaddr, dest peer.ID) bool {
+	return tcpAddress(address) && a.auth.authorize(a.auth.ctx, src.String()) && a.auth.authorize(a.auth.ctx, dest.String())
 }
 
 // infraAddrInfo validates an infrastructure descriptor and returns a libp2p
@@ -168,11 +176,12 @@ func circuitAddrInfo(infra peerauth.Infrastructure, target peer.ID) (peer.AddrIn
 	if err != nil {
 		return peer.AddrInfo{}, err
 	}
-	if len(relayAI.Addrs) == 0 {
-		return peer.AddrInfo{}, errors.New("peertransport: relay has no addresses")
+	bases := preferTCP(relayAI.Addrs)
+	if len(bases) == 0 {
+		return peer.AddrInfo{}, fmt.Errorf("%w: relay needs a TCP endpoint", ErrInfrastructureInvalid)
 	}
-	addrs := make([]ma.Multiaddr, 0, len(relayAI.Addrs))
-	for _, base := range preferTCP(relayAI.Addrs) {
+	addrs := make([]ma.Multiaddr, 0, len(bases))
+	for _, base := range bases {
 		if _, err := base.ValueForProtocol(ma.P_P2P); err != nil {
 			base = ma.Join(base, ma.StringCast("/p2p/"+relayAI.ID.String()))
 		}

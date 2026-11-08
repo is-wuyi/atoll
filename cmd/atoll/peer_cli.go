@@ -40,15 +40,9 @@ type clientP2P interface {
 // -p2p-diagnostics it wires cfg.Observe to a bounded private sink and returns a
 // diagnosticRuntime wrapper that owns the flush-once lifecycle.
 func newPeerRuntime(ctx context.Context, p *p2pCLIFlags, identityPath string) (peertransport.RuntimeAPI, error) {
-	return newPeerRuntimeWithListen(ctx, p, identityPath, p.listenAddresses())
-}
-
-// newPeerRuntimeWithListen lets the center use its TCP-only relay default while
-// nodes and clients keep TCP+QUIC for direct candidates.
-func newPeerRuntimeWithListen(ctx context.Context, p *p2pCLIFlags, identityPath string, listen []string) (peertransport.RuntimeAPI, error) {
 	cfg := peertransport.Config{
 		IdentityPath:      identityPath,
-		ListenAddresses:   listen,
+		ListenAddresses:   p.listenAddresses(),
 		AnnounceAddresses: p.announceAddresses(),
 		PublicOnly:        p.publicOnly != nil && *p.publicOnly,
 		DirectTimeout:     p2pDirectTimeout,
@@ -190,7 +184,7 @@ func (ps *peerServe) Close() error {
 // any background worker, so a startup cannot serve peer routes without the
 // runtime handler in place.
 func masterEnableP2P(ctx context.Context, p *p2pCLIFlags, origin, identityPath, certFile, keyFile string, srv *master.Server) (*peerServe, error) {
-	rt, err := newPeerRuntimeWithListen(ctx, p, identityPath, p.masterListenAddresses())
+	rt, err := newPeerRuntime(ctx, p, identityPath)
 	if err != nil {
 		return nil, err
 	}

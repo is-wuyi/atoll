@@ -12,10 +12,12 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/transport"
 	basichost "github.com/libp2p/go-libp2p/p2p/host/basic"
 	"github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	libp2pconnmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
@@ -43,18 +45,25 @@ func newMainHost(ctx context.Context, priv crypto.PrivKey, listen, announce []ma
 	}
 	tracer := &traversalEvents{observe: observe, metrics: holepunch.NewMetricsTracer(holepunch.WithRegisterer(prometheus.DefaultRegisterer))}
 	var constructed *basichost.BasicHost
-	started := false
+	quicOwner := new(quicManagerOwner)
+	gate := &mainGate{publicOnly: publicOnly, auth: auth}
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.NoListenAddrs,
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(libp2ptcp.NewTCPTransport),
 		libp2p.Transport(quic.NewTransport),
+		quicOwner.option(),
 		libp2p.ResourceManager(finiteResourceManager(maxConns)),
 		libp2p.ConnectionManager(noTrimConnMgr()),
-		libp2p.ConnectionGater(&mainGate{publicOnly: publicOnly, auth: auth}),
+		libp2p.ConnectionGater(gate),
 		libp2p.SwarmOpts(swarm.WithDialTimeout(30 * time.Second)),
-		libp2p.EnableRelay(),
+		libp2p.DisableRelay(),
+		libp2p.WithFxOption(fx.Invoke(func(h *basichost.BasicHost) {
+			constructed = h
+			gate.network = h.Network()
+		})),
+		tcpRelayTransport(auth, observe),
 		libp2p.EnableHolePunching(holepunch.WithMetricsAndEventTracer(tracer, tracer)),
 		// Injecting the client into BasicHost preserves its reachability tracker;
 		// merely starting an AutoNAT service after construction would not.
@@ -62,10 +71,6 @@ func newMainHost(ctx context.Context, priv crypto.PrivKey, listen, announce []ma
 			fx.Replace(service),
 			fx.Replace(fx.Annotate(observed, fx.As(new(basichost.ObservedAddrsManager)))),
 			fx.Invoke(func(bus event.Bus, n *basichost.BasicHost) error { return observed.start(bus, n.Network()) }),
-			fx.Invoke(func(h *basichost.BasicHost, life fx.Lifecycle) {
-				constructed = h
-				life.Append(fx.Hook{OnStart: func(context.Context) error { started = true; return nil }})
-			}),
 		),
 		// The address factory always runs so the published set obeys the
 		// public-only policy even for learned addresses; an explicit announce
@@ -80,11 +85,11 @@ func newMainHost(ctx context.Context, priv crypto.PrivKey, listen, announce []ma
 	h, err := libp2p.New(opts...)
 	if err != nil {
 		_ = observed.Close()
-		if constructed != nil && started {
+		if constructed != nil {
 			_ = constructed.Close()
-		} else {
-			_ = probe.Close()
 		}
+		_ = quicOwner.Close()
+		_ = probe.Close()
 		return nil, fmt.Errorf("peertransport: new main host: %w", err)
 	}
 	// The graph is fully started before binding physical listeners. A bind
@@ -104,7 +109,7 @@ func newMainHost(ctx context.Context, priv crypto.PrivKey, listen, announce []ma
 		_ = probe.Close()
 		return nil, ctx.Err()
 	}
-	return &runtimeHost{Host: h, probe: probe, service: service, observed: observed}, nil
+	return &runtimeHost{Host: h, probe: probe, service: service, observed: observed, quicManager: quicOwner.manager}, nil
 }
 
 // newRelayDialHost builds the lazy, dial-only host used exclusively for
@@ -112,23 +117,47 @@ func newMainHost(ctx context.Context, priv crypto.PrivKey, listen, announce []ma
 // host but has its own peerstore and a strict relay gate, so a direct
 // connection to an authorized target can never be reused: only an authorized
 // target's circuit address and the relay's direct addresses are dialable.
-func newRelayDialHost(ctx context.Context, priv crypto.PrivKey, relay peer.ID, publicOnly bool, auth *protocolGate, maxConns int) (host.Host, error) {
+func newRelayDialHost(ctx context.Context, priv crypto.PrivKey, relay peer.ID, publicOnly bool, auth *protocolGate, maxConns int, observe func(RuntimeEvent)) (host.Host, error) {
+	var constructed *basichost.BasicHost
+	quicOwner := new(quicManagerOwner)
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.NoListenAddrs,
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(libp2ptcp.NewTCPTransport),
 		libp2p.Transport(quic.NewTransport),
+		quicOwner.option(),
 		libp2p.ResourceManager(finiteResourceManager(maxConns)),
 		libp2p.ConnectionManager(noTrimConnMgr()),
 		libp2p.ConnectionGater(&relayGate{auth: auth, relay: relay, publicOnly: publicOnly}),
-		libp2p.EnableRelay(),
+		libp2p.DisableRelay(),
+		libp2p.WithFxOption(fx.Invoke(func(h *basichost.BasicHost) {
+			constructed = h
+		})),
+		tcpRelayTransport(auth, observe),
 	}
 	h, err := libp2p.New(opts...)
 	if err != nil {
+		if constructed != nil {
+			_ = constructed.Close()
+		}
+		_ = quicOwner.Close()
 		return nil, fmt.Errorf("peertransport: new relay dial host: %w", err)
 	}
+	if ctx.Err() != nil {
+		_ = h.Close()
+		return nil, ctx.Err()
+	}
 	return h, nil
+}
+
+func tcpRelayTransport(auth *protocolGate, observe func(RuntimeEvent)) libp2p.Option {
+	return libp2p.WithFxOption(fx.Invoke(func(h *basichost.BasicHost, upgrader transport.Upgrader) error {
+		selected := &connectionHost{Host: h, observe: observe, connection: func(ctx context.Context, remote peer.ID) (network.Conn, error) {
+			return ensureTCP(ctx, h, auth, remote)
+		}}
+		return relayclient.AddTransport(selected, upgrader)
+	}))
 }
 
 // noTrimConnMgr returns a connection manager with trimming disabled

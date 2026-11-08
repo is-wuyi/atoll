@@ -51,6 +51,9 @@ func (c *Client) putRecoveryObject(ctx context.Context, upload types.WriteUpload
 			return context.DeadlineExceeded
 		}
 		putCtx, progress, cancel := newWriteProgressContext(ctx, remaining, c.recoveryIdleTimeout())
+		putCtx, observed := c.observeTransferUpload(putCtx, addr, plan.Object.ID)
+		started := time.Now()
+		status := 0
 		requestID := newOpID()
 		stopProgress := c.observeActiveWrite(putCtx, progress, upload, plan, nodeID, requestID)
 		var body io.Reader = bytes.NewReader(data)
@@ -67,6 +70,7 @@ func (c *Client) putRecoveryObject(ctx context.Context, upload types.WriteUpload
 			var resp *http.Response
 			resp, err = c.HTTP.Do(req)
 			if err == nil {
+				status = resp.StatusCode
 				err = statusError(resp)
 				if err == nil {
 					var result struct {
@@ -79,6 +83,9 @@ func (c *Client) putRecoveryObject(ctx context.Context, upload types.WriteUpload
 				}
 				resp.Body.Close()
 			}
+		}
+		if err == nil {
+			c.finishTransferUpload(observed, addr, int64(len(data)), started, status)
 		}
 		cancel()
 		stopProgress()
@@ -386,8 +393,10 @@ func (c *Client) uploadRecoverableChunk(ctx context.Context, upload types.WriteU
 		if out.Plan.Recovery.Attempts >= types.MaxWriteRecoveries {
 			return fmt.Errorf("write recovery attempts exhausted: %w", transferErr)
 		}
+		recoverCtx := ctx
 		req := types.RecoverWriteChunkRequest{WriteBinding: plannedBinding(upload), Index: out.Plan.Index, ExpectedEpoch: out.Plan.Recovery.Epoch, OpID: newOpID(), FailedNodes: failed}
 		if c.transferEnabled {
+			generation := c.transferGeneration()
 			c.transferMu.Lock()
 			c.transferObservation = nil
 			c.transferMu.Unlock()
@@ -396,9 +405,10 @@ func (c *Client) uploadRecoverableChunk(ctx context.Context, upload types.WriteU
 				return err
 			}
 			req.Network = observation
+			recoverCtx = context.WithValue(ctx, transferSubmissionKey{}, generation)
 		}
 		var next types.PlanWriteChunkResponse
-		if err := c.recoverWritePlan(ctx, req, &next); err != nil {
+		if err := c.recoverWritePlan(recoverCtx, req, &next); err != nil {
 			return fmt.Errorf("recover chunk %d: %w", req.Index, err)
 		}
 		if err := validatePlannedChunk(geometry, next); err != nil {

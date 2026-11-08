@@ -51,6 +51,10 @@ type Node struct {
 	observationMu         sync.Mutex
 	observedPeers         map[uint64]time.Time
 	observationBusy       atomic.Bool
+	// payloadObsSlots bounds best-effort /replicate payload observations.
+	// Filled non-blocking by pushWithPlan; full queue drops rather than
+	// delaying save confirmation.
+	payloadObsSlots chan struct{}
 
 	capMu              sync.Mutex // 容量闸：保护 inflight 与「used 结算 + 预留归还」的原子性
 	usageOnce          sync.Once
@@ -92,6 +96,7 @@ func New(dataDir, masterURL, advertise string, totalBytes int64) *Node {
 		advertise:         advertise,
 		totalBytes:        totalBytes,
 		heartbeatInterval: 5 * time.Second,
+		payloadObsSlots:   make(chan struct{}, 8),
 		// 大对象传输不能设全程超时：http.Client 的 Timeout 覆盖读 body，
 		// 3GB 文件按内网实际带宽可能要数分钟，60s 超时会让每次 pull/push
 		// 都在半途被掐死（曾导致 inode 114 副本自 8/21 起从未同步成功）。
