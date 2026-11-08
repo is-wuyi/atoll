@@ -29,7 +29,7 @@ type Config struct {
 }
 
 // RuntimeEvent contains connection and traversal facts, never credentials or request bodies.
-// Observers must be concurrency-safe and nonblocking.
+// Observers must be concurrency-safe, nonblocking and must not call Close.
 type RuntimeEvent struct {
 	Time             time.Time     `json:"time"`
 	Kind             string        `json:"kind"`
@@ -38,6 +38,8 @@ type RuntimeEvent struct {
 	RemotePeerID     string        `json:"remote_peer_id,omitempty"`
 	ConnectionID     string        `json:"connection_id,omitempty"`
 	StreamID         string        `json:"stream_id,omitempty"`
+	Protocol         string        `json:"protocol,omitempty"`
+	Transport        string        `json:"transport,omitempty"`
 	LocalAddress     string        `json:"local_address,omitempty"`
 	RemoteAddress    string        `json:"remote_address,omitempty"`
 	Candidates       []string      `json:"candidates,omitempty"`

@@ -44,8 +44,11 @@ type protocolGate struct {
 	// test can shorten it without racing a live authorizer call.
 	authTimeout time.Duration
 
-	dirMu   sync.RWMutex
-	allowed map[string]time.Time // peerID -> expiry
+	dirMu             sync.RWMutex
+	allowed           map[string]time.Time // peerID -> expiry
+	infrastructure    string
+	infrastructureTCP bool
+	relayTCP          map[peer.ID]struct{}
 
 	onlineMu sync.RWMutex
 	online   func(context.Context, string) bool
@@ -76,6 +79,8 @@ func (g *protocolGate) setDirectory(d peerauth.Directory) {
 	allowed[d.Infrastructure.PeerID] = time.Now().Add(peerauth.EndpointLease)
 	g.dirMu.Lock()
 	g.allowed = allowed
+	g.infrastructure = d.Infrastructure.PeerID
+	g.infrastructureTCP = infrastructureHasTCP(d.Infrastructure)
 	g.dirMu.Unlock()
 }
 

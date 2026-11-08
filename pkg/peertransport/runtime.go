@@ -1,7 +1,6 @@
 package peertransport
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	ma "github.com/multiformats/go-multiaddr"
@@ -47,11 +45,13 @@ type Runtime struct {
 	ident *runtimeIdentity
 	id    peer.ID
 
-	cfg      Config
-	mainHost host.Host
-	auth     *protocolGate
-	observed *trustedObservations
-	events   *runtimeEvents
+	cfg             Config
+	mainHost        host.Host
+	auth            *protocolGate
+	observed        *trustedObservations
+	events          *runtimeEvents
+	observationHost host.Host
+	observationMu   chan struct{}
 
 	closeOnce sync.Once
 	closeErr  error
@@ -85,11 +85,12 @@ func New(ctx context.Context, cfg Config) (*Runtime, error) {
 	}
 	rctx, cancel := context.WithCancel(ctx)
 	r := &Runtime{
-		ctx:        rctx,
-		cancel:     cancel,
-		cfg:        cfg,
-		auth:       newProtocolGate(rctx),
-		relayHosts: map[peer.ID]host.Host{},
+		ctx:           rctx,
+		cancel:        cancel,
+		cfg:           cfg,
+		auth:          newProtocolGate(rctx),
+		relayHosts:    map[peer.ID]host.Host{},
+		observationMu: make(chan struct{}, 1),
 	}
 
 	// The full configuration is validated before any identity file or host is
@@ -154,67 +155,49 @@ func (r *Runtime) operationContext(ctx context.Context) (context.Context, func()
 	}, nil
 }
 
-// PrepareInfrastructure establishes only a verified control peer connection.
-// Identify completion is not a successful hole punch or a data receipt.
+// PrepareInfrastructure establishes a verified TCP control connection and
+// observes QUIC candidates separately. Neither is a hole punch or data receipt.
 func (r *Runtime) PrepareInfrastructure(ctx context.Context, infra peerauth.Infrastructure) error {
 	operation, finish, err := r.operationContext(ctx)
 	if err != nil {
 		return err
 	}
 	defer finish()
-	ctx = operation
-	ai, err := infraAddrInfo(infra)
-	if err != nil || len(ai.Addrs) == 0 {
+	fence := r.observed.fence()
+	if !sameInfrastructure(fence.infra, infra) || !r.observed.currentFence(fence) {
 		return ErrInfrastructureInvalid
 	}
-	if r.cfg.PublicOnly {
-		addresses, normalizeErr := peerauth.NormalizeAddresses(infra.Addresses, true)
-		if normalizeErr != nil || len(addresses) == 0 {
-			return ErrInfrastructureInvalid
-		}
-	}
-	if !r.auth.authorize(ctx, infra.PeerID) {
-		return ErrPeerUnauthorized
-	}
-	r.observed.mu.Lock()
-	configured := r.observed.infra
-	valid := time.Now().Before(r.observed.until)
-	r.observed.mu.Unlock()
-	if configured.PeerID != infra.PeerID || !bytes.Equal(configured.PublicKey, infra.PublicKey) || !valid {
-		return ErrInfrastructureInvalid
-	}
-	pctx, cancel := context.WithTimeout(ctx, infrastructurePrepareTimeout)
-	stop := context.AfterFunc(r.ctx, cancel)
-	defer func() { stop(); cancel() }()
-	pctx = network.WithForceDirectDial(pctx, "atoll-infrastructure")
-	if err := r.mainHost.Connect(pctx, ai); err != nil {
+	pctx, cancel := context.WithTimeout(operation, infrastructurePrepareTimeout)
+	defer cancel()
+	prepared, err := r.prepareTCPInfrastructure(pctx, infra)
+	if err != nil {
 		return fmt.Errorf("peertransport: infrastructure connect: %w", err)
 	}
-	// A currently open authenticated center connection is sufficient for
-	// bootstrap. Probe callbacks use the same identity but are inbound and
-	// short-lived, so they must not hold up connection preparation.
-	var prepared network.Conn
-	for _, conn := range r.mainHost.Network().ConnsToPeer(ai.ID) {
-		if conn.IsClosed() || hasCircuitComponent(conn.RemoteMultiaddr()) || conn.Stat().Direction != network.DirOutbound {
-			continue
-		}
-		if err := verifyStreamPeer(conn, ai.ID, infra.PublicKey); err != nil {
-			return fmt.Errorf("%w: infrastructure identity mismatch", ErrInfrastructureInvalid)
-		}
-		if err := r.observed.waitIdentify(pctx, conn); err != nil {
-			return fmt.Errorf("peertransport: infrastructure identify: %w", err)
-		}
-		prepared = conn
-		break
+	if err := r.prepareInfrastructureIdentity(pctx, prepared, fence); err != nil {
+		return fmt.Errorf("peertransport: infrastructure identify: %w", err)
 	}
-	if prepared == nil {
-		return errors.New("peertransport: no direct infrastructure connection")
+	qctx, stop := context.WithTimeout(pctx, quicObservationTimeout)
+	observationErr := r.observeQUICInfrastructure(qctx, infra, fence)
+	stop()
+	// A failed UDP observation must not remove a working TCP relay baseline.
+	// The observation emits its own result and will be retried on preparation.
+	if errors.Is(observationErr, ErrPeerUnauthorized) || errors.Is(observationErr, ErrInfrastructureInvalid) {
+		return observationErr
+	}
+	if err := pctx.Err(); err != nil {
+		return err
+	}
+	if !r.observed.currentFence(fence) || !r.auth.allowedPeer(infra.PeerID) || !r.auth.authorize(pctx, infra.PeerID) {
+		return ErrInfrastructureInvalid
 	}
 	if err := r.waitTraversalReady(pctx); err != nil {
 		return err
 	}
-	if !r.auth.authorize(pctx, infra.PeerID) {
-		return ErrPeerUnauthorized
+	if pctx.Err() != nil {
+		return pctx.Err()
+	}
+	if prepared.IsClosed() || !r.observed.currentFence(fence) || !r.auth.authorize(pctx, infra.PeerID) {
+		return ErrInfrastructureInvalid
 	}
 	return nil
 }
@@ -222,7 +205,11 @@ func (r *Runtime) PrepareInfrastructure(ctx context.Context, infra peerauth.Infr
 // The library installs the DCUtR handler after seeing a public candidate.
 // Waiting for that handler avoids losing the first inbound relay notification.
 func (r *Runtime) waitTraversalReady(ctx context.Context) error {
-	if len(r.observed.Addrs(1)) == 0 {
+	var publicCandidate bool
+	for _, address := range r.observed.Addrs(1) {
+		publicCandidate = publicCandidate || publicOnlyRemote(address)
+	}
+	if !publicCandidate {
 		return nil
 	}
 	ticker := time.NewTicker(20 * time.Millisecond)
@@ -398,6 +385,8 @@ func (r *Runtime) shutdown() error {
 	r.listener = nil
 	hosts := r.relayHosts
 	r.relayHosts = map[peer.ID]host.Host{}
+	observer := r.observationHost
+	r.observationHost = nil
 	r.relayOrder = nil
 	svc := r.relaySvc
 	r.relaySvc = nil
@@ -411,6 +400,10 @@ func (r *Runtime) shutdown() error {
 	}
 	for _, h := range hosts {
 		_ = h.Close()
+	}
+	if observer != nil {
+		observer.Network().StopNotify(r.observed)
+		_ = observer.Close()
 	}
 	var closeErr error
 	if r.mainHost != nil {
@@ -438,7 +431,7 @@ func (r *Runtime) relayHostFor(relay peer.ID) (host.Host, error) {
 	if len(r.relayHosts) >= maxRelayHosts {
 		return nil, errors.New("peertransport: relay host cache is full")
 	}
-	h, err := newRelayDialHost(r.ctx, r.ident.priv, relay, r.cfg.PublicOnly, r.auth, r.cfg.MaxConnections)
+	h, err := newRelayDialHost(r.ctx, r.ident.priv, relay, r.cfg.PublicOnly, r.auth, r.cfg.MaxConnections, r.cfg.Observe)
 	if err != nil {
 		return nil, err
 	}

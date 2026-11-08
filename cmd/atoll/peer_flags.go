@@ -12,16 +12,9 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-// defaultP2PListen 未显式 -p2p-listen 时节点/客户端 TCP+QUIC 同绑：QUIC 是打洞
-// 与直连候选的主要来源；显式 -p2p-listen 完全覆盖。
+// defaultP2PListen keeps both transports available for candidate observation.
+// Relay payloads select TCP connections separately from the published set.
 var defaultP2PListen = []string{"/ip4/0.0.0.0/tcp/0", "/ip4/0.0.0.0/udp/0/quic-v1"}
-
-// masterDefaultP2PListen 让中心默认只提供 TCP 中继。实测第三方 NAS 的内核把 UDP
-// 接收缓冲限制在 416 KiB（quic-go 请求 7 MiB），QUIC 中继在丢包后重传停摆，
-// 8 MiB 双副本写入 991 秒未完成；同路径 TCP 中继 23.7 秒完成写入、23.9 秒完成
-// 读取。中心改为 TCP 后，节点经 TCP 连接中心、观测到的候选也是 TCP；代价是
-// UDP 打洞候选消失。需要打洞时显式 -p2p-listen/-p2p-announce 启用 QUIC 中心。
-var masterDefaultP2PListen = []string{"/ip4/0.0.0.0/tcp/0"}
 
 // p2pStringList accepts both repeated flags and comma-separated values. Keeping
 // raw values as canonical multiaddrs lets peertransport perform the same
@@ -94,15 +87,6 @@ func addP2PFlags(fs *flag.FlagSet) *p2pCLIFlags {
 func (p *p2pCLIFlags) listenAddresses() []string {
 	if len(p.listen.values) == 0 {
 		return append([]string(nil), defaultP2PListen...)
-	}
-	return p.listen.clone()
-}
-
-// masterListenAddresses is the center's default: TCP-only relay. An explicit
-// -p2p-listen overrides it and re-enables QUIC (and therefore UDP candidates).
-func (p *p2pCLIFlags) masterListenAddresses() []string {
-	if len(p.listen.values) == 0 {
-		return append([]string(nil), masterDefaultP2PListen...)
 	}
 	return p.listen.clone()
 }

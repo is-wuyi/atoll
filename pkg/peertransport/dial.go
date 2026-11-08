@@ -139,17 +139,26 @@ func (r *Runtime) dialRequiredRelay(ctx context.Context, target peer.ID, pub []b
 }
 
 func (r *Runtime) dialNormal(ctx context.Context, target peer.ID, pub []byte, addrs []ma.Multiaddr, infra peerauth.Infrastructure) DialResult {
+	directCtx := ctx
+	if deadline, limited := ctx.Deadline(); infra.Relay && limited {
+		// Candidate mappings may accept TCP then stall in the handshake. Keep
+		// part of the same caller deadline available for the relay fallback.
+		budget := min(r.directTimeout(), time.Until(deadline)/2)
+		var cancel context.CancelFunc
+		directCtx, cancel = context.WithTimeout(ctx, max(0, budget))
+		defer cancel()
+	}
 	// A punched connection may remain usable while its unsolicited-dial
 	// candidate is marked private. Reuse the verified connection, not its address.
 	if len(selectConns(r.mainHost.Network().ConnsToPeer(target), connDirectOnly)) > 0 {
-		if stream, err := r.openVerifiedStream(ctx, r.mainHost, target, pub, connDirectOnly); err == nil {
+		if stream, err := r.openVerifiedStream(directCtx, r.mainHost, target, pub, connDirectOnly); err == nil {
 			return wrapDialResult(stream, false)
 		}
 	}
 	var firstErr error
 	if len(addrs) > 0 {
 		ai := peer.AddrInfo{ID: target, Addrs: addrs}
-		dctx, cancel := context.WithTimeout(ctx, r.directTimeout())
+		dctx, cancel := context.WithTimeout(directCtx, r.directTimeout())
 		dctx = network.WithForceDirectDial(dctx, "atoll-direct")
 		err := r.mainHost.Connect(dctx, ai)
 		if err == nil {

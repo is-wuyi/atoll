@@ -67,10 +67,11 @@ type LoginResult struct {
 
 // secureSession 保存会话与 space 选择；读写都经锁（transport 每请求快照）。
 type secureSession struct {
-	mu       sync.Mutex
-	token    string
-	spaceID  uint64
-	hasSpace bool
+	mu         sync.Mutex
+	token      string
+	spaceID    uint64
+	hasSpace   bool
+	generation uint64
 }
 
 func (s *secureSession) snapshot() (token string, spaceID uint64, hasSpace bool) {
@@ -266,7 +267,12 @@ func safeRequestURL(u *url.URL) error {
 // applyMasterAuth 注入用户会话与 space。token 为空（login/register 等免认证调用）
 // 不注入任何头，认证由 master 裁决。
 func (t *secureTransport) applyMasterAuth(req *http.Request) error {
-	token, spaceID, hasSpace := t.s.snapshot()
+	t.s.mu.Lock()
+	defer t.s.mu.Unlock()
+	if generation, bound := req.Context().Value(transferSubmissionKey{}).(uint64); bound && t.s.generation != generation {
+		return errors.New("write transfer session changed before authentication")
+	}
+	token, spaceID, hasSpace := t.s.token, t.s.spaceID, t.s.hasSpace
 	if token == "" {
 		req.Header.Del("Authorization") // 防调用方预置头随请求外发
 		req.Header.Del(access.SpaceHeader)
@@ -467,6 +473,7 @@ func (c *Client) Login(ctx context.Context, username, password string) (LoginRes
 		return LoginResult{}, errors.New("Login: master 返回无效用户或空间")
 	}
 	c.sec.mu.Lock()
+	c.sec.generation++
 	c.sec.token = out.Token
 	if out.Space != nil {
 		c.sec.spaceID, c.sec.hasSpace = out.Space.ID, true
@@ -501,6 +508,7 @@ func (c *Client) SetSession(token string) error {
 		}
 	}
 	c.sec.mu.Lock()
+	c.sec.generation++
 	c.sec.token = token
 	c.sec.hasSpace = false
 	c.sec.spaceID = 0
@@ -516,6 +524,9 @@ func (c *Client) UseSpace(spaceID uint64) error {
 		return errNotSecure
 	}
 	c.sec.mu.Lock()
+	if c.sec.spaceID != spaceID || c.sec.hasSpace != (spaceID != 0) {
+		c.sec.generation++
+	}
 	c.sec.spaceID, c.sec.hasSpace = spaceID, spaceID != 0
 	c.sec.mu.Unlock()
 	c.p2pSessionChanged()
@@ -530,6 +541,7 @@ func (c *Client) Logout(ctx context.Context) error {
 	}
 	err := c.postJSONCtx(ctx, "/auth/logout", nil, nil)
 	c.sec.mu.Lock()
+	c.sec.generation++
 	c.sec.token = ""
 	c.sec.spaceID, c.sec.hasSpace = 0, false
 	c.sec.mu.Unlock()
