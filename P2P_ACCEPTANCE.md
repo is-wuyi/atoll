@@ -10,6 +10,22 @@
 
 本轮源码仅在 `ci/p2p-validation-20261102-auto` 留有预验收提交，开发分支仍保留未提交实现。两个 NAS 和中心的隔离目录、进程及运行态防火墙规则均已核对清理；未替换其它测试部署、拆除 EasyTier、迁移数据或合并 main。
 
+## 2026-11-08 中继传输更正：默认 TCP
+
+此前 8 MiB 慢的问题被误归因于读取期限。隔离实验（同一集群、同一路径）确认根因是 QUIC 中继在第三方 NAS 上停摆：
+
+- QUIC 中继（默认 2 KiB 拷贝缓冲）：8 MiB 双副本写入 **991 秒未完成**，客户端正文约 13 KB/s（每 10 秒 128 KiB）；
+- QUIC 中继缓冲 128 KiB：147 秒完成；1 MiB：280 秒失败（缓冲不是主因）；
+- **TCP 中继**：8 MiB 双副本写入 23.7 秒、读取 23.9 秒且 SHA-256 一致；
+- NAS 上 quic-go 每次启动报 `failed to sufficiently increase receive buffer size (got 416 KiB, wanted 7168 KiB)`；EasyTier 自身走 UDP 正常，说明不是运营商全面封 UDP，而是 quic-go 在受限 UDP 缓冲/丢包下的重传崩溃；
+- 本机 loopback 对照：直连 726 MB/s、中继 238 MB/s，2 KiB 缓冲在零 RTT 下不构成限制。
+
+代码改为：中心默认只监听/公布 TCP；中继预约与严格中继拨号优先 TCP；显式 `-p2p-listen`/`-p2p-announce` 仍可恢复 QUIC 中心。代价是中心只公布 TCP 时 UDP 打洞候选消失；需要打洞时必须显式启用 QUIC 中心，并接受 QUIC 批量传输的风险。TCP 无法做 NAT 打洞，因此打洞保持“尽力而为的直连”，不作为保存或读取前提。
+
+确定性回归：`preferTCP` 与 `circuitAddrInfo` 只选 TCP、QUIC-only 时回退；中心默认监听为 TCP、显式覆盖生效。`pkg/peertransport`、`cmd/atoll`、`integration/peer` 整包 `-race` 通过，vet 通过。
+
+真机复测（新二进制，中心 TCP-only，29663 单节点在线，performance 单副本）：8 MiB 写入 **3.4 秒**，读取 **7.6 秒**且 SHA-256 一致。29038 本轮离线，属于正常的节点离线条件。
+
 ## 2026-10-31 最小接线历史结论
 
 **生产 P2P 最小接线已通过本地与 Linux CI 验收，可交付开发分支。** [Linux 完整验证 41182185516](https://github.com/is-wuyi/atoll/actions/runs/41182185516) 的根模块竞态、vet 和两个独立模块均退出 0；macOS 已提交源码快照的带取证全根竞态也退出 0（1143.411 秒）。真实 TLS、授权发现、AEAD、多块恢复、节点复制、直连/中继、同身份重启和完整 CLI 进程用例均已覆盖。历史失败、预验收提交及其修正保留在下文，不宣称所有轮次全绿。

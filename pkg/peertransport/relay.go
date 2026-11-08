@@ -24,6 +24,24 @@ const (
 	relayReserveTimeout  = 20 * time.Second
 )
 
+// preferTCP returns the relay's TCP addresses when it publishes any. Third-party
+// NAS kernels cap the UDP receive buffer far below quic-go's request, and QUIC
+// relayed copies then collapse into retransmission stalls; TCP keeps relayed
+// bulk transfers at usable throughput. QUIC is still used for direct dials and
+// hole punching, which do not go through this helper.
+func preferTCP(addrs []ma.Multiaddr) []ma.Multiaddr {
+	tcp := make([]ma.Multiaddr, 0, len(addrs))
+	for _, address := range addrs {
+		if _, err := address.ValueForProtocol(ma.P_TCP); err == nil {
+			tcp = append(tcp, address)
+		}
+	}
+	if len(tcp) == 0 {
+		return addrs
+	}
+	return tcp
+}
+
 // ReserveRelay holds (or refreshes) a CircuitRelay v2 reservation on the main
 // host for the given infrastructure relay, and returns the reservation expiry.
 // The caller (node/client) manages TTL renewal and retry; this only issues one
@@ -46,6 +64,9 @@ func (r *Runtime) ReserveRelay(ctx context.Context, infra peerauth.Infrastructur
 	defer cancel()
 	bounded := &reservationHost{Host: r.mainHost}
 	defer bounded.finish()
+	// The reservation connection is the one the relay later uses for inbound
+	// relayed streams to this peer, so prefer TCP here too.
+	ai.Addrs = preferTCP(ai.Addrs)
 	res, err := relayclient.Reserve(rctx, bounded, ai)
 	if err != nil {
 		if rctx.Err() != nil {
@@ -151,7 +172,7 @@ func circuitAddrInfo(infra peerauth.Infrastructure, target peer.ID) (peer.AddrIn
 		return peer.AddrInfo{}, errors.New("peertransport: relay has no addresses")
 	}
 	addrs := make([]ma.Multiaddr, 0, len(relayAI.Addrs))
-	for _, base := range relayAI.Addrs {
+	for _, base := range preferTCP(relayAI.Addrs) {
 		if _, err := base.ValueForProtocol(ma.P_P2P); err != nil {
 			base = ma.Join(base, ma.StringCast("/p2p/"+relayAI.ID.String()))
 		}

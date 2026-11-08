@@ -110,6 +110,10 @@ func TestP2PDefaultListenAndPublicOnly(t *testing.T) {
 	if got != want {
 		t.Fatalf("default listen = %q, want %q", got, want)
 	}
+	// 中心默认只提供 TCP 中继：QUIC 中继在第三方 NAS 的受限 UDP 缓冲下会停摆。
+	if got, want := strings.Join(p.masterListenAddresses(), ","), "/ip4/0.0.0.0/tcp/0"; got != want {
+		t.Fatalf("master default listen = %q, want %q", got, want)
+	}
 	if p.publicOnly == nil || !*p.publicOnly {
 		t.Fatal("public-only must default to true (public-internet safety)")
 	}
@@ -124,6 +128,10 @@ func TestP2PDefaultListenAndPublicOnly(t *testing.T) {
 	}
 	if got, want := strings.Join(p2.listenAddresses(), ","), "/ip4/127.0.0.1/tcp/7000"; got != want {
 		t.Fatalf("explicit listen = %q, want %q (default must not be mixed in)", got, want)
+	}
+	// 显式 -p2p-listen 也能把中心的 QUIC 监听加回来（打洞候选）。
+	if got, want := strings.Join(p2.masterListenAddresses(), ","), "/ip4/127.0.0.1/tcp/7000"; got != want {
+		t.Fatalf("master explicit listen = %q, want %q", got, want)
 	}
 	// publish 空公共地址列表合法（Normalize 允许 []）：不得强迫手填私网/ET IP。
 	if err := validateP2PFlags(p); err != nil {
