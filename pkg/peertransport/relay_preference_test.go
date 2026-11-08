@@ -28,7 +28,7 @@ func relayTargetIdentity(t *testing.T) (peer.ID, []byte) {
 	return id, raw
 }
 
-func TestPreferTCPKeepsTCPAndFallsBackToQUIC(t *testing.T) {
+func TestPreferTCPRequiresTCPRelayEndpoint(t *testing.T) {
 	tcp := ma.StringCast("/ip4/203.0.113.10/tcp/29602")
 	quic := ma.StringCast("/ip4/203.0.113.10/udp/29603/quic-v1")
 	got := preferTCP([]ma.Multiaddr{quic, tcp})
@@ -36,8 +36,8 @@ func TestPreferTCPKeepsTCPAndFallsBackToQUIC(t *testing.T) {
 		t.Fatalf("mixed relay addresses = %v, want only the TCP address", got)
 	}
 	got = preferTCP([]ma.Multiaddr{quic})
-	if len(got) != 1 || !got[0].Equal(quic) {
-		t.Fatalf("QUIC-only relay addresses = %v, want the QUIC fallback", got)
+	if len(got) != 0 {
+		t.Fatalf("QUIC-only infrastructure must not masquerade as TCP relay: %v", got)
 	}
 }
 

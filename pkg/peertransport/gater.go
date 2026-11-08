@@ -20,11 +20,32 @@ import (
 type mainGate struct {
 	publicOnly bool
 	auth       *protocolGate
+	network    network.Network
+}
+
+func (g *mainGate) allowsInfrastructureTransport(dir network.Direction, remote peer.ID, address ma.Multiaddr) bool {
+	if g.auth == nil || !g.auth.requiresInfrastructureTCP(remote) || tcpAddress(address) {
+		return true
+	}
+	if dir != network.DirInbound || g.network == nil {
+		return false
+	}
+	// A callback must not win the first connection race and make DialPeer
+	// reuse QUIC when the relay still needs its TCP baseline.
+	for _, conn := range g.network.ConnsToPeer(remote) {
+		if isTCPConnection(conn) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *mainGate) InterceptPeerDial(peer.ID) bool { return true }
 
-func (g *mainGate) InterceptAddrDial(_ peer.ID, addr ma.Multiaddr) bool {
+func (g *mainGate) InterceptAddrDial(p peer.ID, addr ma.Multiaddr) bool {
+	if g.auth != nil && g.auth.requiresInfrastructureTCP(p) && !tcpAddress(addr) {
+		return false
+	}
 	if !g.publicOnly || publicOnlyRemote(addr) {
 		return true
 	}
@@ -38,7 +59,10 @@ func (g *mainGate) InterceptAccept(cm network.ConnMultiaddrs) bool {
 	return publicOnlyRemote(cm.RemoteMultiaddr()) && publicOnlyLocal(cm.LocalMultiaddr())
 }
 
-func (g *mainGate) InterceptSecured(_ network.Direction, p peer.ID, cm network.ConnMultiaddrs) bool {
+func (g *mainGate) InterceptSecured(dir network.Direction, p peer.ID, cm network.ConnMultiaddrs) bool {
+	if !g.allowsInfrastructureTransport(dir, p, cm.RemoteMultiaddr()) {
+		return false
+	}
 	if g.auth != nil && !g.auth.authorize(g.auth.ctx, p.String()) {
 		return false
 	}
@@ -49,6 +73,9 @@ func (g *mainGate) InterceptSecured(_ network.Direction, p peer.ID, cm network.C
 }
 
 func (g *mainGate) InterceptUpgraded(c network.Conn) (bool, control.DisconnectReason) {
+	if !g.allowsInfrastructureTransport(c.Stat().Direction, c.RemotePeer(), c.RemoteMultiaddr()) {
+		return false, 0
+	}
 	if g.auth != nil && !g.auth.authorize(g.auth.ctx, c.RemotePeer().String()) {
 		return false, 0
 	}
@@ -84,7 +111,7 @@ func (g *relayGate) InterceptPeerDial(p peer.ID) bool {
 
 func (g *relayGate) InterceptAddrDial(p peer.ID, addr ma.Multiaddr) bool {
 	if p == g.relay {
-		return !g.publicOnly || publicOnlyRemote(addr)
+		return tcpAddress(addr) && (!g.publicOnly || publicOnlyRemote(addr))
 	}
 	if g.auth == nil || !g.auth.authorize(g.auth.ctx, p.String()) {
 		return false
@@ -105,7 +132,7 @@ func (g *relayGate) InterceptSecured(dir network.Direction, p peer.ID, cm networ
 		return false
 	}
 	if p == g.relay {
-		return !g.publicOnly || (publicOnlyRemote(cm.RemoteMultiaddr()) && publicOnlyLocal(cm.LocalMultiaddr()))
+		return tcpAddress(cm.RemoteMultiaddr()) && (!g.publicOnly || (publicOnlyRemote(cm.RemoteMultiaddr()) && publicOnlyLocal(cm.LocalMultiaddr())))
 	}
 	if !hasCircuitComponent(cm.RemoteMultiaddr()) {
 		return false
@@ -122,6 +149,9 @@ func (g *relayGate) InterceptUpgraded(c network.Conn) (bool, control.DisconnectR
 		return false, 0
 	}
 	if p == g.relay {
+		if !tcpAddress(c.RemoteMultiaddr()) {
+			return false, 0
+		}
 		if g.publicOnly && !(publicOnlyRemote(c.RemoteMultiaddr()) && publicOnlyLocal(c.LocalMultiaddr())) {
 			return false, 0
 		}

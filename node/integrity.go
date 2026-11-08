@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"atoll/pkg/access"
@@ -348,6 +349,13 @@ func (r *contextReader) Read(p []byte) (int, error) {
 	return r.r.Read(p)
 }
 
+// A full response at the old drain limit cannot prove EOF. Leave it unmeasured
+// rather than waiting for an extra byte and delaying replica confirmation.
+func readPayloadResponse(resp *http.Response) (bool, error) {
+	read, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return err == nil && read < 4096, err
+}
+
 func (n *Node) pushWithPlan(ctx context.Context, peerAddr string, plan types.ReplicationPlan) error {
 	assigned := false
 	for _, peer := range plan.Targets {
@@ -364,8 +372,9 @@ func (n *Node) pushWithPlan(ctx context.Context, peerAddr string, plan types.Rep
 	}
 	defer f.Close()
 	var flowBPS uint64
+	var targetID uint64
+	peerBase := false
 	if plan.WriteTransfer != nil {
-		var targetID uint64
 		for _, target := range plan.Targets {
 			if target.Addr == peerAddr {
 				targetID = target.ID
@@ -377,17 +386,31 @@ func (n *Node) pushWithPlan(ctx context.Context, peerAddr string, plan types.Rep
 		}
 		flowBPS = leg.BPS
 		ctx = peerhttp.WithPath(ctx, peerhttp.Path(leg.Path))
+		if _, ok := n.transferBase().(*peerhttp.Transport); ok {
+			peerBase = true
+		}
 		if leg.Path == string(peerhttp.PathDirect) || leg.Path == string(peerhttp.PathRelay) {
 			if n.sec == nil {
 				return errors.New("P2P replica plan requires secure peer transport")
 			}
-			if _, ok := n.sec.base.(*peerhttp.Transport); !ok {
+			if !peerBase {
 				return errors.New("P2P replica plan requires a configured peer resolver")
 			}
 		}
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, plan.WriteTransfer.ExpiresAt)
 		defer cancel()
+	}
+	var observedPath atomic.Value
+	if plan.WriteTransfer != nil {
+		path := n.scheme()
+		if peerBase {
+			path = string(peerhttp.PathUnknown)
+			ctx = peerhttp.WithResponseReporter(ctx, func(observation peerhttp.Observation) {
+				observedPath.Store(string(observation.Path))
+			})
+		}
+		observedPath.Store(path)
 	}
 	reader, release, err := n.sendWithBudget(ctx, f, flowBPS)
 	if err != nil {
@@ -412,14 +435,31 @@ func (n *Node) pushWithPlan(ctx context.Context, peerAddr string, plan types.Rep
 		req.Header.Set(types.WriteEpochHeader, strconv.FormatUint(plan.Object.WriteEpoch, 10))
 		req.Header.Set(types.WriteAttemptHeader, newWriteRequestID())
 	}
+	started := time.Now() // Do starts here; rate-limited body upload/download is included
 	resp, err := n.bulkClient.Do(req)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("replicate: status %d", resp.StatusCode)
+	status := resp.StatusCode
+	var measured bool
+	var readErr error
+	if plan.WriteTransfer != nil && status == http.StatusCreated {
+		measured, readErr = readPayloadResponse(resp)
+	} else {
+		_, readErr = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	}
+	elapsed := time.Since(started)
+	resp.Body.Close()
+	if status != http.StatusCreated {
+		return fmt.Errorf("replicate: status %d", status)
+	}
+	if plan.WriteTransfer != nil && measured && readErr == nil {
+		path, _ := observedPath.Load().(string)
+		goodput := payloadGoodput(plan.Object.Size, elapsed)
+		self := uint64(n.nodeID.Load())
+		if targetID != 0 && self != 0 && goodput > 0 && payloadObservationPath(path) && path != string(peerhttp.PathUnknown) {
+			n.queuePayloadObservation(types.TransferObservation{FromNodeID: self, ToNodeID: targetID, Path: path, Available: true, ThroughputBPS: goodput, ObservedAt: time.Now()})
+		}
 	}
 	return nil
 }

@@ -1,0 +1,134 @@
+{
+  "format": "atoll-p2p-split-acceptance/1",
+  "date": "2026-11-09",
+  "base_commit": "4aadbe837e760bf75e52144d5696de4e80403a44",
+  "scope": "Automatic TCP/QUIC candidate discovery remains available while actual relay control and payload hops use TCP; confirmed payload feedback and bounded cold-client re-observation",
+  "source": {
+    "snapshot": "p2p-split-final-20261109-r7",
+    "manifest_sha256": "ba7b659c53151b8eedb7366fdf77f2f4e6980597844034d0a9257eba39b27858",
+    "go_module_requirement": "1.26.0",
+    "go_toolchain": "1.26.7"
+  },
+  "verification": {
+    "macos_root_race_first": {
+      "exit_code": 1,
+      "elapsed_seconds": 1649.7777715539996,
+      "failures_retained": [
+        "TestPeerCLIProcessesAndRelease: client directory initialization deadline",
+        "TestPeerCLIDiagnosticsResultFailure: CLI build killed at the unchanged two-minute build allowance",
+        "TestPeerNATRelayRetryPreservesCiphertextAndRequestEvidence: client registration deadline"
+      ]
+    },
+    "macos_root_race_serial_rerun": {
+      "exit_code": 0,
+      "elapsed_seconds": 1012.395117402004,
+      "same_manifest": true,
+      "source_timeouts_assertions_unchanged": true
+    },
+    "macos_root_vet_exit": 0,
+    "prototype_peertransport_race_exit": 0,
+    "prototype_peertransport_production_integration_race_exit": 0,
+    "linux": {
+      "run_id": "42524544059",
+      "url": "https://github.com/is-wuyi/atoll/actions/runs/42524544059",
+      "pre_acceptance_commit": "65db76b2f61522da1832738842c0cffff411e56a",
+      "all_four_downloaded_exit_files": 0,
+      "tree_matches_snapshot": true
+    },
+    "darwin_amd64_cli_build": "passed",
+    "linux_amd64_cli_build": "passed",
+    "linux_amd64_harness_sha256": "742c394cc951a90cac5b6906bf262e8af29616dd2a6e1b3050df139221f4b5f9"
+  },
+  "real_cluster": {
+    "run_id": "split-20261109-426b1d92a1bdd639",
+    "admitted_nas": ["29078", "29156"],
+    "management_discovery": "Current center EasyTier CLI list, management SSH only",
+    "automatic_candidates": ["tcp", "quic-v1"],
+    "node_announce_override": false,
+    "mesh_or_lan_data_configuration": false,
+    "nat_dns_mount_configuration_changes": false,
+    "write_1": {
+      "logical_bytes": 8388608,
+      "object_id": 1099511627776,
+      "stored_bytes": 8392832,
+      "encoding": "aead-record-v1",
+      "crc32c": 1254754282,
+      "required_confirmations": 2,
+      "done_node_ids": [2, 3],
+      "upload_seconds": 26.374958200001856,
+      "plaintext_readback_seconds": 23.06429699799628,
+      "plaintext_sha256_match": true,
+      "plaintext_sha256": "3f76a9a2bdc720c7f7b671103aab09f56cbf9cb56f1332fadc1895e59c2ca14c",
+      "plan_evidence": "master-master-stdout.log:14",
+      "ingress_receive_evidence": "29078-node-stdout.log:32",
+      "replica_receive_evidence": "29156-node-stdout.log:37",
+      "commit_evidence": "master-master-stdout.log:117",
+      "confirmed_replica_application_bps": 732737
+    },
+    "write_2": {
+      "logical_bytes": 8388608,
+      "object_id": 1099511628032,
+      "stored_bytes": 8392832,
+      "encoding": "aead-record-v1",
+      "crc32c": 835174933,
+      "required_confirmations": 2,
+      "done_node_ids": [2, 3],
+      "upload_seconds": 29.522364790012944,
+      "plaintext_readback_seconds": 17.070749213002273,
+      "plaintext_sha256_match": true,
+      "plaintext_sha256": "5743d1c6c9ba51c847c5cec05adc95a6eb314bd725c39c202148bde46e8d8331",
+      "first_plan_rejection": "master-master-stdout.log:132 (422)",
+      "retry": "One real re-observation, same upload/plan/revision/object geometry and ciphertext",
+      "successful_plan_evidence": "master-master-stdout.log:133",
+      "ingress_receive_evidence": "29078-node-stdout.log:62",
+      "replica_receive_evidence": "29156-node-stdout.log:62",
+      "commit_evidence": "master-master-stdout.log:233",
+      "confirmed_replica_application_bps": 771091
+    },
+    "persisted_graph": {
+      "upload_targets": [2],
+      "legs": [
+        {"from_node_id": 0, "to_node_id": 2, "path": "circuit", "budget_bps": 1048576},
+        {"from_node_id": 2, "to_node_id": 3, "path": "circuit", "budget_bps": 1048576}
+      ],
+      "actual_receive_paths_match": true,
+      "actual_relay_control_transports": "tcp on both hops",
+      "center_relay_carried_payload": true
+    },
+    "nas_reader": {
+      "identity": "Independent client peer on admitted NAS 29078, not its storage-node identity",
+      "normal_ciphertext_reads_seconds": [22.483010028, 21.878472363],
+      "normal_ciphertext_crc_length_match": true,
+      "strict_circuit_seconds": 18.918705849,
+      "strict_circuit_complete": true,
+      "strict_direct": {
+        "status": "failed",
+        "bytes": 0,
+        "elapsed_seconds": 6.084126109,
+        "throughput_reported": false
+      }
+    },
+    "cleanup": {
+      "all_owned_processes_stopped": true,
+      "all_owned_remote_directories_absent": true,
+      "runtime_rules_removed_and_queried_absent": ["29700/tcp", "29702/tcp", "29703/udp"],
+      "permanent_firewall_modified": false,
+      "unrelated_services_replaced": false,
+      "easytier_stopped_or_restarted": false
+    }
+  },
+  "limits": [
+    "Successful public direct object delivery and public TCP/QUIC hole punching were not verified for this NAS pair; native attempts and candidate availability are not a pass",
+    "Relay fallback and consecutive confirmations passed; this does not make centralized relay the normal intended architecture",
+    "Application-confirmed bytes/s include request, authentication, pacing, acknowledgement and server time; they are not line speed",
+    "Raw reader length/CRC binds ciphertext; the separate complete CLI readback verifies AEAD plaintext",
+    "Only the listed two 8 MiB objects and test window are accepted, not long soak, all NAT combinations or unrelated deployments",
+    "main merge, existing deployment replacement and data migration were not performed"
+  ],
+  "history": {
+    "earlier_setup_failures_retained": ["missing strict CA keyUsage", "NAS temporary filesystem noexec"],
+    "r5_real_failures_retained": ["public QUIC blocked before dial by read-only black-hole detector", "HTTP request deadline stripped by net/http dial context"],
+    "r6_real_failures_retained": ["fresh client initial probe rejected without re-observation", "strict direct failed with zero payload"],
+    "live_sampler_correction": "First r6 strict-circuit live sample was empty at process exit; full final log verified completion in a separate correction file, original result preserved"
+  }
+}

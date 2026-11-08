@@ -22,6 +22,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
 	libp2ptcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -122,11 +123,12 @@ func newProbeHost(priv crypto.PrivKey, auth *protocolGate, allowPrivate bool) (*
 // duplicate Host.Close calls made by AutoNAT and failed starts meet once here.
 type runtimeHost struct {
 	host.Host
-	probe    *probeHost
-	service  *autonatv2.AutoNAT
-	observed *trustedObservations
-	once     sync.Once
-	err      error
+	probe       *probeHost
+	service     *autonatv2.AutoNAT
+	observed    *trustedObservations
+	quicManager *quicreuse.ConnManager
+	once        sync.Once
+	err         error
 }
 
 func (h *runtimeHost) Close() error {

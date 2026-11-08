@@ -9,6 +9,7 @@ require (
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/multiformats/go-multistream v0.6.1
 	github.com/prometheus/client_golang v1.24.1
+	github.com/quic-go/quic-go v0.62.0
 	go.etcd.io/bbolt v1.3.11
 	go.uber.org/fx v1.24.0
 	golang.org/x/crypto v0.57.0
@@ -75,7 +76,6 @@ require (
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.62.0 // indirect
 	github.com/quic-go/webtransport-go v0.13.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect

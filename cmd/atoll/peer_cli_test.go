@@ -105,6 +105,27 @@ func TestNodeStartP2PSequence(t *testing.T) {
 	}
 }
 
+func TestMasterDefaultRuntimeRetainsBothCandidateTransports(t *testing.T) {
+	p := p2pTestFlags(true)
+	*p.publicOnly = false
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt, err := newPeerRuntime(ctx, p, filepath.Join(t.TempDir(), "master.peer.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	infra := infrastructureFromRuntime(rt)
+	var tcp, quic bool
+	for _, address := range infra.Addresses {
+		tcp = tcp || strings.Contains(address, "/tcp/")
+		quic = quic || strings.Contains(address, "/udp/") && strings.Contains(address, "/quic-v1")
+	}
+	if !tcp || !quic {
+		t.Fatalf("center default removed a candidate transport: %v", infra.Addresses)
+	}
+}
+
 // pairRuntimes builds two interconnected runtimes on loopback with mutual
 // authorization so a direct dial succeeds in both directions.
 func pairRuntimes(t *testing.T, ctx context.Context) (srv, cli *peertransport.Runtime) {

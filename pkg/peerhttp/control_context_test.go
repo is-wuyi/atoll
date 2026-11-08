@@ -14,6 +14,7 @@ func TestControlContextKeepsCancellationButDropsDataPathAndReporter(t *testing.T
 	// A data dial context carries the private request meta; a control request
 	// derived from it must not inherit any of it.
 	ctx = context.WithValue(ctx, metaKey, &requestMeta{requestID: "data-request-1", method: "GET"})
+	ctx = withDialBounds(ctx)
 	control := ControlContext(ctx)
 	if _, required := RequiredPath(control); required {
 		t.Fatal("control request inherited data path")
@@ -23,6 +24,9 @@ func TestControlContextKeepsCancellationButDropsDataPathAndReporter(t *testing.T
 	}
 	if metaFrom(control) != nil {
 		t.Fatal("control request inherited the data request meta")
+	}
+	if bounds, _ := control.Value(dialBoundsKey).(*dialBounds); bounds != nil {
+		t.Fatal("control request inherited private data dial bounds")
 	}
 	transport := &Transport{}
 	transport.report(control, Observation{Master: true})
