@@ -2,7 +2,7 @@
 
 Atoll（环礁）面向零配置、自治调度的跨地域边缘主存储。当前提供多副本存储、FUSE 本地挂载、故障修复、受邀账号和个人/团队空间。安全模式以持久 Ed25519 设备身份、HTTPS 与在线访问票据控制访问；计划写入可使用 AEAD 内容加密。内置 P2P 通过显式 `-p2p` 接入 Master、节点、CLI 和挂载客户端，详见 [P2P 说明](P2P.md)；本批已通过 macOS 全根竞态与 Linux CI 完整验收，并在隔离跨 NAS 上完成真实 secure/P2P 加密读写、故障读与同身份重启（EasyTier overlay，非公网）；历史失败与未覆盖范围见 [验收记录](P2P_ACCEPTANCE.md)。功能接线、本地验收和现网部署是独立阶段；现有 EasyTier 通道保持不变，本批不做网络迁移或正式数据迁移。
 
-运行方法与边界见 [计划写入说明](WRITE_PLANNING.md)、[拓扑与带宽感知传输](TRANSFER_PLANNING.md)、[对象退隐与容量释放](RETIREMENT.md) 和 [自治多副本说明](AUTONOMY.md)；前一批协议、升级限制与原型记录见 [完整性基础说明](EDGE_FOUNDATION.md)。`-write-planning` 为默认关闭的新写入口：Master 调度器冻结复制布局与具体确认集合，满足后原子发布；保护档位只影响优化权重，不是固定副本数。
+最终目标的剩余能力与验收门见 [进度追踪](PROGRESS.md)。运行方法与边界见 [计划写入说明](WRITE_PLANNING.md)、[拓扑与带宽感知传输](TRANSFER_PLANNING.md)、[对象退隐与容量释放](RETIREMENT.md) 和 [自治多副本说明](AUTONOMY.md)；前一批协议、升级限制与原型记录见 [完整性基础说明](EDGE_FOUNDATION.md)。`-write-planning` 为默认关闭的新写入口：Master 调度器冻结复制布局与具体确认集合，满足后原子发布；保护档位只影响优化权重，不是固定副本数。
 
 `-write-transfer-planning` 在计划写入上增加方向性连接观测、多个上传入口与节点复制路线；后台补副本可为不同不可变块绑定多个来源，共享上下行预算。`pkg/peerhttp` 保留 HTTPS 与在线票据，`pkg/peertransport` 提供 libp2p 传输，授权绑定和目录由 HTTPS Master 管理。P2P 默认关闭，不能从 `direct` 标签推断公网直连已验收，也不替换现网 EasyTier。既有传输批次与隔离实机边界分别见 [传输批次验收](TRANSFER_PLANNING_ACCEPTANCE.md) 和 [隔离实机验收](TRANSFER_PLANNING_REAL_ACCEPTANCE.md)，不能与后续 P2P 接线验收混为一批。
 

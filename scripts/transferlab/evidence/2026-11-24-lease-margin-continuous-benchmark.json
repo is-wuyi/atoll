@@ -1,0 +1,302 @@
+{
+  "format": "atoll-real-benchmark-evidence/1",
+  "run_id": "bench-20261124-915c50e29d5f2542",
+  "source_head": "9e8f7cbde0f071e3d15441455d1a1a4ea00e7853",
+  "source_manifest_sha256": "f500eef8f71f7416e6167c9b28f5631ffcb65e861c0a671ebc346870be6330bf",
+  "conditions": {
+    "shared_client_session_peer": true,
+    "node_ids": [
+      2,
+      3
+    ],
+    "required_done_per_upload": [
+      2,
+      3
+    ],
+    "aead_required": true,
+    "declared_budget_bps": 67108864,
+    "client_flow_limit": 4,
+    "file_concurrency_is_offered_load_not_scheduler_output": true,
+    "strict_relay": false,
+    "request_lease_margin_seconds": 10,
+    "legacy_signing_delay_present": false,
+    "production_timeouts_unchanged": true,
+    "install_management_timeout_seconds": 900,
+    "install_timeout_is_not_object_or_production_timeout": true,
+    "mesh_or_lan_announcements": false
+  },
+  "registration": {
+    "post_count": 12,
+    "status_counts": {
+      "200": 12
+    },
+    "requested_lifetime_seconds_min": 109.933974788,
+    "requested_lifetime_seconds_max": 109.947122625,
+    "409_count": 0
+  },
+  "batches": [
+    {
+      "name": "warmup-put",
+      "operation": "put",
+      "files": 1,
+      "file_concurrency": 1,
+      "passed": 1,
+      "failed": 0,
+      "completed_logical_bytes": 1048576,
+      "elapsed_seconds": 6.474173984,
+      "aggregate_mib_per_second": 0.15445985889031677,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "warmup-get",
+      "operation": "get",
+      "files": 1,
+      "file_concurrency": 1,
+      "passed": 1,
+      "failed": 0,
+      "completed_logical_bytes": 1048576,
+      "elapsed_seconds": 6.238883558,
+      "aggregate_mib_per_second": 0.1602850879814417,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "one-mib-upload-c1",
+      "operation": "put",
+      "files": 8,
+      "file_concurrency": 1,
+      "passed": 8,
+      "failed": 0,
+      "completed_logical_bytes": 8388608,
+      "elapsed_seconds": 91.003549018,
+      "aggregate_mib_per_second": 0.08790865945698056,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "one-mib-upload-c2",
+      "operation": "put",
+      "files": 8,
+      "file_concurrency": 2,
+      "passed": 8,
+      "failed": 0,
+      "completed_logical_bytes": 8388608,
+      "elapsed_seconds": 43.335362716,
+      "aggregate_mib_per_second": 0.18460673912961834,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "one-mib-upload-c4",
+      "operation": "put",
+      "files": 8,
+      "file_concurrency": 4,
+      "passed": 8,
+      "failed": 0,
+      "completed_logical_bytes": 8388608,
+      "elapsed_seconds": 50.588812613,
+      "aggregate_mib_per_second": 0.15813773019737193,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "one-mib-upload-c8",
+      "operation": "put",
+      "files": 8,
+      "file_concurrency": 8,
+      "passed": 4,
+      "failed": 4,
+      "completed_logical_bytes": 4194304,
+      "elapsed_seconds": 13.331086138,
+      "aggregate_mib_per_second": 0.30005057041812055,
+      "comparison_status": "incomplete_or_failed_sample_do_not_rank_as_throughput"
+    },
+    {
+      "name": "one-mib-download-c1",
+      "operation": "get",
+      "files": 8,
+      "file_concurrency": 1,
+      "passed": 8,
+      "failed": 0,
+      "completed_logical_bytes": 8388608,
+      "elapsed_seconds": 73.150042005,
+      "aggregate_mib_per_second": 0.10936425709028545,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "one-mib-download-c2",
+      "operation": "get",
+      "files": 8,
+      "file_concurrency": 2,
+      "passed": 8,
+      "failed": 0,
+      "completed_logical_bytes": 8388608,
+      "elapsed_seconds": 35.671058922,
+      "aggregate_mib_per_second": 0.2242714469871268,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "one-mib-download-c4",
+      "operation": "get",
+      "files": 8,
+      "file_concurrency": 4,
+      "passed": 8,
+      "failed": 0,
+      "completed_logical_bytes": 8388608,
+      "elapsed_seconds": 18.488038171,
+      "aggregate_mib_per_second": 0.43271221781382163,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "one-mib-download-c8",
+      "operation": "get",
+      "files": 8,
+      "file_concurrency": 8,
+      "passed": 8,
+      "failed": 0,
+      "completed_logical_bytes": 8388608,
+      "elapsed_seconds": 12.03315041,
+      "aggregate_mib_per_second": 0.6648300509359295,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "large-64mib-upload",
+      "operation": "put",
+      "files": 1,
+      "file_concurrency": 1,
+      "passed": 1,
+      "failed": 0,
+      "completed_logical_bytes": 67108864,
+      "elapsed_seconds": 38.803641397,
+      "aggregate_mib_per_second": 1.64932974576319,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "large-64mib-download",
+      "operation": "get",
+      "files": 1,
+      "file_concurrency": 1,
+      "passed": 1,
+      "failed": 0,
+      "completed_logical_bytes": 67108864,
+      "elapsed_seconds": 25.765339517,
+      "aggregate_mib_per_second": 2.483957176569427,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "large-128mib-upload",
+      "operation": "put",
+      "files": 1,
+      "file_concurrency": 1,
+      "passed": 1,
+      "failed": 0,
+      "completed_logical_bytes": 134217728,
+      "elapsed_seconds": 63.587145961,
+      "aggregate_mib_per_second": 2.0129854558735256,
+      "comparison_status": "comparable_full_sample"
+    },
+    {
+      "name": "large-128mib-download",
+      "operation": "get",
+      "files": 1,
+      "file_concurrency": 1,
+      "passed": 1,
+      "failed": 0,
+      "completed_logical_bytes": 134217728,
+      "elapsed_seconds": 197.070668991,
+      "aggregate_mib_per_second": 0.649513195724959,
+      "comparison_status": "comparable_full_sample"
+    }
+  ],
+  "file_accounting": {
+    "put_results": 35,
+    "put_api_success": 31,
+    "put_double_done_verified": 31,
+    "put_write_budget_rejected": 4,
+    "get_results": 35,
+    "get_plaintext_hash_verified": 35,
+    "all_download_batches_have_eight_files": true
+  },
+  "actual_data_path_phase_counts": {
+    "circuit|dial|": 89,
+    "circuit|response|": 88,
+    "circuit|response|read": 1,
+    "unknown|dial|connect": 1
+  },
+  "fallback_counts": {
+    "fallback=false": 104,
+    "fallback=true": 75,
+    "fallback_upgraded": 0
+  },
+  "large_128_download_recovery": {
+    "circuit_read_failure_then_retry": true,
+    "unknown_connect_failure_then_circuit_retry": true,
+    "fallback_upgraded": false,
+    "final_plaintext_hash_verified": true
+  },
+  "write_budget_analysis": {
+    "persisted_plans_before_rejection": 4,
+    "required_confirmations_preserved": [
+      2,
+      3
+    ],
+    "each_plan_uses_one_directional_flow_per_node": true,
+    "configured_node_flow_limit": 4,
+    "next_plan_would_exceed_directional_flow_limit": true,
+    "http_507_shared_by_capacity_bps_and_concurrency": true,
+    "not_a_complete_concurrency_8_sample": true
+  },
+  "process": {
+    "exit_code": 0,
+    "elapsed_seconds": 682.7420652149995,
+    "dropped_events": 0
+  },
+  "cleanup": {
+    "all_owner_directories_absent": true,
+    "checked_files": {
+      "29156": 43,
+      "29078": 43,
+      "master": 12
+    },
+    "runtime_firewall_confirmed_absent": true,
+    "preexisting_firewall_rules_untouched": true
+  },
+  "orchestration_failures_preserved": [
+    {
+      "run_id": "bench-20261124-ae5f9b2cb669ca31",
+      "stage": "NAS install management SSH",
+      "cleanup_complete": true,
+      "object_transfer_started": false
+    },
+    {
+      "run_id": "bench-20261124-b8cf146732d52ebc",
+      "stage": "NAS install management SSH",
+      "cleanup_complete": true,
+      "object_transfer_started": false
+    },
+    {
+      "run_id": "bench-20261124-76464de01c7f460c",
+      "stage": "NAS install management SSH",
+      "cleanup_complete": true,
+      "object_transfer_started": false
+    },
+    {
+      "run_id": "bench-20261124-f8887d93cf05ae15",
+      "stage": "strict test certificate validation",
+      "cleanup_complete": true,
+      "object_transfer_started": false
+    }
+  ],
+  "test_fixture_corrections": {
+    "management_install_timeout_seconds": 900,
+    "management_payload_bytes": 26254311,
+    "management_decode_total_seconds": 138.74996971099972,
+    "management_base64_seconds": 0.1675984486937523,
+    "management_gzip_seconds": 0.20159112103283405,
+    "test_ca_skid_and_leaf_akid_added": true,
+    "strict_tls_verification_remained_enabled": true,
+    "public_python_and_curl_health_checks_passed": true
+  },
+  "m1_complete": false,
+  "remaining_gates": [
+    "queue or coordinate file tasks before node four-flow admission instead of failing four of eight uploads",
+    "retain and diagnose large-read retry/tail latency; success does not prove direct or fallback upgrade",
+    "repeat continuous samples before treating this single run as a stable performance baseline"
+  ]
+}
