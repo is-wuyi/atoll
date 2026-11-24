@@ -1,5 +1,19 @@
 # 内置 P2P：分阶段本地、Linux CI 与隔离公网验收
 
+## 连续传输复核与租约请求余量（2026-11-24）
+
+2026-11-10 基于 `8bbe121b9f165a3a284b6b21f9b84929cca8bc58` 的两轮隔离 NAS 测速没有取得可用的并发吞吐排名或大文件速度：第一轮 16 份 1 MiB 的四个文件并发档共出现 59 次 `422 write_no_feasible`，下载没有完整校验样本；第二轮 64 MiB 在已有双确认计划后只接收到 2,080,768/67,142,656 密文字节便断流，128 MiB 未取得完整计划闭环。部分 API 成功但仅一份确认的新计划没有与双副本样本合并，失败耗时和部分字节均不换算成吞吐；已完成应用流均为 circuit。原报告和失败保留在本地私有测速归档，本轮隔离资源均已清理。
+
+登记计时取证还发现：客户端签名的 `NotAfter` 相对中心时钟约为 120.188 秒，超过中心严格的 120 秒窗口，导致 `/peers/client` 反复返回 409。测速客户端曾只在签名前等待 500ms 作为测试绕行，没有修改系统时间、中心校验或生产期限；该绕行不是产品修复。
+
+现新增 `peerauth.RequestNotAfter`，客户端登记、释放和节点地址发布统一只请求 110 秒，预留 10 秒给轻微时钟偏差和请求传输。中心仍严格拒绝超过自身 `now+120s` 的请求；没有延长租约、放宽签名/撤销检查或改变保存确认条件。伪中心时钟落后 200ms 的回归能复现旧代码的 409 重试耗尽，修复后登记一次 POST 成功；共享 helper 同时校验请求期限严格小于中心窗口且保持 UTC。
+
+- `go test -race -p 1 ./pkg/peerauth ./client -run 'TestRequestNotAfter|TestClientPeerRegistration' -count=3` 通过。
+- 相关整包 race 首轮中 `peerauth`、`client`、`node` 分别通过；`integration/peer` 的真实 CLI 构建在测试自身两分钟期限被终止（`signal: killed`），该失败不擦除。相同源码单独复跑 `TestPeerCLIDiagnosticsResultFailure` 通过（51.817 秒），未修改构建期限或断言。
+- `go vet ./pkg/peerauth ./client ./node ./integration/peer` 通过；`go test -race -p 1 ./integration/peer -count=1 -timeout=20m` 整包通过（333.844 秒）。这里的包级 watchdog 不是生产超时调整。
+
+**修复后的代码尚未重新执行隔离 NAS 连续小文件/大文件测速，也未部署到其它测试集群。** 因此目前只能确认登记租约兼容性及本地真实组件回归，不能宣称此前的断流、规划拒绝或吞吐问题已经解决。
+
 ## 当前批次状态（2026-11-09）
 
 当前批次的候选观测与实际 TCP 中继连接分离已完成分阶段验收，基线 `4aadbe837e760bf75e52144d5696de4e80403a44`。中心保留 TCP+QUIC 默认，主 host 保留直连和原生 DCUtR；同身份独立 QUIC 观测借主 UDP 套接字，中继两跳选具体 TCP 连接。r7 完整本机串行回归、vet、两独立模块、Linux 四项和双平台构建均通过，跨 NAS 连续两次新客户端 8 MiB AEAD 写入、双确认与完整回读、普通及严格 TCP 中继读取通过。第二客户端首次短探测拒绝后真实重探测成功，未降低确认条件。**该 NAS 配对的公网 direct/打洞仍未通过**，不称全场景公网验收或生产部署完成。结构化证据见 [2026-11-09 候选/中继分离](scripts/transferlab/evidence/2026-11-09-candidate-relay-separation.json)。

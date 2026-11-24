@@ -764,7 +764,7 @@ func (n *Node) publishAddressAttempt(ctx context.Context, p *nodeP2P, expected u
 		ExpectedRevision: expected,
 		OperationID:      opID,
 		Addresses:        append([]string{}, addresses...),
-		NotAfter:         time.Now().UTC().Add(peerauth.EndpointLease),
+		NotAfter:         peerauth.RequestNotAfter(time.Now()),
 	}
 	proof, err := peerauth.PublicationProof(n.masterURL, uint64(n.nodeID.Load()), req)
 	if err != nil {

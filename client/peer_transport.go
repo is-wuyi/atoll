@@ -261,7 +261,7 @@ func (p *clientP2P) releaseRegistration() {
 		PublicKey:        append([]byte(nil), p.runtime.PublicKey()...),
 		ExpectedRevision: current,
 		OperationID:      opID,
-		NotAfter:         time.Now().UTC().Add(peerauth.EndpointLease),
+		NotAfter:         peerauth.RequestNotAfter(time.Now()),
 	}
 	proof, err := peerauth.ClientReleaseProof(origin, token, spaceID, req)
 	if err != nil {
@@ -495,7 +495,7 @@ func (p *clientP2P) doRegistration(ctx context.Context, token string, spaceID ui
 			PublicKey:        append([]byte(nil), p.runtime.PublicKey()...),
 			ExpectedRevision: current,
 			OperationID:      opID,
-			NotAfter:         time.Now().UTC().Add(peerauth.EndpointLease),
+			NotAfter:         peerauth.RequestNotAfter(time.Now()),
 		}
 		proof, err := peerauth.ClientProof(origin, token, spaceID, req)
 		if err != nil {

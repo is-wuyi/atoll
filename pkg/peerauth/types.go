@@ -15,7 +15,19 @@ const (
 	MaxDirectoryPeers = 512
 	MaxDirectoryBytes = 8 << 20
 	EndpointLease     = 2 * time.Minute
+	// LeaseRequestMargin is subtracted from EndpointLease when a peer asks the
+	// center for a new lease. The center rejects any NotAfter beyond its own
+	// now+EndpointLease, so a peer whose clock runs slightly ahead, or whose
+	// request spends time in transit, must not ask for the full window.
+	LeaseRequestMargin = 10 * time.Second
 )
+
+// RequestNotAfter returns the lease deadline a peer should sign for a request
+// starting at now. It keeps a bounded safety margin so the center's strictly
+// validated window is never exceeded by clock skew or request transit.
+func RequestNotAfter(now time.Time) time.Time {
+	return now.UTC().Add(EndpointLease - LeaseRequestMargin)
+}
 
 type Identity interface {
 	PeerID() string
