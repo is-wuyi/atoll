@@ -71,6 +71,17 @@ func (c *Client) SetTransferBudget(budget types.TransferBudget) error {
 	return nil
 }
 
+func transferObservationCacheTTL(ttl time.Duration, links []types.TransferObservation) time.Duration {
+	for _, link := range links {
+		if link.Available && link.Path == string(peerhttp.PathRelay) {
+			// Circuit payloads cannot upgrade themselves. Let the next plan use
+			// the existing normal direct-first probe sooner, without racing data.
+			return min(3*time.Second, ttl/4)
+		}
+	}
+	return min(10*time.Second, ttl/2)
+}
+
 func (c *Client) observeWriteTransfer(ctx context.Context, upload types.WriteUpload) (*types.WriteTransferObservation, error) {
 	c.transferMu.Lock()
 	defer c.transferMu.Unlock()
@@ -168,7 +179,7 @@ func (c *Client) observeWriteTransfer(ctx context.Context, upload types.WriteUpl
 	// Reserve half the lease for publication and clock/network delay. Probes
 	// completed early in a large fan-out may already be too old to submit.
 	now := time.Now()
-	validUntil := now.Add(min(10*time.Second, ttl/2))
+	validUntil := now.Add(transferObservationCacheTTL(ttl, observation.Links))
 	fresh := observation.Links[:0]
 	for _, link := range observation.Links {
 		until := link.ObservedAt.Add(ttl / 2)

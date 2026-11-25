@@ -228,7 +228,7 @@ func planWriteTransfer(n *TransferNetwork, targets, confirms []string, size uint
 			if !valid || !allocateTransferRates(n, p, endpoints, now) {
 				continue
 			}
-			p.EstimatedSeconds = transferDuration(n.Origin, p.Legs, size)
+			p.EstimatedSeconds = estimateTransferDuration(n, p, size, now)
 			if p.EstimatedSeconds > float64(n.PlanTTLSeconds) {
 				continue
 			}
@@ -257,10 +257,10 @@ func allocateTransferRates(n *TransferNetwork, p *WriteTransfer, endpoints map[s
 		}
 		up, _ := availableBandwidth(from)
 		_, down := availableBandwidth(to)
+		// Authorized pacing and in-flight reservations come from configured
+		// budgets. Historical goodput belongs only to route/ETA estimates; using
+		// it here would feed a slow, already-paced sample back into the next flow.
 		leg.BPS = min(up/uint64(max(out[leg.From], from.MaxConcurrent)), down/uint64(max(in[leg.To], to.MaxConcurrent)))
-		if link := usableLink(n, leg.From, leg.To, leg.Path, now); link != nil && link.ThroughputBPS != 0 {
-			leg.BPS = min(leg.BPS, link.ThroughputBPS)
-		}
 		if leg.BPS == 0 {
 			return false
 		}
@@ -286,6 +286,17 @@ func transferDuration(origin string, legs []TransferLeg, size uint64) float64 {
 	return longest
 }
 
+func estimateTransferDuration(n *TransferNetwork, p *WriteTransfer, size uint64, now time.Time) float64 {
+	estimated := &WriteTransfer{Legs: append([]TransferLeg(nil), p.Legs...)}
+	for i := range estimated.Legs {
+		leg := &estimated.Legs[i]
+		if link := usableLink(n, leg.From, leg.To, leg.Path, now); link != nil && link.ThroughputBPS != 0 {
+			leg.BPS = min(leg.BPS, link.ThroughputBPS)
+		}
+	}
+	return transferDuration(n.Origin, estimated.Legs, size)
+}
+
 func validateWriteTransfer(n *TransferNetwork, p *WriteTransfer, targets, confirms []string, size uint64, now time.Time) error {
 	if err := validateTransferNetwork(n, now); err != nil {
 		return err
@@ -307,9 +318,8 @@ func validateWriteTransfer(n *TransferNetwork, p *WriteTransfer, targets, confir
 		if seen[l.To] || !stringMember(targets, l.To) || l.From == l.To || l.BPS == 0 || roots[l.To] != (l.From == n.Origin) || l.From != n.Origin && !roots[l.From] {
 			return errors.New("invalid transfer dependency or duplicate target")
 		}
-		link := usableLink(n, l.From, l.To, l.Path, now)
-		if link == nil || link.ThroughputBPS != 0 && l.BPS > link.ThroughputBPS {
-			return errors.New("unobserved, stale or over-budget transfer link")
+		if link := usableLink(n, l.From, l.To, l.Path, now); link == nil {
+			return errors.New("unobserved or stale transfer link")
 		}
 		var overflow bool
 		up[l.From], overflow = addOverflow(up[l.From], l.BPS)
@@ -333,7 +343,16 @@ func validateWriteTransfer(n *TransferNetwork, p *WriteTransfer, targets, confir
 	if len(seen) != len(targets) {
 		return errors.New("transfer does not reach every replica target")
 	}
-	seconds := transferDuration(n.Origin, p.Legs, size)
+	authorized := &WriteTransfer{Legs: append([]TransferLeg(nil), p.Legs...)}
+	if !allocateTransferRates(n, authorized, endpoints, now) {
+		return errors.New("authorized transfer rates exceed configured budgets")
+	}
+	for i := range p.Legs {
+		if p.Legs[i].BPS != authorized.Legs[i].BPS {
+			return errors.New("transfer rate differs from configured budget allocation")
+		}
+	}
+	seconds := estimateTransferDuration(n, p, size, now)
 	if seconds > float64(n.PlanTTLSeconds) || math.Abs(seconds-p.EstimatedSeconds) > 1e-9 {
 		return errors.New("transfer completion estimate differs from budgeted dependencies")
 	}

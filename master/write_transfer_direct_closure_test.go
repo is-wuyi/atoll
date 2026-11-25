@@ -380,6 +380,11 @@ func TestDirectClosureMeasuredPayloadSurvivesHealthProbe(t *testing.T) {
 	if path := directClosureLegPath(t, decision, f.a, f.b); path != scheduler.TransferDirect {
 		t.Fatalf("fan-out path %q, want direct", path)
 	}
+	for _, leg := range decision.Transfer.Legs {
+		if leg.From == strconv.FormatUint(f.a, 10) && leg.To == strconv.FormatUint(f.b, 10) && leg.BPS <= 4096 {
+			t.Fatalf("measured goodput became the authorized fan-out rate: %+v", leg)
+		}
+	}
 }
 
 func TestDirectClosureNodeUnknownFailureEndpointContract(t *testing.T) {

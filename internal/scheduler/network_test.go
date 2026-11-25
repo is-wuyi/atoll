@@ -124,6 +124,42 @@ func TestWriteTransferRejectsTamperedRoutes(t *testing.T) {
 	}
 }
 
+func TestWriteTransferMeasurementDoesNotCapAuthorizedRates(t *testing.T) {
+	s, obj, now := transferWorld()
+	s.Network.Links[0].ThroughputBPS = 100
+	s.Network.Links[1].ThroughputBPS = 25
+	d, err := PlanWriteAt(&s, obj, now)
+	if err != nil || d.Transfer == nil {
+		t.Fatalf("measured network rejected: %+v %v", d, err)
+	}
+	want := []TransferLeg{{From: "client", To: "a", Path: TransferDirect, BPS: 250}, {From: "a", To: "b", Path: TransferDirect, BPS: 50}}
+	if !reflect.DeepEqual(d.Transfer.Legs, want) {
+		t.Fatalf("historical goodput became the authorized pacing rate: got %+v want %+v", d.Transfer.Legs, want)
+	}
+	if d.Transfer.EstimatedSeconds != 5 {
+		t.Fatalf("estimate must still use measured goodput: got %v want 5", d.Transfer.EstimatedSeconds)
+	}
+	if !ValidateWriteDecisionAt(&s, obj, d, now).Passed {
+		t.Fatal("independent validation rejected budget-derived rates")
+	}
+	for name, mutate := range map[string]func(*WriteDecision){
+		"rate":      func(d *WriteDecision) { d.Transfer.Legs[0].BPS++ },
+		"aggregate": func(d *WriteDecision) { d.Transfer.Legs[0].BPS = 4000 },
+		"estimate":  func(d *WriteDecision) { d.Transfer.EstimatedSeconds++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			clone := d
+			transfer := *d.Transfer
+			transfer.Legs = append([]TransferLeg(nil), d.Transfer.Legs...)
+			clone.Transfer = &transfer
+			mutate(&clone)
+			if ValidateWriteDecisionAt(&s, obj, clone, now).Passed {
+				t.Fatal("tampered authorized rate or estimate accepted")
+			}
+		})
+	}
+}
+
 func TestWriteTransferRejectsInvalidNetwork(t *testing.T) {
 	for _, mutation := range []string{"duplicate", "nan", "overcommitted", "missing-origin", "invalid-path", "future", "oversized-ttl", "empty-budget"} {
 		t.Run(mutation, func(t *testing.T) {

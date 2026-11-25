@@ -64,11 +64,11 @@ func (n *Node) observeTransferPeers(ctx context.Context, plan types.ReplicationP
 		if n.observedPeers == nil {
 			n.observedPeers = map[uint64]time.Time{}
 		}
-		if time.Since(n.observedPeers[peer.ID]) < 10*time.Second {
+		if time.Now().Before(n.observedPeers[peer.ID]) {
 			n.observationMu.Unlock()
 			continue
 		}
-		n.observedPeers[peer.ID] = time.Now()
+		n.observedPeers[peer.ID] = time.Now().Add(10 * time.Second)
 		n.observationMu.Unlock()
 		select {
 		case slots <- struct{}{}:
@@ -109,6 +109,11 @@ func (n *Node) observeTransferPeers(ctx context.Context, plan types.ReplicationP
 			}
 			cancel()
 			link.Path = path.Load().(string)
+			if link.Available && link.Path == string(peerhttp.PathRelay) {
+				n.observationMu.Lock()
+				n.observedPeers[peer.ID] = time.Now().Add(3 * time.Second)
+				n.observationMu.Unlock()
+			}
 			body, _ := json.Marshal(link)
 			reportCtx, reportCancel := context.WithTimeout(ctx, 3*time.Second)
 			req, err = http.NewRequestWithContext(reportCtx, http.MethodPost, n.masterURL+"/nodes/transfer-observation", bytes.NewReader(body))
