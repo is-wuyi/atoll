@@ -60,6 +60,10 @@ func (c *Client) SetTransferBudget(budget types.TransferBudget) error {
 	if err != nil {
 		return err
 	}
+	admission, err := transferbudget.New(budget.UploadBPS, budget.MaxConcurrent)
+	if err != nil {
+		return err
+	}
 	c.transferMu.Lock()
 	defer c.transferMu.Unlock()
 	if c.transferUpload != nil {
@@ -67,8 +71,19 @@ func (c *Client) SetTransferBudget(budget types.TransferBudget) error {
 	}
 	c.transferBudget = &budget
 	c.transferUpload = limiter
+	c.transferAdmission = admission
 	c.transferObservation = nil
 	return nil
+}
+
+func (c *Client) acquirePlannedUpload(ctx context.Context) (func(), error) {
+	c.transferMu.Lock()
+	limiter := c.transferAdmission
+	c.transferMu.Unlock()
+	if limiter == nil {
+		return func() {}, nil
+	}
+	return limiter.Acquire(ctx)
 }
 
 func transferObservationCacheTTL(ttl time.Duration, links []types.TransferObservation) time.Duration {

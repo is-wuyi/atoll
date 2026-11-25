@@ -52,11 +52,18 @@ func (c *Client) BeginStreamUpload(remotePath string, replicas int) (*StreamUplo
 		return nil, err
 	}
 	if planned {
-		u, err := c.beginPlannedWrite(context.Background(), remotePath, -1, true, newOpID())
+		release, err := c.acquirePlannedUpload(context.Background())
 		if err != nil {
 			return nil, plannedError(err)
 		}
-		return &StreamUploader{c: c, staging: u.ID, planned: newPlannedStream(c, u, context.Background())}, nil
+		u, err := c.beginPlannedWrite(context.Background(), remotePath, -1, true, newOpID())
+		if err != nil {
+			release()
+			return nil, plannedError(err)
+		}
+		stream := newPlannedStream(c, u, context.Background())
+		stream.releaseUpload = release
+		return &StreamUploader{c: c, staging: u.ID, planned: stream}, nil
 	}
 	name := remotePath[strings.LastIndexByte(remotePath, '/')+1:]
 	if name == "" || name == "." || name == ".." {

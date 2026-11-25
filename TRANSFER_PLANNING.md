@@ -42,6 +42,8 @@ CLI 的节点、客户端 put 和 mount 支持 `-upload-bps`、`-download-bps`�
 
 新写计划腿的授权 BPS 只由配置预算、在途预留和并发份额决定；历史 payload goodput 仅用于路径/来源选择与 `EstimatedSeconds`，不再直接成为下一腿的硬限速，避免包含握手和既有 pacing 的慢样本形成自我降速。独立验证器分别重算配置授权速率和实测估值，任一维度被篡改都拒绝计划。
 
+`SetTransferBudget.MaxConcurrent` 还作为**单个 Client 的活动计划文件数上限**。Reader 与 `BeginStreamUpload` 在 Master 建档前先取得文件准入，超出者按调用上下文等待；Finish、Close、读失败和 abort 后幂等释放。该 limiter 独立于对象 PUT limiter，避免文件槽与块槽相互死锁。它不协调多个 Client，也不改变每文件两个块流水槽；多块文件或其它客户端仍可能遇到真实的共享预算拒绝，不重试容量/BPS/并发共用的 507。
+
 强制 circuit 的已保留计划不在 payload 中盲目切换路径。客户端 circuit 观测缓存缩短为至多 3 秒，节点 circuit 结果在 3 秒后可参与下一次现有心跳探测；direct、普通 HTTPS、失败/unknown 仍走原期限。后续探测继续使用 normal direct-first 策略，只有真实 direct 观测才能让新计划切回，NAT 持续失败时仍如实保留 circuit。
 
 第一版按现有不可变块分工。没有单对象内部的 Range 拼装，没有 EC/COW 编码器，也不是 BitTorrent 公开 swarm。小对象仍可单源，不为并行制造重复流量。

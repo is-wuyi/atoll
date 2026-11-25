@@ -478,6 +478,11 @@ func (c *Client) putPlannedReader(ctx context.Context, path string, size int64, 
 	if size < 0 {
 		return out, plannedError(errors.New("reader upload requires a known nonnegative size"))
 	}
+	release, err := c.acquirePlannedUpload(ctx)
+	if err != nil {
+		return out, plannedError(err)
+	}
+	defer release()
 	u, err := c.beginPlannedWrite(ctx, path, size, overwrite, newOpID())
 	if err != nil {
 		return out, plannedError(err)

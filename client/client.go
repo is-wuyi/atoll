@@ -46,6 +46,7 @@ type Client struct {
 	writeRecovery          bool
 	transferBudget         *types.TransferBudget
 	transferUpload         *transferbudget.Limiter
+	transferAdmission      *transferbudget.Limiter
 	transferMu             sync.Mutex
 	transferObservation    *types.WriteTransferObservation
 	transferObservedAt     time.Time

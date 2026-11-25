@@ -10,24 +10,25 @@ import (
 )
 
 type plannedStream struct {
-	c          *Client
-	upload     types.WriteUpload
-	ctx        context.Context
-	cancel     context.CancelFunc
-	admission  sync.Mutex
-	mu         sync.Mutex
-	wg         sync.WaitGroup
-	slots      chan struct{}
-	next       int
-	uploaded   int64
-	err        error
-	closed     bool
-	finished   bool
-	closing    bool
-	finishDone chan struct{}
-	result     types.Inode
-	commitOp   string
-	aead       *aeadUpload
+	c             *Client
+	upload        types.WriteUpload
+	ctx           context.Context
+	cancel        context.CancelFunc
+	admission     sync.Mutex
+	releaseUpload func()
+	mu            sync.Mutex
+	wg            sync.WaitGroup
+	slots         chan struct{}
+	next          int
+	uploaded      int64
+	err           error
+	closed        bool
+	finished      bool
+	closing       bool
+	finishDone    chan struct{}
+	result        types.Inode
+	commitOp      string
+	aead          *aeadUpload
 }
 
 func newPlannedStream(c *Client, u types.WriteUpload, ctx context.Context) *plannedStream {
@@ -94,6 +95,12 @@ func (p *plannedStream) push(data []byte) error {
 	return plannedError(p.enqueue(data))
 }
 
+func (p *plannedStream) releaseAdmission() {
+	if p.releaseUpload != nil {
+		p.releaseUpload()
+	}
+}
+
 func (p *plannedStream) finish(tail []byte, total int64) (types.Inode, error) {
 	p.admission.Lock()
 	if p.closed {
@@ -101,6 +108,7 @@ func (p *plannedStream) finish(tail []byte, total int64) (types.Inode, error) {
 		return types.Inode{}, plannedError(errors.New("planned stream is closed"))
 	}
 	p.closed = true
+	defer p.releaseAdmission()
 	p.finishDone = make(chan struct{})
 	defer close(p.finishDone)
 	var err error
@@ -144,6 +152,7 @@ func (p *plannedStream) finish(tail []byte, total int64) (types.Inode, error) {
 }
 
 func (p *plannedStream) close() error {
+	defer p.releaseAdmission()
 	p.mu.Lock()
 	p.closing = true
 	p.mu.Unlock()
