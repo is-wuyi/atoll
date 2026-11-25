@@ -1,0 +1,273 @@
+{
+  "format": "atoll-real-benchmark-comparison/1",
+  "run_id": "bench-20261125-b9b42e797a0b3b96",
+  "baseline_run_id": "bench-20261124-915c50e29d5f2542",
+  "source_head": "147ee2098632760cba837bd7bc2720e56462cd0f",
+  "source_manifest_sha256": "c7ff1b463c13b87794cbf1eaf34c77ba4d37d0644dac297ea6bb13f2de7ecddd",
+  "baseline_source_head": "9e8f7cbde0f071e3d15441455d1a1a4ea00e7853",
+  "conditions": {
+    "same_benchmark_driver_and_success_criteria": true,
+    "shared_client_session_peer": true,
+    "required_done_per_upload": [
+      2,
+      3
+    ],
+    "aead_required": true,
+    "declared_budget_bps": 67108864,
+    "client_flow_limit": 4,
+    "strict_relay": false,
+    "legacy_signing_delay_present": false,
+    "production_timeouts_unchanged": true,
+    "install_management_timeout_seconds": 900,
+    "mesh_or_lan_announcements": false
+  },
+  "local_verification": {
+    "new_regressions_failed_before_fix": true,
+    "focused_race_count_3_passed": true,
+    "related_package_race_and_vet_passed": true,
+    "root_module_race_and_vet_passed": true
+  },
+  "registration": {
+    "post_count": 7,
+    "status_counts": {
+      "200": 7
+    },
+    "requested_lifetime_seconds_min": 109.86927466,
+    "requested_lifetime_seconds_max": 109.870428471,
+    "409_count": 0
+  },
+  "rate_fix": {
+    "before_plan_count": 32,
+    "after_plan_count": 32,
+    "before_min_authorized_bps": 80754,
+    "after_min_authorized_bps": 7077888,
+    "after_max_authorized_bps": 16777216,
+    "before_historical_goodput_capped_next_flow": true,
+    "after_authorized_bps_uses_only_configured_budget_and_concurrency": true,
+    "measured_goodput_still_used_for_route_and_estimated_seconds": true,
+    "validator_recomputes_authorized_bps_and_measured_estimate": true
+  },
+  "before_after_batches": [
+    {
+      "name": "warmup-put",
+      "before_passed": 1,
+      "after_passed": 1,
+      "before_seconds": 6.474173984,
+      "after_seconds": 6.329282727,
+      "before_mib_per_second": 0.15445985889031677,
+      "after_mib_per_second": 0.15799578611555995,
+      "speed_ratio_after_over_before": 1.0228922080509868,
+      "time_ratio_after_over_before": 0.9776201168893394,
+      "complete_sample": true
+    },
+    {
+      "name": "warmup-get",
+      "before_passed": 1,
+      "after_passed": 1,
+      "before_seconds": 6.238883558,
+      "after_seconds": 4.936356139,
+      "before_mib_per_second": 0.1602850879814417,
+      "after_mib_per_second": 0.2025785765535504,
+      "speed_ratio_after_over_before": 1.26386415046299,
+      "time_ratio_after_over_before": 0.7912242780473447,
+      "complete_sample": true
+    },
+    {
+      "name": "one-mib-upload-c1",
+      "before_passed": 8,
+      "after_passed": 8,
+      "before_seconds": 91.003549018,
+      "after_seconds": 42.51718586,
+      "before_mib_per_second": 0.08790865945698056,
+      "after_mib_per_second": 0.18815920758119528,
+      "speed_ratio_after_over_before": 2.1403944587879176,
+      "time_ratio_after_over_before": 0.46720360160448615,
+      "complete_sample": true
+    },
+    {
+      "name": "one-mib-upload-c2",
+      "before_passed": 8,
+      "after_passed": 8,
+      "before_seconds": 43.335362716,
+      "after_seconds": 29.162394348,
+      "before_mib_per_second": 0.18460673912961834,
+      "after_mib_per_second": 0.27432589740521945,
+      "speed_ratio_after_over_before": 1.4860015333059233,
+      "time_ratio_after_over_before": 0.6729468157245365,
+      "complete_sample": true
+    },
+    {
+      "name": "one-mib-upload-c4",
+      "before_passed": 8,
+      "after_passed": 8,
+      "before_seconds": 50.588812613,
+      "after_seconds": 14.271600971,
+      "before_mib_per_second": 0.15813773019737193,
+      "after_mib_per_second": 0.5605537890427332,
+      "speed_ratio_after_over_before": 3.5447188241737453,
+      "time_ratio_after_over_before": 0.28210982297956866,
+      "complete_sample": true
+    },
+    {
+      "name": "one-mib-upload-c8",
+      "before_passed": 4,
+      "after_passed": 4,
+      "before_seconds": 13.331086138,
+      "after_seconds": 10.009333078,
+      "before_mib_per_second": 0.30005057041812055,
+      "after_mib_per_second": 0.39962702498049496,
+      "speed_ratio_after_over_before": 1.331865573271914,
+      "time_ratio_after_over_before": 0.7508265248897156,
+      "complete_sample": false
+    },
+    {
+      "name": "one-mib-download-c1",
+      "before_passed": 8,
+      "after_passed": 8,
+      "before_seconds": 73.150042005,
+      "after_seconds": 72.965377167,
+      "before_mib_per_second": 0.10936425709028545,
+      "after_mib_per_second": 0.10964104223966314,
+      "speed_ratio_after_over_before": 1.0025308556629173,
+      "time_ratio_after_over_before": 0.9974755333976789,
+      "complete_sample": true
+    },
+    {
+      "name": "one-mib-download-c2",
+      "before_passed": 8,
+      "after_passed": 8,
+      "before_seconds": 35.671058922,
+      "after_seconds": 34.933273298,
+      "before_mib_per_second": 0.2242714469871268,
+      "after_mib_per_second": 0.22900802715381427,
+      "speed_ratio_after_over_before": 1.0211198537768356,
+      "time_ratio_after_over_before": 0.9793169688174026,
+      "complete_sample": true
+    },
+    {
+      "name": "one-mib-download-c4",
+      "before_passed": 8,
+      "after_passed": 8,
+      "before_seconds": 18.488038171,
+      "after_seconds": 17.479590438,
+      "before_mib_per_second": 0.43271221781382163,
+      "after_mib_per_second": 0.4576766274001643,
+      "speed_ratio_after_over_before": 1.0576928696685977,
+      "time_ratio_after_over_before": 0.9454540431130312,
+      "complete_sample": true
+    },
+    {
+      "name": "one-mib-download-c8",
+      "before_passed": 8,
+      "after_passed": 8,
+      "before_seconds": 12.03315041,
+      "after_seconds": 10.365417961,
+      "before_mib_per_second": 0.6648300509359295,
+      "after_mib_per_second": 0.7717971460581801,
+      "speed_ratio_after_over_before": 1.1608938930658523,
+      "time_ratio_after_over_before": 0.8614051688729786,
+      "complete_sample": true
+    },
+    {
+      "name": "large-64mib-upload",
+      "before_passed": 1,
+      "after_passed": 1,
+      "before_seconds": 38.803641397,
+      "after_seconds": 23.655899839,
+      "before_mib_per_second": 1.64932974576319,
+      "after_mib_per_second": 2.705456162546276,
+      "speed_ratio_after_over_before": 1.64033673041796,
+      "time_ratio_after_over_before": 0.6096309260508962,
+      "complete_sample": true
+    },
+    {
+      "name": "large-64mib-download",
+      "before_passed": 1,
+      "after_passed": 1,
+      "before_seconds": 25.765339517,
+      "after_seconds": 22.910938928,
+      "before_mib_per_second": 2.483957176569427,
+      "after_mib_per_second": 2.7934254550250706,
+      "speed_ratio_after_over_before": 1.1245868010023619,
+      "time_ratio_after_over_before": 0.8892154870648351,
+      "complete_sample": true
+    },
+    {
+      "name": "large-128mib-upload",
+      "before_passed": 1,
+      "after_passed": 1,
+      "before_seconds": 63.587145961,
+      "after_seconds": 38.180606224,
+      "before_mib_per_second": 2.0129854558735256,
+      "after_mib_per_second": 3.3524873662047905,
+      "speed_ratio_after_over_before": 1.6654304959943163,
+      "time_ratio_after_over_before": 0.6004453517605173,
+      "complete_sample": true
+    },
+    {
+      "name": "large-128mib-download",
+      "before_passed": 1,
+      "after_passed": 1,
+      "before_seconds": 197.070668991,
+      "after_seconds": 40.220037857,
+      "before_mib_per_second": 0.649513195724959,
+      "after_mib_per_second": 3.182493274996322,
+      "speed_ratio_after_over_before": 4.8998131153350295,
+      "time_ratio_after_over_before": 0.20408941656780394,
+      "complete_sample": true
+    }
+  ],
+  "file_accounting": {
+    "put_results": 35,
+    "put_api_success": 31,
+    "put_double_done_verified": 31,
+    "put_write_budget_rejected": 4,
+    "get_results": 35,
+    "get_plaintext_hash_verified": 35,
+    "all_download_batches_have_eight_files": true
+  },
+  "actual_data_path_phase_counts": {
+    "circuit|dial|": 94,
+    "circuit|response|": 94
+  },
+  "direct_recovery": {
+    "completed_direct_responses": 0,
+    "fallback_upgraded_count": 0,
+    "all_completed_object_streams_remained_circuit": true,
+    "client_holepunch_failed": 2,
+    "node_direct_dial_failed": 3,
+    "private_reachability_observed": true,
+    "short_recheck_does_not_guarantee_nat_traversal": true
+  },
+  "write_budget_remaining": {
+    "concurrency_8_upload_passed": 4,
+    "concurrency_8_upload_failed": 4,
+    "error_kind": "http_507_write_budget",
+    "configured_node_flow_limit": 4,
+    "not_a_complete_concurrency_8_sample": true
+  },
+  "process": {
+    "exit_code": 0,
+    "elapsed_seconds": 379.4493515469949,
+    "baseline_elapsed_seconds": 682.7420652149995,
+    "dropped_events": 0
+  },
+  "cleanup": {
+    "all_owner_directories_absent": true,
+    "checked_files": {
+      "29156": 43,
+      "29078": 43,
+      "master": 12
+    },
+    "runtime_firewall_confirmed_absent": true
+  },
+  "orchestration_failures_this_run": [],
+  "interpretation_limits": [
+    "one post-fix run is not a stable performance distribution",
+    "upload improvements are consistent with removing the historical pacing cap; the plan-rate evidence directly confirms that cap is gone",
+    "the upload pacing change does not directly control downloads; the 128 MiB download also had no read/connect failure this run, so its improvement cannot be attributed solely to this patch",
+    "all payload remained circuit; no direct, EasyTier, or raw-TCP comparative speed is claimed",
+    "concurrency-8 upload remains incomplete and is never ranked as a full batch"
+  ],
+  "m1_complete": false
+}
