@@ -1,0 +1,131 @@
+{
+  "format": "atoll-path-cost-comparison/1",
+  "source_head": "bc9419c42c87cbd46878fa6f1cd17a294fd34bf1",
+  "source_manifest_sha256": "f56fc85d55f7575d712932d04167083105d912c08102062aabf25aff18bbf010",
+  "conditions": {
+    "client_on_vps_for_all_accepted_comparisons": true,
+    "nas_pair": [
+      "29663",
+      "29651"
+    ],
+    "offered_file_concurrency": 8,
+    "file_size_mib": 1,
+    "aead_and_dual_done_required": true,
+    "file_admission_commit": "7099f07d575e19fb321bfcc99f75c591e02fc7a7",
+    "path_cost_commit": "bc9419c42c87cbd46878fa6f1cd17a294fd34bf1",
+    "production_timeouts_unchanged": true,
+    "macos_client_results_not_compared_with_vps_results": true
+  },
+  "accepted_results": [
+    {
+      "mode": "pure-easytier-https",
+      "run_id": "bench-20261126-9fb534684c3961b6",
+      "all_18_plan_legs_https": true,
+      "warmup_put_seconds": 1.964823735,
+      "warmup_get_seconds": 0.412932329,
+      "concurrency_8_upload_double_done": 8,
+      "concurrency_8_elapsed_seconds": 299.039518603,
+      "concurrency_8_mib_per_second": 0.026752317009380525,
+      "cleanup_complete": true
+    },
+    {
+      "mode": "normal-p2p-before-cost-change",
+      "run_id": "bench-20261126-c6accd5b3158573c",
+      "warmup_put_seconds": 4.275010969,
+      "warmup_get_seconds": 0.439783113,
+      "concurrency_8_upload_double_done": 8,
+      "concurrency_8_elapsed_seconds": 308.178926988,
+      "concurrency_8_mib_per_second": 0.02595894559757328,
+      "direct_replication_goodput_bps": [
+        3602,
+        3590,
+        3529,
+        3509
+      ],
+      "circuit_replication_goodput_bps": [
+        246912,
+        304532
+      ],
+      "slow_direct_replication_seconds": [
+        289.989705468,
+        290.429512381,
+        295.894187445,
+        295.270307434
+      ],
+      "circuit_replication_seconds": [
+        2.20135856,
+        2.691332954
+      ],
+      "cleanup_complete": true
+    },
+    {
+      "mode": "strict-circuit",
+      "run_id": "bench-20261126-c6eaf7eb6c3e0295",
+      "all_18_plan_legs_circuit": true,
+      "warmup_put_seconds": 2.993283097,
+      "warmup_get_seconds": 0.599528671,
+      "concurrency_8_upload_double_done": 8,
+      "concurrency_8_elapsed_seconds": 12.644668885,
+      "concurrency_8_mib_per_second": 0.6326776978312311,
+      "cleanup_complete": true
+    },
+    {
+      "mode": "normal-p2p-with-measured-path-cost",
+      "run_id": "bench-20261126-deaf77397fe20241",
+      "warmup_put_seconds": 4.304989804,
+      "warmup_get_seconds": 0.440951539,
+      "concurrency_8_upload_double_done": 8,
+      "concurrency_8_elapsed_seconds": 344.935830781,
+      "concurrency_8_mib_per_second": 0.023192719590442334,
+      "plan_leg_paths": {
+        "direct": 8,
+        "circuit": 10
+      },
+      "direct_replication_goodput_bps": [
+        3119,
+        3096,
+        3097,
+        3100
+      ],
+      "all_36_plans_required_two_confirmations": true,
+      "write_budget_507": 0,
+      "cleanup_complete": true
+    }
+  ],
+  "failed_path_cost_run_preserved": {
+    "run_id": "bench-20261126-35b536526b9502b8",
+    "process_exit": 1,
+    "warmup_double_done": true,
+    "only_two_concurrency_8_files_reached_done_before_exit": true,
+    "control_poll_log_cap_obscured_terminal_error": true,
+    "cleanup_complete": true
+  },
+  "path_policy_change": {
+    "commit": "bc9419c42c87cbd46878fa6f1cd17a294fd34bf1",
+    "measured_goodput_considered_before_direct_preference": true,
+    "direct_used_only_as_tie_or_unknown_preference": true,
+    "path_facts_and_confirmation_sets_unchanged": true,
+    "root_race_and_vet_passed": true,
+    "direct_recovery_test_uses_natural_measurement_expiry": true,
+    "stream_identity_comparison_uses_remote_and_stream_tuple": true
+  },
+  "interpretation": {
+    "functional_real_acceptance_obtained": true,
+    "performance_goal_not_met": true,
+    "strict_circuit_is_much_faster_in_this_pair": true,
+    "direct_is_not_always_optimal": true,
+    "new_policy_does_not_prove_speedup": true,
+    "first_slow_direct_can_expire_before_a_complete_measurement_exists": true,
+    "next_requirement_is_bounded_replanning_on_slow_progress_not_only_cost_ranking": true,
+    "no_claim_that_circuit_is_always_faster": true,
+    "no_claim_that_easytier_is_always_faster": true,
+    "direct_does_not_prove_non_overlay": true
+  },
+  "test_tooling_only": {
+    "client_runs_on_vps_with_owner_pid_validation": true,
+    "pure_easytier_disables_master_node_and_client_p2p": true,
+    "mixed_easytier_run_not_used_as_pure_comparison": true,
+    "control_write_status_polling_logs_filtered_to_preserve_terminal_error": true,
+    "no_production_timeout_or_confirmation_changes": true
+  }
+}
