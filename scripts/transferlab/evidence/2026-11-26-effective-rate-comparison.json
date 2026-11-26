@@ -1,0 +1,53 @@
+{
+  "format": "atoll-effective-rate-comparison/1",
+  "source_head": "4190f8b7c836994e767d9b92b6980ab490c7a699",
+  "source_manifest_sha256": "dba6c8aa38eb68ce8e0012dbcee6681c148de0387bbe3530b5d15f9c49aa0fe5",
+  "run_id": "bench-20261126-3e44e6d108bdae2b",
+  "nas_pair": ["29663", "29651"],
+  "client_on_vps": true,
+  "change": {
+    "path_candidates_scored_with_transferRate": true,
+    "unknown_circuit_is_not_treated_as_zero": true,
+    "direct_used_only_as_tie_or_unknown_preference": true,
+    "root_race_and_vet_passed": true,
+    "regression_slow_direct_one_vs_unmeasured_circuit_zero_failed_before_fix": true,
+    "no_new_recovery_protocol_or_timeout": true
+  },
+  "result": {
+    "warmup_put_seconds": 4.528419758,
+    "warmup_get_seconds": 0.436425473,
+    "concurrency_8_upload_double_done": 8,
+    "concurrency_8_failed": 0,
+    "concurrency_8_elapsed_seconds": 396.024286596,
+    "concurrency_8_mib_per_second": 0.020200781292388552,
+    "plan_leg_paths": {
+      "direct": 7,
+      "circuit": 11
+    },
+    "direct_replication_goodput_bps": [2720, 2687, 2686, 2687],
+    "circuit_replication_goodput_bps": [401265],
+    "all_36_plans_required_two_confirmations": true,
+    "write_budget_507": 0,
+    "process_exit": 0,
+    "process_elapsed_seconds": 412.0450840040139,
+    "cleanup_complete": true
+  },
+  "comparison": {
+    "previous_normal_cost_seconds": 344.935830781,
+    "strict_circuit_seconds": 12.644668885,
+    "pure_easytier_seconds": 299.039518603,
+    "effective_rate_normal_seconds": 396.024286596,
+    "improvement_over_previous_normal": false
+  },
+  "interpretation": {
+    "effective_scoring_is_functionally_correct": true,
+    "performance_goal_not_met": true,
+    "first_slow_direct_still_dominates_end_to_end_latency": true,
+    "measurement_appears_after_slow_transfer_cannot_recover_elapsed_time": true,
+    "next_requirement_is_path_quality_before_first_slow_transfer_or_bounded_optimistic_fallback": true,
+    "no_claim_of_optimal_scheduling_or_speedup": true,
+    "no_claim_circuit_is_always_faster": true,
+    "direct_does_not_prove_non_overlay": true
+  },
+  "previous_evidence": "2026-11-26-path-cost-comparison.json"
+}

@@ -1,5 +1,13 @@
 # 内置 P2P：分阶段本地、Linux CI 与隔离公网验收
 
+## 有效速率评分与首段慢路径边界（2026-11-26）
+
+`4190f8b7c836994e767d9b92b6980ab490c7a699` 进一步把候选比较改为 `transferRate` 有效速率：同时考虑端点预算与历史 goodput，不再把未测 circuit 当成 0。新增 direct=1、circuit=0 的回归在旧实现上错误选 direct，修正后选 circuit；direct/circuit 同成本、direct 更快、双方未知和超预算测量仍保留 direct 平局偏好。scheduler 三轮 race 与根模块全量 race/vet 均通过。
+
+同一 VPS 客户端和 29663/29651 配对下，`bench-20261126-3e44e6d108bdae2b` 取得完整并发 8：**8/8 双 Done，396.024 秒、0.020 MiB/s**。计划为 direct 7、circuit 11；direct 实测仅 2.7 KiB/s，后续 circuit 实测 401,265 B/s。预热上传/下载为 4.528/0.436 秒，36 个计划全部要求双确认，507=0，所有隔离目录和 runtime 规则已清理。
+
+**这次没有提速**：上一版 normal 为 344.936 秒，严格 circuit 仍为 12.645 秒。有效评分能在测量出现后选择更优路径，却无法追回第一次慢 direct 已消耗的时间。当前瓶颈已从“排序错误”进一步收敛为“首次慢传前缺少可用路径质量与有界 optimistic fallback”，不能把本结果称为最优调度完成。下一项需要单独研究慢进展恢复，不伪造同布局换路或增加生产超时。见 [有效评分证据](scripts/transferlab/evidence/2026-11-26-effective-rate-comparison.json) 与 [前序 A/B](scripts/transferlab/evidence/2026-11-26-path-cost-comparison.json)。
+
 ## 路径成本对照与实测选路修正（2026-11-26）
 
 `bc9419c42c87cbd46878fa6f1cd17a294fd34bf1` 将同向 direct/circuit 的排序改为先比较真实 goodput，测量相同或未知时才以 direct 作为平局偏好。修前回归证明 direct=100、circuit=200 或 direct 未知时仍错误选择 direct；修后 scheduler 三轮 race、相关整包和根模块全量 race/vet 均通过。旧恢复用例改为让 fresh circuit 测量自然过期后再期待 direct，并以 `(remote, streamID)` 元组判断实际流身份，未注入观测或改变生产 TTL。
