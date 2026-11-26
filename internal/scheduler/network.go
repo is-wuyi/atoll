@@ -104,7 +104,7 @@ func usableLink(n *TransferNetwork, from, to, path string, now time.Time) *LinkO
 		if l.From != from || l.To != to || path != "" && l.Path != path || !l.Available || l.Confidence < n.MinConfidence || !now.Before(l.ValidUntil) {
 			continue
 		}
-		if best == nil || l.ThroughputBPS > best.ThroughputBPS || l.ThroughputBPS == best.ThroughputBPS && (pathRank(l.Path) < pathRank(best.Path) || pathRank(l.Path) == pathRank(best.Path) && (l.RTTMs < best.RTTMs || l.RTTMs == best.RTTMs && l.Path < best.Path)) {
+		if preferLink(n, from, to, l, best) {
 			best = l
 		}
 	}
@@ -121,7 +121,7 @@ func indexTransferNetwork(n *TransferNetwork, now time.Time) {
 		key := link.From + "\x00" + link.To + "\x00"
 		n.index[key+link.Path] = link
 		best := n.index[key]
-		if best == nil || link.ThroughputBPS > best.ThroughputBPS || link.ThroughputBPS == best.ThroughputBPS && (pathRank(link.Path) < pathRank(best.Path) || pathRank(link.Path) == pathRank(best.Path) && (link.RTTMs < best.RTTMs || link.RTTMs == best.RTTMs && link.Path < best.Path)) {
+		if preferLink(n, link.From, link.To, link, best) {
 			n.index[key] = link
 		}
 	}
@@ -132,6 +132,28 @@ func pathRank(path string) int {
 		return 1
 	}
 	return 0
+}
+
+func preferLink(n *TransferNetwork, from, to string, candidate, best *LinkObservation) bool {
+	if best == nil {
+		return true
+	}
+	endpoints := endpointIndex(n)
+	candidateRate := transferRate(candidate, endpoints[from], endpoints[to])
+	bestRate := transferRate(best, endpoints[from], endpoints[to])
+	if candidateRate != bestRate {
+		return candidateRate > bestRate
+	}
+	if pathRank(candidate.Path) != pathRank(best.Path) {
+		return pathRank(candidate.Path) < pathRank(best.Path)
+	}
+	if candidate.ThroughputBPS != best.ThroughputBPS {
+		return candidate.ThroughputBPS > best.ThroughputBPS
+	}
+	if candidate.RTTMs != best.RTTMs {
+		return candidate.RTTMs < best.RTTMs
+	}
+	return candidate.Path < best.Path
 }
 
 func endpointIndex(n *TransferNetwork) map[string]EndpointBandwidth {

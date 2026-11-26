@@ -35,9 +35,10 @@ func TestWriteTransferUsesMeasuredCostBeforeDirectPreference(t *testing.T) {
 		directBPS, relayBPS uint64
 		want                string
 	}{
-		{name: "faster-relay", directBPS: 100, relayBPS: 200, want: TransferRelay},
+		{name: "faster-relay", directBPS: 1, relayBPS: 200, want: TransferRelay},
 		{name: "faster-direct", directBPS: 200, relayBPS: 100, want: TransferDirect},
-		{name: "measured-relay-beats-unknown-direct", directBPS: 0, relayBPS: 200, want: TransferRelay},
+		{name: "measured-cost-capped-at-budget-prefers-direct", directBPS: 0, relayBPS: 200, want: TransferDirect},
+		{name: "slow-direct-loses-to-unmeasured-relay-budget", directBPS: 1, relayBPS: 0, want: TransferRelay},
 		{name: "unknown-relay-does-not-beat-measured-direct", directBPS: 200, relayBPS: 0, want: TransferDirect},
 		{name: "equal-measurement-prefers-direct", directBPS: 200, relayBPS: 200, want: TransferDirect},
 		{name: "both-unknown-prefers-direct", directBPS: 0, relayBPS: 0, want: TransferDirect},
