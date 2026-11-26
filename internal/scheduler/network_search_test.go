@@ -6,9 +6,10 @@ import (
 	"time"
 )
 
-func TestWriteTransferPrefersDirectAndIndexesExactPath(t *testing.T) {
+func TestWriteTransferPrefersDirectWhenMeasuredCostsMatch(t *testing.T) {
 	s, obj, now := transferWorld()
 	n := s.Network
+	n.Links[1].ThroughputBPS = 10000
 	n.Links = append(n.Links, LinkObservation{From: "a", To: "b", Path: TransferRelay, Available: true, RTTMs: 1, ThroughputBPS: 10000, Confidence: 1, ObservedAt: now, ValidUntil: now.Add(time.Minute)})
 	if path := usableLink(n, "a", "b", "", now).Path; path != TransferDirect {
 		t.Fatalf("preferred relay %s", path)
@@ -25,6 +26,34 @@ func TestWriteTransferPrefersDirectAndIndexesExactPath(t *testing.T) {
 	d, err := PlanWriteAt(&s, obj, now)
 	if err != nil || d.Transfer == nil || d.Transfer.Legs[1].Path != TransferDirect {
 		t.Fatalf("decision %+v %v", d, err)
+	}
+}
+
+func TestWriteTransferUsesMeasuredCostBeforeDirectPreference(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		directBPS, relayBPS uint64
+		want                string
+	}{
+		{name: "faster-relay", directBPS: 100, relayBPS: 200, want: TransferRelay},
+		{name: "faster-direct", directBPS: 200, relayBPS: 100, want: TransferDirect},
+		{name: "measured-relay-beats-unknown-direct", directBPS: 0, relayBPS: 200, want: TransferRelay},
+		{name: "unknown-relay-does-not-beat-measured-direct", directBPS: 200, relayBPS: 0, want: TransferDirect},
+		{name: "equal-measurement-prefers-direct", directBPS: 200, relayBPS: 200, want: TransferDirect},
+		{name: "both-unknown-prefers-direct", directBPS: 0, relayBPS: 0, want: TransferDirect},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, obj, now := transferWorld()
+			s.Network.Links[1].ThroughputBPS = test.directBPS
+			s.Network.Links = append(s.Network.Links, LinkObservation{From: "a", To: "b", Path: TransferRelay, Available: true, RTTMs: 1, ThroughputBPS: test.relayBPS, Confidence: 1, ObservedAt: now, ValidUntil: now.Add(time.Minute)})
+			d, err := PlanWriteAt(&s, obj, now)
+			if err != nil || d.Transfer == nil {
+				t.Fatalf("plan: %+v %v", d, err)
+			}
+			if got := d.Transfer.Legs[1].Path; got != test.want {
+				t.Fatalf("path = %s, want %s (direct=%d relay=%d)", got, test.want, test.directBPS, test.relayBPS)
+			}
+		})
 	}
 }
 

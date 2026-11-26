@@ -104,7 +104,7 @@ func usableLink(n *TransferNetwork, from, to, path string, now time.Time) *LinkO
 		if l.From != from || l.To != to || path != "" && l.Path != path || !l.Available || l.Confidence < n.MinConfidence || !now.Before(l.ValidUntil) {
 			continue
 		}
-		if best == nil || pathRank(l.Path) < pathRank(best.Path) || pathRank(l.Path) == pathRank(best.Path) && (l.ThroughputBPS > best.ThroughputBPS || l.ThroughputBPS == best.ThroughputBPS && (l.RTTMs < best.RTTMs || l.RTTMs == best.RTTMs && l.Path < best.Path)) {
+		if best == nil || l.ThroughputBPS > best.ThroughputBPS || l.ThroughputBPS == best.ThroughputBPS && (pathRank(l.Path) < pathRank(best.Path) || pathRank(l.Path) == pathRank(best.Path) && (l.RTTMs < best.RTTMs || l.RTTMs == best.RTTMs && l.Path < best.Path)) {
 			best = l
 		}
 	}
@@ -121,7 +121,7 @@ func indexTransferNetwork(n *TransferNetwork, now time.Time) {
 		key := link.From + "\x00" + link.To + "\x00"
 		n.index[key+link.Path] = link
 		best := n.index[key]
-		if best == nil || pathRank(link.Path) < pathRank(best.Path) || pathRank(link.Path) == pathRank(best.Path) && (link.ThroughputBPS > best.ThroughputBPS || link.ThroughputBPS == best.ThroughputBPS && (link.RTTMs < best.RTTMs || link.RTTMs == best.RTTMs && link.Path < best.Path)) {
+		if best == nil || link.ThroughputBPS > best.ThroughputBPS || link.ThroughputBPS == best.ThroughputBPS && (pathRank(link.Path) < pathRank(best.Path) || pathRank(link.Path) == pathRank(best.Path) && (link.RTTMs < best.RTTMs || link.RTTMs == best.RTTMs && link.Path < best.Path)) {
 			n.index[key] = link
 		}
 	}

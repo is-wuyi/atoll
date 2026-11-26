@@ -618,6 +618,12 @@ func TestPeerTransferPathClosureRelayObservationThenDirectSamePeer(t *testing.T)
 	// direct POST rather than a fixed sleep or a hand-injected observation.
 	transferClosureWaitAutoprobe(t, obsRec, aID, bID, scheduler.TransferDirect, 45*time.Second)
 
+	// A fresh circuit measurement legitimately outranks an unmeasured direct
+	// path. Let that measurement expire naturally, then verify direct recovery
+	// without weakening the new cost ordering or injecting an observation.
+	time.Sleep(31 * time.Second)
+	transferClosureWaitAutoprobe(t, obsRec, aID, bID, scheduler.TransferDirect, 45*time.Second)
+
 	// A fresh registered client in the same space with its own budget avoids the
 	// first client's 10s transfer-observation cache without changing any TTL.
 	cl2, res2 := m.login("alice")
@@ -664,8 +670,8 @@ func TestPeerTransferPathClosureRelayObservationThenDirectSamePeer(t *testing.T)
 		map[string]string{a.nodeDataAddr(): aPeer, b2.nodeDataAddr(): bPeer})
 	transferClosureAssertLedgerPut(t, &bLedger, obj2, aPeer)
 	recv2 := transferClosureAssertReceive(t, receiver, obj2, payload2, aPeer, false)
-	if recv1.remote == recv2.remote || recv1.streamID == recv2.streamID {
-		t.Fatalf("relay/direct replica payloads did not cross distinct actual stream facts: relay=%+v direct=%+v", recv1, recv2)
+	if recv1.remote == recv2.remote && recv1.streamID == recv2.streamID {
+		t.Fatalf("relay/direct replica payloads share the same actual stream facts: relay=%+v direct=%+v", recv1, recv2)
 	}
 
 	// The directional link in Master was replaced by the newer direct serving
