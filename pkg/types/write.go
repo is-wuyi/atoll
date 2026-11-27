@@ -3,18 +3,19 @@ package types
 import "time"
 
 const (
-	WritePlanFeature     = "write-plan-v1"
-	WriteTransferFeature = "write-transfer-v1"
-	WriteRecoveryFeature = "write-recovery-v2"
-	WriteEpochHeader     = "X-Atoll-Write-Epoch"
-	WriteResumeHeader    = "X-Atoll-Write-Resume"
-	WriteAttemptHeader   = "X-Atoll-Write-Attempt-ID"
-	MaxWriteRecoveries   = 3
-	WriteRecoveryMaxTime = 30 * time.Minute
-	PlainEncoding        = "plain-v1"
-	WritePending         = "pending"
-	WriteCommitted       = "committed"
-	WriteAborted         = "aborted"
+	WritePlanFeature         = "write-plan-v1"
+	WriteTransferFeature     = "write-transfer-v1"
+	WriteRecoveryFeature     = "write-recovery-v2"
+	WritePathRecoveryFeature = "write-path-recovery-v1"
+	WriteEpochHeader         = "X-Atoll-Write-Epoch"
+	WriteResumeHeader        = "X-Atoll-Write-Resume"
+	WriteAttemptHeader       = "X-Atoll-Write-Attempt-ID"
+	MaxWriteRecoveries       = 3
+	WriteRecoveryMaxTime     = 30 * time.Minute
+	PlainEncoding            = "plain-v1"
+	WritePending             = "pending"
+	WriteCommitted           = "committed"
+	WriteAborted             = "aborted"
 )
 
 type ProtectionTier string
@@ -87,6 +88,7 @@ type WriteRecovery struct {
 	OperationID string    `json:"operation_id,omitempty"`
 	RequestHash string    `json:"request_hash,omitempty"`
 	FailedNodes []uint64  `json:"failed_nodes,omitempty"`
+	AvoidPaths  []string  `json:"avoid_paths,omitempty"`
 }
 
 type WriteChunkPlan struct {
@@ -181,7 +183,8 @@ type RecoverWriteChunkRequest struct {
 	Index         int                       `json:"index"`
 	ExpectedEpoch uint64                    `json:"expected_epoch"`
 	OpID          string                    `json:"op_id"`
-	FailedNodes   []uint64                  `json:"failed_nodes"`
+	FailedNodes   []uint64                  `json:"failed_nodes,omitempty"`
+	AvoidPaths    []string                  `json:"avoid_paths,omitempty"`
 	Network       *WriteTransferObservation `json:"network,omitempty"`
 }
 

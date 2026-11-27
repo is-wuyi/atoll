@@ -49,14 +49,26 @@ func RecoveryRequestHash(req types.RecoverWriteChunkRequest) string {
 		ExpectedEpoch uint64   `json:"expected_epoch"`
 		OpID          string   `json:"op_id"`
 		FailedNodes   []uint64 `json:"failed_nodes"`
-	}{WriteBinding: req.WriteBinding, Index: req.Index, ExpectedEpoch: req.ExpectedEpoch, OpID: req.OpID, FailedNodes: append([]uint64(nil), req.FailedNodes...)}
+		AvoidPaths    []string `json:"avoid_paths,omitempty"`
+	}{WriteBinding: req.WriteBinding, Index: req.Index, ExpectedEpoch: req.ExpectedEpoch, OpID: req.OpID, FailedNodes: append([]uint64(nil), req.FailedNodes...), AvoidPaths: append([]string(nil), req.AvoidPaths...)}
 	sort.Slice(identity.FailedNodes, func(i, j int) bool { return identity.FailedNodes[i] < identity.FailedNodes[j] })
+	sort.Strings(identity.AvoidPaths)
 	raw, _ := json.Marshal(identity)
 	return BodySHA256(raw)
 }
 
+func normalizeRecoveryRequest(req types.RecoverWriteChunkRequest) types.RecoverWriteChunkRequest {
+	if len(req.FailedNodes) == 0 {
+		req.FailedNodes = nil
+	}
+	if len(req.AvoidPaths) == 0 {
+		req.AvoidPaths = nil
+	}
+	return req
+}
+
 func validRecoveryRequest(req types.RecoverWriteChunkRequest) bool {
-	if req.Index < 0 || req.Index >= types.MaxChunksPerFile || req.ExpectedEpoch == 0 || !validRecoveryOp(req.OpID) || len(req.FailedNodes) == 0 || len(req.FailedNodes) > 32 {
+	if req.Index < 0 || req.Index >= types.MaxChunksPerFile || req.ExpectedEpoch == 0 || !validRecoveryOp(req.OpID) || len(req.FailedNodes) > 32 || len(req.FailedNodes) == 0 && len(req.AvoidPaths) == 0 || len(req.FailedNodes) > 0 && len(req.AvoidPaths) > 0 || !types.ValidRecoveryAvoidPaths(req.AvoidPaths) {
 		return false
 	}
 	seen := map[uint64]bool{}
@@ -86,7 +98,8 @@ func recoveryChunk(rec plannedWriteRecord, in types.Inode, index int) (types.Wri
 
 // A lost recovery response replays the same epoch; it never consumes another attempt.
 func checkRecoveryRequest(req types.RecoverWriteChunkRequest, plan types.WriteChunkPlan, now time.Time) (bool, error) {
-	if !validRecoveryRequest(req) || plan.Recovery == nil {
+	req = normalizeRecoveryRequest(req)
+	if !validRecoveryRequest(req) || plan.Recovery == nil || len(req.AvoidPaths) > 0 && plan.Transfer == nil {
 		return false, ErrWritePlanConflict
 	}
 	r := plan.Recovery
@@ -156,6 +169,7 @@ func expectedRecoveryExclusions(old, next types.WriteChunkPlan, failed []uint64)
 }
 
 func (s *Store) RecoverWriteChunk(actor WriteActor, req types.RecoverWriteChunkRequest, previous types.WriteChunkPlan, choice types.WriteChunkPlan, profileRevision uint64, nodeMaxAge time.Duration, now time.Time) (types.WriteChunkPlan, types.ChunkInfo, error) {
+	req = normalizeRecoveryRequest(req)
 	var out types.WriteChunkPlan
 	var result types.ChunkInfo
 	err := s.write(func(w *txw) error {
@@ -182,7 +196,12 @@ func (s *Store) RecoverWriteChunk(actor WriteActor, req types.RecoverWriteChunkR
 		if !sameRecoveryPlan(old, previous) || profileRevision != profileRevisionTx(w.tx) {
 			return ErrWritePlanConflict
 		}
-		if choice.Index != old.Index || choice.Object != old.Object || choice.RequiredConfirmations < old.RequiredConfirmations || len(choice.Layout.Nodes) < len(old.Layout.Nodes) || choice.Layout.Epoch != old.Layout.Epoch+1 || choice.Recovery == nil || choice.Recovery.Epoch != choice.Layout.Epoch || choice.Recovery.Attempts != old.Recovery.Attempts+1 || !choice.Recovery.HardUntil.Equal(old.Recovery.HardUntil) || choice.Recovery.OperationID != req.OpID || choice.Recovery.RequestHash != RecoveryRequestHash(req) || !reflect.DeepEqual(choice.Recovery.Excluded, expectedRecoveryExclusions(old, choice, req.FailedNodes)) || !reflect.DeepEqual(choice.Recovery.FailedNodes, req.FailedNodes) {
+		if len(req.AvoidPaths) > 0 {
+			if choice.Recovery == nil || !types.SameUint64Set(choice.Layout.Nodes, old.Layout.Nodes) || !types.SameUint64Set(choice.Confirmations, old.Confirmations) || choice.RequiredConfirmations != old.RequiredConfirmations || !reflect.DeepEqual(choice.Recovery.AvoidPaths, req.AvoidPaths) {
+				return ErrWritePlanConflict
+			}
+		}
+		if choice.Index != old.Index || choice.Object != old.Object || choice.RequiredConfirmations < old.RequiredConfirmations || len(choice.Layout.Nodes) < len(old.Layout.Nodes) || choice.Layout.Epoch != old.Layout.Epoch+1 || choice.Recovery == nil || choice.Recovery.Epoch != choice.Layout.Epoch || choice.Recovery.Attempts != old.Recovery.Attempts+1 || !choice.Recovery.HardUntil.Equal(old.Recovery.HardUntil) || choice.Recovery.OperationID != req.OpID || choice.Recovery.RequestHash != RecoveryRequestHash(req) || !reflect.DeepEqual(choice.Recovery.Excluded, expectedRecoveryExclusions(old, choice, req.FailedNodes)) || !reflect.DeepEqual(choice.Recovery.FailedNodes, req.FailedNodes) || !reflect.DeepEqual(choice.Recovery.AvoidPaths, req.AvoidPaths) {
 			return ErrWritePlanConflict
 		}
 		geometry := types.PlanWriteChunkRequest{WriteBinding: req.WriteBinding, Index: req.Index, LogicalSize: old.Object.LogicalSize, StoredSize: old.Object.StoredSize, Encoding: old.Object.Encoding, Checksum: old.Object.Checksum}

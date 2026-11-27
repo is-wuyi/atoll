@@ -52,7 +52,7 @@ func (c *Client) WritePlanning(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, plannedError(err)
 	}
-	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature+","+types.WriteTransferFeature+","+types.WriteRecoveryFeature)
+	req.Header.Set(types.FeaturesHeader, types.ObjectIDFeature+","+types.WritePlanFeature+","+types.WriteTransferFeature+","+types.WriteRecoveryFeature+","+types.WritePathRecoveryFeature)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return false, plannedError(err)
@@ -93,6 +93,9 @@ func (c *Client) WritePlanning(ctx context.Context) (bool, error) {
 			if feature == types.WriteRecoveryFeature {
 				c.writeRecovery = true
 			}
+			if feature == types.WritePathRecoveryFeature {
+				c.writePathRecovery = true
+			}
 		}
 	}
 	c.writeChecked = time.Now()
@@ -131,6 +134,9 @@ func (c *Client) writeJSON(ctx context.Context, method, path string, body, out a
 	features := types.ObjectIDFeature + "," + types.WritePlanFeature + "," + types.WriteTransferFeature
 	if c.writeRecovery {
 		features += "," + types.WriteRecoveryFeature
+	}
+	if c.writePathRecovery {
+		features += "," + types.WritePathRecoveryFeature
 	}
 	req.Header.Set(types.FeaturesHeader, features)
 	if body != nil {

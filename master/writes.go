@@ -123,7 +123,7 @@ func (s *Server) writePlanningGuard(next http.Handler) http.Handler {
 				httpError(w, http.StatusUpgradeRequired, "TLS required for security mode")
 				return
 			}
-			features := []string{types.ObjectIDFeature, types.WritePlanFeature, types.WriteRecoveryFeature}
+			features := []string{types.ObjectIDFeature, types.WritePlanFeature, types.WriteRecoveryFeature, types.WritePathRecoveryFeature}
 			if transferEnabled {
 				features = append(features, types.WriteTransferFeature)
 			}
@@ -203,7 +203,10 @@ func decodeWriteJSON(w http.ResponseWriter, r *http.Request, value any) error {
 	case *types.PlanWriteChunkRequest:
 		required = []string{"upload_id", "plan_id", "revision", "index", "logical_size", "stored_size", "encoding", "checksum"}
 	case *types.RecoverWriteChunkRequest:
-		required = []string{"upload_id", "plan_id", "revision", "index", "expected_epoch", "op_id", "failed_nodes"}
+		required = []string{"upload_id", "plan_id", "revision", "index", "expected_epoch", "op_id"}
+		if !fields["avoid_paths"] {
+			required = append(required, "failed_nodes")
+		}
 	case *types.CommitWriteRequest:
 		required = []string{"upload_id", "plan_id", "revision", "op_id", "size", "chunk_count"}
 	case *types.WriteBinding:

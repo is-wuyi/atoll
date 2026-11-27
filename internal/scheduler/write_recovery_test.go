@@ -72,6 +72,22 @@ func TestWriteRecoveryNeverWeakensDomainOrCapacityConstraints(t *testing.T) {
 	}
 }
 
+func TestWriteRecoveryExactConfirmationsConstrainCandidates(t *testing.T) {
+	s, o, now := writeWorld()
+	d, err := PlanWriteRecoveryExactAt(&s, o, 3, []string{"a", "c"}, []string{"a", "b", "c"}, now)
+	if err != nil || d.Plan == nil || d.RequiredConfirmations != 2 || !reflect.DeepEqual(d.ConfirmationNodes, []string{"a", "c"}) {
+		t.Fatalf("exact confirmation set was not preserved: %+v %v", d, err)
+	}
+	if d.Validation == nil || !d.Validation.Passed {
+		t.Fatalf("exact recovery failed independent validation: %+v", d.Validation)
+	}
+	s.Nodes[2].Online = false
+	d, err = PlanWriteRecoveryExactAt(&s, o, 3, []string{"a", "c"}, []string{"a", "b", "c"}, now)
+	if err == nil && d.Plan != nil {
+		t.Fatalf("unavailable exact confirmation was replaced: %+v", d)
+	}
+}
+
 func TestWriteRecoveryValidatorRejectsDroppedCompletedCopy(t *testing.T) {
 	s, o, now := writeWorld()
 	d, err := PlanWriteRecoveryAt(&s, o, 2, 2, []string{"a"}, now)

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"sync"
@@ -23,6 +24,52 @@ func (c *Client) recoveryIdleTimeout() time.Duration {
 		return c.putTimeout
 	}
 	return time.Minute
+}
+
+var errWritePathRecovery = errors.New("required write replica is too slow on the direct path")
+
+type writePathProgressSample struct {
+	attempt uint64
+	bytes   int64
+	at      time.Time
+}
+
+type writePathProgress struct {
+	count       int
+	first, last writePathProgressSample
+}
+
+func (p *writePathProgress) add(sample writePathProgressSample, idle time.Duration) {
+	if sample.attempt == 0 || sample.bytes <= 0 || sample.at.IsZero() {
+		return
+	}
+	if p.count > 0 && (sample.attempt != p.last.attempt || sample.at.Before(p.last.at)) {
+		*p = writePathProgress{}
+	}
+	if p.count > 0 && sample.bytes <= p.last.bytes {
+		return
+	}
+	if p.count > 0 && idle > 0 && sample.at.Sub(p.first.at) > idle {
+		p.first, p.count = p.last, 1
+	}
+	if p.count == 0 {
+		p.first = sample
+	}
+	p.last = sample
+	p.count++
+}
+
+func shouldRecoverDirectPath(p writePathProgress, storedSize int64, now, hardUntil time.Time, idle, ioTimeout time.Duration) bool {
+	if p.count < 3 || storedSize <= 0 || idle <= 0 || ioTimeout <= 0 || p.last.bytes >= storedSize || p.last.bytes <= p.first.bytes || p.first.bytes <= 0 || now.Before(p.last.at) || hardUntil.Sub(now) < idle {
+		return false
+	}
+	span := p.last.at.Sub(p.first.at)
+	if span <= 0 || span < idle/2 || span > idle || now.Sub(p.last.at) > idle/2 {
+		return false
+	}
+	rate := float64(p.last.bytes-p.first.bytes) / span.Seconds()
+	estimated := time.Duration(float64(storedSize) / rate * float64(time.Second))
+	return estimated > max(4*ioTimeout, 2*idle)
 }
 
 func (c *Client) putRecoveryObject(ctx context.Context, upload types.WriteUpload, nodeID uint64, addr string, plan types.WriteChunkPlan, data []byte, rate uint64) error {
@@ -235,10 +282,16 @@ func (c *Client) currentRecoveryStatus(ctx context.Context, upload types.WriteUp
 }
 
 func (c *Client) waitRecoveryChunk(ctx context.Context, upload types.WriteUpload, plan types.WriteChunkPlan) ([]uint64, error) {
+	return c.waitRecoveryChunkWithPathRecovery(ctx, upload, plan, true)
+}
+
+func (c *Client) waitRecoveryChunkWithPathRecovery(ctx context.Context, upload types.WriteUpload, plan types.WriteChunkPlan, allowPathRecovery bool) ([]uint64, error) {
 	began := time.Now()
+	idle := c.recoveryIdleTimeout()
 	lastProgress := map[uint64]time.Time{}
 	bytesDone := map[uint64]int64{}
 	attempts := map[uint64]uint64{}
+	pathProgress := map[uint64]*writePathProgress{}
 	for _, id := range plan.Confirmations {
 		lastProgress[id] = began
 	}
@@ -256,6 +309,12 @@ func (c *Client) waitRecoveryChunk(ctx context.Context, upload types.WriteUpload
 				attempts[progress.NodeID] = progress.Attempt
 				bytesDone[progress.NodeID] = progress.Bytes
 				lastProgress[progress.NodeID] = now
+				samples := pathProgress[progress.NodeID]
+				if samples == nil {
+					samples = &writePathProgress{}
+					pathProgress[progress.NodeID] = samples
+				}
+				samples.add(writePathProgressSample{attempt: progress.Attempt, bytes: progress.Bytes, at: now}, idle)
 			}
 		}
 		var stalled []uint64
@@ -267,7 +326,19 @@ func (c *Client) waitRecoveryChunk(ctx context.Context, upload types.WriteUpload
 		if len(stalled) > 0 {
 			return stalled, errors.New("required write replicas made no payload progress")
 		}
-		if err := waitWriteRetry(ctx, min(100*time.Millisecond, c.recoveryIdleTimeout()/4)); err != nil {
+		if allowPathRecovery && c.writePathRecovery && plan.Transfer != nil && plan.Recovery.Attempts < types.MaxWriteRecoveries {
+			for _, id := range plan.Confirmations {
+				if types.ContainsUint64(status.Done, id) || pathProgress[id] == nil {
+					continue
+				}
+				for _, leg := range plan.Transfer.Legs {
+					if leg.ToNodeID == id && leg.Path == string(peerhttp.PathDirect) && shouldRecoverDirectPath(*pathProgress[id], plan.Object.StoredSize, now, plan.Recovery.HardUntil, idle, c.ioTimeout(plan.Object.StoredSize)) {
+						return nil, errWritePathRecovery
+					}
+				}
+			}
+		}
+		if err := waitWriteRetry(ctx, min(100*time.Millisecond, idle/4)); err != nil {
 			return nil, err
 		}
 	}
@@ -354,12 +425,36 @@ func (c *Client) recoverWritePlan(ctx context.Context, req types.RecoverWriteChu
 	return err
 }
 
+func validateRecoveredWritePlan(old, next types.WriteChunkPlan, req types.RecoverWriteChunkRequest, pathRecovery bool) error {
+	if next.Recovery == nil || next.Recovery.Epoch != old.Recovery.Epoch+1 || next.Recovery.OperationID != req.OpID || next.Recovery.Attempts != old.Recovery.Attempts+1 || !next.Recovery.HardUntil.Equal(old.Recovery.HardUntil) || next.RequiredConfirmations < old.RequiredConfirmations || len(next.Layout.Nodes) < len(old.Layout.Nodes) || (next.Transfer == nil) != (old.Transfer == nil) || !reflect.DeepEqual(next.Recovery.FailedNodes, req.FailedNodes) || !reflect.DeepEqual(next.Recovery.AvoidPaths, req.AvoidPaths) {
+		return errors.New("master returned inconsistent recovery plan")
+	}
+	for _, id := range req.FailedNodes {
+		if types.ContainsUint64(next.Layout.Nodes, id) || !types.ContainsUint64(next.Recovery.Excluded, id) {
+			return errors.New("master did not exclude failed upload node")
+		}
+	}
+	if len(req.AvoidPaths) == 0 {
+		return nil
+	}
+	if !pathRecovery || old.Transfer == nil || !types.SameUint64Set(next.Layout.Nodes, old.Layout.Nodes) || !types.SameUint64Set(next.Confirmations, old.Confirmations) || next.RequiredConfirmations != old.RequiredConfirmations || !types.SameUint64Set(next.Recovery.Excluded, old.Recovery.Excluded) {
+		return errors.New("master changed the accepted layout during path recovery")
+	}
+	for _, leg := range next.Transfer.Legs {
+		if leg.Path == req.AvoidPaths[0] {
+			return errors.New("master returned an avoided recovery path")
+		}
+	}
+	return nil
+}
+
 func (c *Client) uploadRecoverableChunk(ctx context.Context, upload types.WriteUpload, geometry types.PlanWriteChunkRequest, out types.PlanWriteChunkResponse, data []byte) error {
 	if out.Plan.Recovery == nil || !time.Now().Before(out.Plan.Recovery.HardUntil) {
 		return errors.New("write recovery deadline expired")
 	}
 	ctx, cancel := context.WithDeadline(ctx, out.Plan.Recovery.HardUntil)
 	defer cancel()
+	allowPathRecovery := true
 	for {
 		failed, transferErr := c.uploadRecoveryTargets(ctx, upload, out, data)
 		if ctx.Err() != nil {
@@ -379,22 +474,27 @@ func (c *Client) uploadRecoverableChunk(ctx context.Context, upload types.WriteU
 			}
 		}
 		failed = pending
+		var avoidPaths []string
 		if len(failed) == 0 {
 			var err error
-			failed, err = c.waitRecoveryChunk(ctx, upload, out.Plan)
+			failed, err = c.waitRecoveryChunkWithPathRecovery(ctx, upload, out.Plan, allowPathRecovery)
 			if err == nil {
 				return nil
 			}
-			if len(failed) == 0 {
-				return err
+			if errors.Is(err, errWritePathRecovery) {
+				avoidPaths = []string{string(peerhttp.PathDirect)}
+			} else {
+				if len(failed) == 0 {
+					return err
+				}
+				transferErr = err
 			}
-			transferErr = err
 		}
 		if out.Plan.Recovery.Attempts >= types.MaxWriteRecoveries {
 			return fmt.Errorf("write recovery attempts exhausted: %w", transferErr)
 		}
 		recoverCtx := ctx
-		req := types.RecoverWriteChunkRequest{WriteBinding: plannedBinding(upload), Index: out.Plan.Index, ExpectedEpoch: out.Plan.Recovery.Epoch, OpID: newOpID(), FailedNodes: failed}
+		req := types.RecoverWriteChunkRequest{WriteBinding: plannedBinding(upload), Index: out.Plan.Index, ExpectedEpoch: out.Plan.Recovery.Epoch, OpID: newOpID(), FailedNodes: failed, AvoidPaths: avoidPaths}
 		if c.transferEnabled {
 			generation := c.transferGeneration()
 			c.transferMu.Lock()
@@ -409,19 +509,22 @@ func (c *Client) uploadRecoverableChunk(ctx context.Context, upload types.WriteU
 		}
 		var next types.PlanWriteChunkResponse
 		if err := c.recoverWritePlan(recoverCtx, req, &next); err != nil {
+			if len(req.AvoidPaths) > 0 {
+				var httpErr *HTTPError
+				if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusUnprocessableEntity && WriteCode(err) == types.WriteNoFeasible {
+					allowPathRecovery = false
+					continue
+				}
+			}
 			return fmt.Errorf("recover chunk %d: %w", req.Index, err)
 		}
 		if err := validatePlannedChunk(geometry, next); err != nil {
 			return err
 		}
-		if next.Plan.Recovery == nil || next.Plan.Recovery.Epoch != out.Plan.Recovery.Epoch+1 || next.Plan.Recovery.OperationID != req.OpID || next.Plan.Recovery.Attempts != out.Plan.Recovery.Attempts+1 || !next.Plan.Recovery.HardUntil.Equal(out.Plan.Recovery.HardUntil) || next.Plan.RequiredConfirmations < out.Plan.RequiredConfirmations || len(next.Plan.Layout.Nodes) < len(out.Plan.Layout.Nodes) || (next.Plan.Transfer == nil) != (out.Plan.Transfer == nil) {
-			return errors.New("master returned inconsistent recovery plan")
-		}
-		for _, id := range failed {
-			if types.ContainsUint64(next.Plan.Layout.Nodes, id) || !types.ContainsUint64(next.Plan.Recovery.Excluded, id) {
-				return errors.New("master did not exclude failed upload node")
-			}
+		if err := validateRecoveredWritePlan(out.Plan, next.Plan, req, c.writePathRecovery); err != nil {
+			return err
 		}
 		out = next
+		allowPathRecovery = true
 	}
 }

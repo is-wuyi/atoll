@@ -27,6 +27,24 @@ func ContainsUint64(list []uint64, v uint64) bool {
 	return false
 }
 
+// SameUint64Set compares recovery membership without making layout order part
+// of the path-only recovery contract. Callers separately reject duplicates.
+func SameUint64Set(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[uint64]bool, len(a))
+	for _, id := range a {
+		seen[id] = true
+	}
+	for _, id := range b {
+		if !seen[id] {
+			return false
+		}
+	}
+	return true
+}
+
 // ChecksumHeader 是客户端 PUT/节点 replicate 携带期望 CRC32C 的 HTTP 头。
 // 存在则节点落盘后校验；缺失则跳过（向后兼容旧客户端）。
 const ChecksumHeader = "X-Atoll-Crc32c"

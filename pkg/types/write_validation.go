@@ -5,6 +5,12 @@ import (
 	"strings"
 )
 
+// ValidRecoveryAvoidPaths limits the first path-only recovery protocol to a
+// single direct-to-circuit replan. Unknown or compound avoid sets are rejected.
+func ValidRecoveryAvoidPaths(paths []string) bool {
+	return len(paths) == 0 || len(paths) == 1 && paths[0] == "direct"
+}
+
 func ValidateWriteChunkPlan(req PlanWriteChunkRequest, plan WriteChunkPlan) error {
 	if req.UploadID < StagingInodeBase || req.UploadID > MaxStagingInode || req.Revision != 1 || req.PlanID == "" || len(req.PlanID) > 128 || strings.ContainsAny(req.PlanID, " \t\r\n") {
 		return errors.New("invalid write binding")
@@ -31,10 +37,10 @@ func ValidateWriteChunkPlan(req PlanWriteChunkRequest, plan WriteChunkPlan) erro
 		if r.Epoch != plan.Layout.Epoch || r.Attempts > MaxWriteRecoveries || r.Epoch != uint64(r.Attempts)+1 || r.HardUntil.IsZero() || len(r.Excluded) > 32*MaxWriteRecoveries {
 			return errors.New("invalid write recovery state")
 		}
-		if r.Attempts == 0 && (r.OperationID != "" || r.RequestHash != "" || len(r.Excluded) > 0 || len(r.FailedNodes) > 0) {
+		if r.Attempts == 0 && (r.OperationID != "" || r.RequestHash != "" || len(r.Excluded) > 0 || len(r.FailedNodes) > 0 || len(r.AvoidPaths) > 0) {
 			return errors.New("unexpected initial write recovery operation")
 		}
-		if r.Attempts > 0 && (r.OperationID == "" || len(r.OperationID) > 128 || strings.ContainsAny(r.OperationID, " \t\r\n") || len(r.RequestHash) != 64 || len(r.FailedNodes) == 0 || len(r.FailedNodes) > 32) {
+		if r.Attempts > 0 && (r.OperationID == "" || len(r.OperationID) > 128 || strings.ContainsAny(r.OperationID, " \t\r\n") || len(r.RequestHash) != 64 || len(r.FailedNodes) > 32 || len(r.FailedNodes) == 0 && len(r.AvoidPaths) == 0 || len(r.FailedNodes) > 0 && len(r.AvoidPaths) > 0 || !ValidRecoveryAvoidPaths(r.AvoidPaths)) {
 			return errors.New("invalid write recovery operation")
 		}
 		failed := map[uint64]bool{}
@@ -88,6 +94,13 @@ func ValidateWriteChunkPlan(req PlanWriteChunkRequest, plan WriteChunkPlan) erro
 			roots[id] = true
 		}
 		completed := map[uint64]bool{}
+		if plan.Recovery != nil && len(plan.Recovery.AvoidPaths) > 0 {
+			for _, leg := range p.Legs {
+				if leg.Path == plan.Recovery.AvoidPaths[0] {
+					return errors.New("recovery plan uses avoided path")
+				}
+			}
+		}
 		for _, leg := range p.Legs {
 			if !targets[leg.ToNodeID] || completed[leg.ToNodeID] || leg.FromNodeID == leg.ToNodeID || leg.BPS == 0 || leg.BPS > 1<<40 || (leg.Path != "http" && leg.Path != "https" && leg.Path != "direct" && leg.Path != "circuit") || roots[leg.ToNodeID] != (leg.FromNodeID == 0) || leg.FromNodeID != 0 && !roots[leg.FromNodeID] {
 				return errors.New("invalid write transfer leg")

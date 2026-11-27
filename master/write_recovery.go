@@ -12,15 +12,23 @@ import (
 	"atoll/pkg/types"
 )
 
-func supportsWriteRecovery(r *http.Request) bool {
+func supportsFeature(r *http.Request, wanted string) bool {
 	for _, header := range r.Header.Values(types.FeaturesHeader) {
 		for _, feature := range strings.FieldsFunc(header, func(c rune) bool { return c == ',' || c == ' ' || c == '\t' }) {
-			if feature == types.WriteRecoveryFeature {
+			if feature == wanted {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func supportsWriteRecovery(r *http.Request) bool {
+	return supportsFeature(r, types.WriteRecoveryFeature)
+}
+
+func supportsWritePathRecovery(r *http.Request) bool {
+	return supportsFeature(r, types.WritePathRecoveryFeature)
 }
 
 func writeRecoveryExclusions(plan types.WriteChunkPlan, failed []uint64) []uint64 {
@@ -74,6 +82,10 @@ func (s *Server) handleRecoverWriteChunk(w http.ResponseWriter, r *http.Request)
 		writePlanningError(w, http.StatusBadRequest, "invalid_write_request", "invalid recovery request")
 		return
 	}
+	if len(req.AvoidPaths) > 0 && !supportsWritePathRecovery(r) {
+		writePlanningError(w, http.StatusUpgradeRequired, types.WritePlanRequired, types.WritePathRecoveryFeature+" client feature required")
+		return
+	}
 	actor, err := s.writeActor(r)
 	if err != nil {
 		writePlanningMetaError(w, err)
@@ -91,6 +103,11 @@ func (s *Server) handleRecoverWriteChunk(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		s.writeChunkResponse(w, old, current)
+		return
+	}
+	pathOnly := len(req.AvoidPaths) > 0
+	if pathOnly && old.Transfer == nil {
+		writePlanningMetaError(w, meta.ErrWritePlanConflict)
 		return
 	}
 	snapshot, err := s.store.AutonomySnapshot()
@@ -118,6 +135,15 @@ func (s *Server) handleRecoverWriteChunk(w http.ResponseWriter, r *http.Request)
 		writePlanningMetaError(w, err)
 		return
 	}
+	if pathOnly {
+		links := world.Network.Links[:0]
+		for _, link := range world.Network.Links {
+			if link.Path != req.AvoidPaths[0] {
+				links = append(links, link)
+			}
+		}
+		world.Network.Links = links
+	}
 	excluded := writeRecoveryExclusions(old, req.FailedNodes)
 	var retained []string
 	for i := range world.Nodes {
@@ -130,12 +156,28 @@ func (s *Server) handleRecoverWriteChunk(w http.ResponseWriter, r *http.Request)
 		if types.ContainsUint64(excluded, id) {
 			n.Online = false
 		}
-		if n.Online && types.ContainsUint64(current.Done, id) && !types.ContainsUint64(current.Suspect, id) {
+		if pathOnly {
+			if n.Online && types.ContainsUint64(old.Layout.Nodes, id) {
+				retained = append(retained, n.ID)
+			}
+		} else if n.Online && types.ContainsUint64(current.Done, id) && !types.ContainsUint64(current.Suspect, id) {
 			retained = append(retained, n.ID)
 		}
 	}
+	if pathOnly {
+		world.Policy.MaxReplicaCount = len(old.Layout.Nodes)
+	}
 	obj := scheduler.ObjectRequirement{ObjectID: strconv.FormatUint(old.Object.ID, 10), ContentVersion: old.Object.Version, SizeBytes: uint64(old.Object.StoredSize), Intent: scheduler.ProtectionIntent{Tier: string(upload.Policy.Tier)}}
-	decision, err := scheduler.PlanWriteRecoveryAt(&world, obj, len(old.Layout.Nodes), old.RequiredConfirmations, retained, now)
+	var decision scheduler.WriteDecision
+	if pathOnly {
+		confirmations := make([]string, 0, len(old.Confirmations))
+		for _, id := range old.Confirmations {
+			confirmations = append(confirmations, strconv.FormatUint(id, 10))
+		}
+		decision, err = scheduler.PlanWriteRecoveryExactAt(&world, obj, len(old.Layout.Nodes), confirmations, retained, now)
+	} else {
+		decision, err = scheduler.PlanWriteRecoveryAt(&world, obj, len(old.Layout.Nodes), old.RequiredConfirmations, retained, now)
+	}
 	if err != nil || decision.Status != scheduler.StatusPlanProposed || decision.Plan == nil {
 		writePlanningMetaError(w, meta.ErrWriteNoFeasible)
 		return
@@ -146,6 +188,22 @@ func (s *Server) handleRecoverWriteChunk(w http.ResponseWriter, r *http.Request)
 		writePlanningMetaError(w, meta.ErrWritePlanConflict)
 		return
 	}
+	if pathOnly {
+		if !types.SameUint64Set(choice.Layout.Nodes, old.Layout.Nodes) || !types.SameUint64Set(choice.Confirmations, old.Confirmations) || choice.RequiredConfirmations != old.RequiredConfirmations {
+			writePlanningMetaError(w, meta.ErrWriteNoFeasible)
+			return
+		}
+		if choice.Transfer == nil {
+			writePlanningMetaError(w, meta.ErrWritePlanConflict)
+			return
+		}
+		for _, leg := range choice.Transfer.Legs {
+			if leg.Path == req.AvoidPaths[0] {
+				writePlanningMetaError(w, meta.ErrWritePlanConflict)
+				return
+			}
+		}
+	}
 	choice.Layout.Epoch = old.Layout.Epoch + 1
 	for _, id := range removedWriteNodes(old.Layout.Nodes, choice.Layout.Nodes) {
 		if !types.ContainsUint64(excluded, id) {
@@ -153,7 +211,7 @@ func (s *Server) handleRecoverWriteChunk(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	sort.Slice(excluded, func(i, j int) bool { return excluded[i] < excluded[j] })
-	choice.Recovery = &types.WriteRecovery{Epoch: choice.Layout.Epoch, Attempts: old.Recovery.Attempts + 1, HardUntil: old.Recovery.HardUntil, Excluded: excluded, OperationID: req.OpID, RequestHash: meta.RecoveryRequestHash(req), FailedNodes: append([]uint64(nil), req.FailedNodes...)}
+	choice.Recovery = &types.WriteRecovery{Epoch: choice.Layout.Epoch, Attempts: old.Recovery.Attempts + 1, HardUntil: old.Recovery.HardUntil, Excluded: excluded, OperationID: req.OpID, RequestHash: meta.RecoveryRequestHash(req), FailedNodes: append([]uint64(nil), req.FailedNodes...), AvoidPaths: append([]string(nil), req.AvoidPaths...)}
 	if choice.Transfer != nil {
 		choice.Transfer.ExpiresAt = old.Recovery.HardUntil
 	}
